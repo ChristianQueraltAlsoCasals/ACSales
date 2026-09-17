@@ -1,0 +1,33 @@
+# Dependencias y builds
+node_modules/
+dist/
+*.log
+.DS_Store
+Thumbs.db
+
+# Secretos (nunca versionar) — un solo .env en la raíz
+.env
+.env.*
+!.env.example
+server/.env
+server/env.txt
+server/*.migrated-to-root.bak
+backend/.env
+backend/env.txt
+
+# Datos locales antiguos (ahora en Postgres)
+server/data/
+backend/data/
+
+# Playwright / Edge — sesión BC y caches (locales por máquina)
+bc_automation/perfil_navegador/
+bc_automation/bc_session.json
+bc_automation/capturas_error/
+bc_automation/*.png
+bc_automation/antes_de_*.png
+bc_automation/captura_*.png
+
+# Misc local
+ChatGPT.url
+*.zip
+backups/

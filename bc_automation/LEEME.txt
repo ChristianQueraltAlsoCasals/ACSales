@@ -1,0 +1,53 @@
+AUTOMATIZACIÓN DE "REGISTRAR" EN BC — carpeta separada, en Python
+===================================================================
+
+Esto es un proceso APARTE de la aplicación principal (que sigue siendo
+Node/Vite). Vive en su propia carpeta para no mezclarse con el resto.
+
+QUÉ HACE (de momento — vamos por pasos):
+  1. login_setup.py    → abre BC, inicias sesión tú a mano UNA vez, se
+                          guarda esa sesión en bc_session.json.
+  2. abrir_pedido.py   → PRUEBA: busca y abre un pedido concreto, hace
+                          una captura. Todavía NO toca "Registrar".
+
+Cuando confirmemos que el paso 2 encuentra bien el pedido, añadimos el
+paso que de verdad hace clic en "Registrar" y elige "Recibir".
+
+
+INSTALACIÓN (una sola vez)
+---------------------------
+1. Necesitas Python instalado (https://www.python.org/downloads/ — al
+   instalarlo, marca la casilla "Add Python to PATH").
+
+2. Abre una terminal EN ESTA CARPETA (bc_automation) — el mismo truco de
+   siempre: en el Explorador, clic en la barra de arriba, escribe cmd,
+   Enter.
+
+3. Ejecuta, una detrás de otra:
+
+     pip install -r requirements.txt
+     playwright install chromium
+
+   (la segunda línea descarga el navegador que usa Playwright — tarda
+   un poco la primera vez, es normal)
+
+
+USO
+---
+1. python login_setup.py
+   → Se abre una ventana de navegador. Inicia sesión en BC como siempre.
+   → Cuando veas BC con normalidad, vuelve a la terminal y pulsa Enter.
+
+2. python abrir_pedido.py PC26-003240
+   → Debería abrir BC, buscar ese pedido, y guardar una captura de
+     pantalla (captura_busqueda_PC26-003240.png, en esta misma carpeta)
+     para que la revisemos juntos antes de seguir.
+
+
+IMPORTANTE
+----------
+- bc_session.json contiene tu sesión iniciada — no lo compartas ni lo
+  subas a ningún sitio. Tu contraseña nunca se guarda en ningún archivo.
+- Si un día el script falla con algo relacionado con "sesión caducada" o
+  te pide iniciar sesión otra vez dentro del navegador automático, vuelve
+  a ejecutar login_setup.py para renovarla.

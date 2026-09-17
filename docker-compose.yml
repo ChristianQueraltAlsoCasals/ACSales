@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: acsales
+      POSTGRES_USER: acsales
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-acsales}
+      TZ: Europe/Madrid
+    ports:
+      # Publicado para desarrollo local (npm start en el host)
+      - '${DB_PORT:-5434}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U acsales -d acsales']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Dentro de la red Docker la BD es el servicio `db`
+      DATABASE_URL: postgres://acsales:${DB_PASSWORD:-acsales}@db:5432/acsales
+      PORT: '8102'
+      TZ: Europe/Madrid
+      # Playwright (servicio_registro.py) sigue en el host
+      BC_REGISTRO_URL: ${BC_REGISTRO_URL:-http://host.docker.internal:5055}
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    ports:
+      - '${APP_PORT:-8102}:8102'
+
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      TZ: Europe/Madrid
+      DATABASE_URL: postgres://acsales:${DB_PASSWORD:-acsales}@db:5432/acsales
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup-loop.sh:/backup-loop.sh:ro
+    entrypoint: ["/bin/sh", "/backup-loop.sh"]
+
+volumes:
+  pgdata:

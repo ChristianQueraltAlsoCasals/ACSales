@@ -1,0 +1,19 @@
+{
+  "name": "acsales-server",
+  "private": true,
+  "version": "0.1.0",
+  "main": "server.cjs",
+  "scripts": {
+    "dev": "node server.cjs",
+    "start": "node server.cjs",
+    "import-data": "node --max-old-space-size=8192 scripts/import-data-json.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^1.1.1",
+    "pg": "^8.23.0",
+    "undici": "^8.7.0"
+  }
+}

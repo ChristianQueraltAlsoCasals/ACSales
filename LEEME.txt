@@ -1,0 +1,80 @@
+﻿=====================================================================
+ AGENTE DE VENTAS — ALSO CASALS · Instalación definitiva
+=====================================================================
+
+INSTALACIÓN (una sola vez)
+---------------------------------------------------------------------
+1. Crea una carpeta NUEVA y limpia, por ejemplo:
+      C:\AgenteVentas
+   (evita carpetas antiguas con restos de versiones anteriores)
+
+2. Descomprime este zip DENTRO de esa carpeta, de forma que
+   INSTALAR.bat quede directamente en C:\AgenteVentas\INSTALAR.bat
+   (si al descomprimir se crea una subcarpeta "agente-ventas",
+   mueve su CONTENIDO un nivel arriba).
+
+3. Copia de tu instalación anterior estos DOS elementos
+   (son tuyos, nunca vienen en el zip):
+      · el archivo  server\.env          (credenciales)
+      · la carpeta  server\data\         (atributos IA y estado guardado)
+   Si no existe server\data, no pasa nada: se creará sola.
+   Si no tienes .env: copia server\.env.example como server\.env
+   y rellena las claves.
+
+4. Doble clic en  INSTALAR.bat  → espera a que diga "terminada".
+
+5. Doble clic en  INICIAR.bat  → abre el navegador solo.
+   La ventana negra debe quedar ABIERTA mientras se usa la app.
+
+COMPROBACIÓN DE QUE TODO ESTÁ BIEN
+---------------------------------------------------------------------
+En la ventana negra debe verse:
+   [api] Agente de Ventas — backend escuchando en http://localhost:3000
+   [web] Local: http://localhost:5173
+Y NO debe verse "Variables de entorno sin configurar"
+(si sale, el server\.env no está o está incompleto).
+
+USO DIARIO
+---------------------------------------------------------------------
+· Arrancar:  doble clic en INICIAR.bat
+· Parar:     Ctrl+C en la ventana negra (responder S), o cerrarla
+· Los datos cargados y la memoria se guardan solos (server\data\)
+  y se restauran al volver a abrir. No hace falta recargar nada.
+
+ACTUALIZACIONES FUTURAS (cuando Claude entregue un zip nuevo)
+---------------------------------------------------------------------
+1. Parar la aplicación (Ctrl+C)
+2. Del zip nuevo, reemplazar SOLO:
+      · la carpeta  client\src\            (completa)
+      · el archivo  server\server.cjs
+      · el archivo  package.json
+3. Doble clic en INSTALAR.bat
+4. Doble clic en INICIAR.bat
+
+⚠ LO QUE NUNCA SE TOCA (tu configuración y tus datos):
+      · server\.env       ← credenciales
+      · server\data\      ← atributos IA, memoria, estado
+   Los zips de actualización NUNCA incluyen estos elementos,
+   así que reemplazar lo indicado arriba jamás los pisa.
+
+SI ALGO FALLA
+---------------------------------------------------------------------
+· Pantalla con recuadro rojo "Error en la aplicación":
+  copiar el mensaje y pasárselo a Claude.
+· "no se reconoce como comando" o "Cannot find module":
+  volver a ejecutar INSTALAR.bat y dejarlo terminar.
+· "EADDRINUSE ... :3000" (puerto ocupado):
+  cerrar TODAS las ventanas negras y volver a INICIAR.bat.
+  Si persiste:  netstat -ano | findstr :3000  →  taskkill /PID <nº> /F
+· Error 500 / timeout al cargar de Business Central:
+  suele ser lentitud puntual de BC; reintentar. El sistema ya
+  reintenta 3 veces solo. Usar el filtro de años ayuda.
+=====================================================================
+
+
+## Persistencia (Fase 3)
+La app usa Postgres (tabla app_state). Antes de INICIAR.bat:
+1. Arranca Docker Desktop
+2. docker compose up -d db
+3. Primera vez: npm run db:import  (estado.json puede tardar)
+Sin Postgres el backend no arranca.

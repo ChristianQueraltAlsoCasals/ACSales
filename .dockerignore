@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+.git
+.env
+server/.env
+server/env.txt
+server/data
+bc_automation
+backups
+*.md
+ChatGPT.url
+**/*.zip
