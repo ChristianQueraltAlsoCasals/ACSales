@@ -26,6 +26,7 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 require("dotenv").config(); // cwd por si se arranca desde la raíz
 const express = require("express");
+const cookieParser = require("cookie-parser");
 
 // pdf-lib: solo hace falta para "Subir Documento" en Recepción de material
 // (recorta el PDF grande en un PDF por pedido). Si no está instalado, NO
@@ -40,9 +41,18 @@ try {
 
 const app = express();
 app.use(express.json({ limit: "500mb" })); // fichas + líneas con TODAS las columnas: el estado puede ser grande
+app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "public"))); // frontend compilado (build)
 
 const PORT = process.env.PORT || 3000;
+
+// Auth ERP + ACconstelation (mismo patrón que achuman / aclogistics)
+const { router: authRouter, requiereSesion } = require("./auth");
+app.use("/api/auth", authRouter);
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) return next();
+  return requiereSesion(req, res, next);
+});
 
 // ---------------------------------------------------------------------
 // RED ROBUSTA: BC a veces tarda en responder (llamadas grandes) y la
@@ -216,14 +226,40 @@ Retorna NOMÉS el text del correu (sense assumpte tret que sigui imprescindible,
 });
 
 // ---------------------------------------------------------------------
-// 0a-quinquies) BANDEJA DE CORREO (Fase A: leer) — cuenta de Maria
+// 0a-quinquies) BANDEJA + ENVÍO — buzón del usuario logueado (AChuman)
 // ---------------------------------------------------------------------
-// Lista la bandeja de entrada y devuelve el cuerpo de un correo concreto.
-// Usa el mismo token de aplicación de Graph (obtenerTokenGraph).
-// Requiere en Azure: Mail.Read o Mail.ReadWrite (Aplicación) + consent.
-// Buzón configurable con M365_BUZON_PERSONAL (por defecto Maria).
+// Remitente = email_empresa del colaborador en AChuman (sesión).
+// Ya no se usa un buzón fijo (Maria). Fallback: email local/ERP @alsocasals.
 // ---------------------------------------------------------------------
-const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@alsocasals.com";
+const { resolverEmailEnvio } = require("./achuman-client");
+
+async function buzonDelUsuario(req, res) {
+  const r = await resolverEmailEnvio(req.usuario || {});
+  const buzon = r.email || null;
+  if (!buzon) {
+    res.status(400).json({
+      error: r.error
+        || "No tienes correo de empresa en AChuman. Configúralo en achuman.alsocasals.com (email empresa) para poder usar el correo.",
+    });
+    return null;
+  }
+  return buzon;
+}
+
+app.get("/api/correo/remitente", async (req, res) => {
+  try {
+    const r = await resolverEmailEnvio(req.usuario || {});
+    res.json({
+      email: r.email || null,
+      origen: r.origen || null,
+      username: req.usuario?.username || null,
+      nombre: req.usuario?.nom_treballador || req.usuario?.nombre || null,
+      error: r.email ? null : (r.error || "Sin email de empresa en AChuman"),
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
 
 app.get("/api/buzon/mensajes", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) {
@@ -233,8 +269,9 @@ app.get("/api/buzon/mensajes", async (req, res) => {
   const top = Math.min(Number(req.query.top || 40), 100);
   const buscar = (req.query.q || "").toString().trim();
   try {
+    const buzon = await buzonDelUsuario(req, res);
+    if (!buzon) return;
     const token = await obtenerTokenGraph();
-    const buzon = BUZON_PERSONAL();
     const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/${carpeta}/messages`;
     const sel = "$select=id,subject,from,toRecipients,receivedDateTime,sentDateTime,isRead,hasAttachments,bodyPreview";
     let url = `${base}?${sel}&$top=${top}&$orderby=receivedDateTime desc`;
@@ -269,8 +306,9 @@ app.get("/api/buzon/mensaje/:id", async (req, res) => {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   }
   try {
+    const buzon = await buzonDelUsuario(req, res);
+    if (!buzon) return;
     const token = await obtenerTokenGraph();
-    const buzon = BUZON_PERSONAL();
     const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/messages/${req.params.id}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments`;
     const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!r.ok) throw new Error(`Graph respondió ${r.status}: ${await r.text()}`);
@@ -292,16 +330,7 @@ app.get("/api/buzon/mensaje/:id", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// 0a-quater-bis) ENVIAR CORREO (con adjunto opcional) — cuenta de Maria
-// ---------------------------------------------------------------------
-// Envío REAL vía Graph (no mailto: — un mailto no puede llevar adjunto).
-// Se envía "como" el buzón de M365_BUZON_PERSONAL (por defecto Maria).
-// Requiere en Azure: permiso de APLICACIÓN "Mail.Send" + consentimiento
-// de administrador (además del Mail.Read que ya se usa para leer la
-// bandeja) — si no está concedido, Graph responde 403 y este endpoint
-// lo devuelve tal cual para poder identificarlo.
-// ---------------------------------------------------------------------
+// Envío REAL vía Graph como el usuario logueado (email_empresa AChuman).
 app.post("/api/correo/enviar", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
@@ -312,8 +341,9 @@ app.post("/api/correo/enviar", async (req, res) => {
   if (!asunto) return res.status(400).json({ error: "Falta 'asunto'." });
 
   try {
+    const buzon = await buzonDelUsuario(req, res);
+    if (!buzon) return;
     const token = await obtenerTokenGraph();
-    const buzon = BUZON_PERSONAL();
     const mensaje = {
       subject: asunto,
       body: { contentType: "HTML", content: cuerpoHtml || "" },
@@ -342,8 +372,8 @@ app.post("/api/correo/enviar", async (req, res) => {
         : "";
       throw new Error(`Graph respondió ${r.status} enviando el correo${pista}: ${detalle.slice(0, 300)}`);
     }
-    console.log(`[correo/enviar] "${asunto}" → ${destinatarios.join(", ")}${adjunto?.base64 ? " (con adjunto)" : ""}`);
-    res.json({ ok: true, para: destinatarios });
+    console.log(`[correo/enviar] de=${buzon} "${asunto}" → ${destinatarios.join(", ")}${adjunto?.base64 ? " (con adjunto)" : ""}`);
+    res.json({ ok: true, de: buzon, para: destinatarios });
   } catch (err) {
     console.error("Error enviando correo:", err);
     res.status(500).json({ error: "Error enviando el correo.", detalle: String(err.message || err) });

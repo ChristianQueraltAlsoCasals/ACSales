@@ -2,7 +2,5 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  margin: 0;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-}
+/* El resto de la UI (pantallas de ventas) sigue en utilidades Tailwind.
+   Login / marca / tokens corporativos: styles.css (mismo patrón que ACTDrive / aclogistics). */

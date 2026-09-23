@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 120" role="img" aria-label="AClogistics">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4d7c0f"/>
+      <stop offset="100%" stop-color="#65a30d"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="18" width="52" height="52" rx="8" fill="#3f6212"/>
+  <rect x="28" y="30" width="52" height="52" rx="8" fill="url(#g1)"/>
+  <path d="M22 70 L40 28 L48 28 L66 70 H54 L50 58 H36 L32 70 Z M39 48 H47 L43 36 Z" fill="#fff" opacity=".95"/>
+  <path d="M58 78 C58 58 78 48 96 54 C108 58 112 70 104 78" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round"/>
+  <text x="120" y="72" font-family="Segoe UI, system-ui, sans-serif" font-size="54" font-weight="800" fill="#3f6212" letter-spacing="-1.5">AC</text>
+  <text x="210" y="72" font-family="Georgia, 'Times New Roman', serif" font-size="48" font-style="italic" font-weight="600" fill="#65a30d">logistics</text>
+</svg>

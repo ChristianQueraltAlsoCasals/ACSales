@@ -12,7 +12,9 @@ ENV NODE_ENV=production
 WORKDIR /app
 COPY server/package.json server/package-lock.json* ./
 RUN npm install --omit=dev
-COPY server/server.cjs server/db.js server/schema.sql ./
+COPY server/server.cjs server/db.js server/schema.sql \
+     server/auth.js server/erp-auth.js server/erp-db.js server/constellation.js \
+     server/achuman-client.js ./
 COPY --from=web /web/dist ./public
 ENV PORT=8102
 EXPOSE 8102

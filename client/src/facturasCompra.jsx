@@ -231,7 +231,7 @@ function LineaFactura({ linea, disponibles, onElegir, onEditar }) {
   );
 }
 
-function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCancelarSeleccion, registrarAplicador }) {
+function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCancelarSeleccion, registrarAplicador, remitenteEmail = null }) {
   const [abierta, setAbierta] = useState(true);
   const [envio, setEnvio] = useState({ estado: "idle" }); // idle | enviando | ok | error
   const [entrada, setEntrada] = useState({ estado: "idle" }); // idle | entrando | ok | error
@@ -731,6 +731,11 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             )}
           </div>
           <div className="flex items-center gap-2">
+            {remitenteEmail && (
+              <span className="text-[11px] text-slate-500" title="Se envía desde tu correo de empresa (AChuman)">
+                De: <span className="font-medium text-slate-700">{remitenteEmail}</span>
+              </span>
+            )}
             {envio.estado === "ok" && <span className="text-xs text-emerald-600 font-medium">✓ Enviado</span>}
             {envio.estado === "error" && <span className="text-xs text-red-600" title={envio.error}>Error al enviar</span>}
             {!destinatarios.length && <span className="text-xs text-amber-600">Sin destinatarios válidos</span>}
@@ -1573,11 +1578,21 @@ function RegistroFacturas({ abierto, onCerrar }) {
   );
 }
 
-export default function FacturasCompra({ pedidos }) {
+export default function FacturasCompra({ pedidos, usuario = null }) {
   const inputRef = useRef(null);
   const [subiendo, setSubiendo] = useState(false);
   const [error, setError] = useState(null);
   const [resultado, setResultado] = useState(null); // { archivo, paginas, facturas: [...] }
+  const [remitenteEmail, setRemitenteEmail] = useState(
+    usuario?.email_envio || usuario?.email_empresa || null
+  );
+
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => { if (d.email) setRemitenteEmail(d.email); })
+      .catch(() => {});
+  }, []);
 
   // "Elegir pedido a mano" (Maria, 2026-09-04): cuando el pedido leído
   // del PDF no se encuentra en BC, Maria puede buscarlo y elegirlo en
@@ -1734,6 +1749,7 @@ export default function FacturasCompra({ pedidos }) {
                   key={facturaKey}
                   f={f}
                   pedidos={pedidos}
+                  remitenteEmail={remitenteEmail}
                   seleccionActiva={objetivoSeleccion?.facturaKey === facturaKey ? objetivoSeleccion.pedidoIdx : null}
                   onIniciarSeleccion={(pedidoIdx) => setObjetivoSeleccion({ facturaKey, pedidoIdx })}
                   onCancelarSeleccion={() => setObjetivoSeleccion(null)}
@@ -1750,6 +1766,7 @@ export default function FacturasCompra({ pedidos }) {
                   key={facturaKey}
                   f={f}
                   pedidos={pedidos}
+                  remitenteEmail={remitenteEmail}
                   seleccionActiva={objetivoSeleccion?.facturaKey === facturaKey ? objetivoSeleccion.pedidoIdx : null}
                   onIniciarSeleccion={(pedidoIdx) => setObjetivoSeleccion({ facturaKey, pedidoIdx })}
                   onCancelarSeleccion={() => setObjetivoSeleccion(null)}

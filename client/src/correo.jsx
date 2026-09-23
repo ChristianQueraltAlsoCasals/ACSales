@@ -1,9 +1,7 @@
 /**
- * correo.jsx — Pantalla de CORREO (Fase A: leer).
+ * correo.jsx — Pantalla de CORREO.
  *
- * Muestra la bandeja de entrada de la cuenta de Maria (vía backend /api/buzon)
- * y permite abrir un correo y leer su cuerpo. Fases siguientes: redactar con
- * Claude (B) y enviar (C).
+ * Bandeja del usuario logueado (email_empresa de AChuman), no un buzón fijo.
  */
 import React, { useState, useEffect, useCallback } from "react";
 import { RefreshCw, Search, Mail, Paperclip, ArrowLeft, Sparkles, CheckSquare } from "lucide-react";
@@ -19,9 +17,10 @@ const fmtFecha = (iso) => {
     : d.toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit", year: "2-digit" });
 };
 
-export default function Correo({ onCrearTarea }) {
+export default function Correo({ onCrearTarea, usuario = null }) {
   const [carpeta, setCarpeta] = useState("inbox"); // inbox | enviados
   const [mensajes, setMensajes] = useState([]);
+  const [buzon, setBuzon] = useState(usuario?.email_envio || usuario?.email_empresa || null);
   const [cargando, setCargando] = useState(false);
   const [error, setError] = useState(null);
   const [q, setQ] = useState("");
@@ -35,6 +34,13 @@ export default function Correo({ onCrearTarea }) {
   const [borrador, setBorrador] = useState("");
   const [redactando, setRedactando] = useState(false);
   const [errCompo, setErrCompo] = useState(null);
+
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => { if (d.email) setBuzon(d.email); })
+      .catch(() => {});
+  }, []);
 
   const abrirCompositor = (modo, msg) => {
     setCompo({
@@ -73,7 +79,10 @@ export default function Correo({ onCrearTarea }) {
       const r = await fetch(`/api/buzon/mensajes?${params.toString()}`);
       const d = await r.json();
       if (!r.ok) { setError(d.error || "No s'ha pogut carregar la bústia."); setMensajes([]); }
-      else setMensajes(d.mensajes || []);
+      else {
+        setMensajes(d.mensajes || []);
+        if (d.buzon) setBuzon(d.buzon);
+      }
     } catch (e) {
       setError("No s'ha pogut connectar amb el servidor.");
     } finally {
@@ -156,7 +165,10 @@ export default function Correo({ onCrearTarea }) {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">Correu</h1>
-          <p className="text-slate-500 text-sm mt-1">Safata de {carpeta === "inbox" ? "entrada" : "enviats"} · maria.rufi@alsocasals.com</p>
+          <p className="text-slate-500 text-sm mt-1">
+            Safata de {carpeta === "inbox" ? "entrada" : "enviats"}
+            {buzon ? <> · <span className="font-medium text-slate-700">{buzon}</span></> : " · resolviendo buzón…"}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <button onClick={() => abrirCompositor("nuevo", null)} className="flex items-center gap-2 text-sm font-semibold text-blue-700 bg-white border border-blue-300 hover:bg-blue-50 rounded-md px-4 py-2">

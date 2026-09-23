@@ -1,0 +1,126 @@
+/* ====== Base ACsales (blaus Constellation) ====== */
+:root {
+  --primari: #0369a1;
+  --primari-fosc: #0c4a6e;
+  --accent: #38bdf8;
+  --fons: #f0f7fc;
+  --tinta: #1e293b;
+  --tinta-suau: #64748b;
+  --vora: #d8e4ef;
+  --vora-forta: #b5c8d9;
+  --blanc: #ffffff;
+  --perill: #b3372f;
+  --marca-soft: #e0f2fe;
+  --shadow: 0 1px 2px rgba(15, 41, 71, 0.07), 0 1px 6px rgba(15, 41, 71, 0.05);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--fons);
+  color: var(--tinta);
+  font-size: 15px;
+}
+
+h1, h2, h3 { margin: 0.2rem 0 0.6rem; }
+h2 { font-size: 1.15rem; }
+h3 { font-size: 1rem; color: var(--primari-fosc); }
+
+a { color: var(--primari); }
+
+button {
+  font: inherit;
+  border: 1px solid var(--vora-forta);
+  background: var(--blanc);
+  color: var(--tinta);
+  border-radius: 6px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+button:hover { border-color: var(--primari); }
+button:disabled { opacity: 0.5; cursor: default; }
+
+.boto-primari { background: var(--primari); border-color: var(--primari); color: #fff; }
+.boto-primari:hover { background: var(--primari-fosc); }
+.boto-secundari { background: var(--blanc); }
+.boto-perill { color: var(--perill); border-color: var(--perill); }
+a.boto-primari {
+  display: block;
+  text-align: center;
+  text-decoration: none;
+  color: #fff;
+}
+
+input, select, textarea {
+  font: inherit;
+  border: 1px solid var(--vora-forta);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  background: var(--blanc);
+  color: var(--tinta);
+  max-width: 100%;
+}
+textarea { width: 100%; resize: vertical; }
+label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; }
+
+.error { color: var(--perill); margin: 0.4rem 0; }
+.ajuda { color: var(--tinta-suau); font-size: 0.85rem; margin: 0.2rem 0 0.7rem; line-height: 1.35; }
+.carregant { padding: 3rem; text-align: center; color: var(--tinta-suau); }
+
+/* ====== Marca ====== */
+.marca-ac {
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--primari-fosc);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.marca-ac .sufix { color: var(--accent); font-style: italic; font-weight: 700; }
+.login-caixa .marca-ac { font-size: 2.2rem; text-align: center; }
+.login-sub {
+  text-align: center;
+  color: var(--tinta-suau);
+  font-size: 0.85rem;
+  margin: -0.5rem 0 0.2rem;
+}
+.login-caixa h1 {
+  font-size: 1.05rem;
+  color: var(--primari-fosc);
+  text-align: center;
+  margin: 0;
+  font-weight: 600;
+}
+
+/* ====== Login ====== */
+.login-fons {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(160deg, #e0f2fe 0%, var(--fons) 45%, #dbeafe 100%);
+}
+.login-caixa {
+  background: var(--blanc);
+  border: 1px solid var(--vora);
+  border-radius: 10px;
+  padding: 1.6rem;
+  width: min(24rem, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  box-shadow: var(--shadow);
+}
+.login-logo { width: min(19rem, 100%); margin: 0 auto; }
+.login-empreses {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 1.1rem;
+  flex-wrap: wrap;
+  margin-top: 0.6rem;
+  border-top: 1px solid var(--vora);
+  padding-top: 0.9rem;
+}
+.login-empreses img { height: 26px; width: auto; }

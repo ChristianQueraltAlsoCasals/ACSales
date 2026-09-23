@@ -1,23 +1,35 @@
 const fs = require("fs");
 const path = require("path");
+const bcrypt = require("bcryptjs");
 const { Pool } = require("pg");
 
 /** Límite práctico bajo el tope JSONB de Postgres (~256 MB). */
 const JSONB_SAFE_BYTES = 240 * 1024 * 1024;
 
-let pool = null;
+let _pg = null;
 
 function getPool() {
-  if (!pool) {
+  if (!_pg) {
     if (!process.env.DATABASE_URL) {
       throw new Error("Falta DATABASE_URL en el entorno (.env en la raíz del repo).");
     }
-    pool = new Pool({
+    _pg = new Pool({
       connectionString: process.env.DATABASE_URL,
       options: "-c client_encoding=UTF8",
     });
   }
-  return pool;
+  return _pg;
+}
+
+/** Proxy compatible con auth/erp-auth (esperan `pool.query`). */
+const pool = {
+  query: (...args) => getPool().query(...args),
+  connect: (...args) => getPool().connect(...args),
+};
+
+/** Hook vacío (otras apps siembran datos por usuario; ACsales no). */
+async function sembrarUsuario(_usuarioId, _email) {
+  return;
 }
 
 async function init() {
@@ -26,6 +38,20 @@ async function init() {
   await p.query(schema);
   const { rows } = await p.query("SELECT count(*)::int AS n FROM app_state");
   console.log(`[db] Postgres OK · app_state con ${rows[0].n} clave(s)`);
+
+  const { rows: usuarios } = await p.query("SELECT count(*)::int AS n FROM usuarios");
+  if (usuarios[0].n === 0) {
+    const username = (process.env.ADMIN_USER || "admin").toLowerCase();
+    const email = (process.env.ADMIN_EMAIL || "admin@empresa.local").toLowerCase();
+    const password = process.env.ADMIN_PASSWORD || "canviam123";
+    const hash = await bcrypt.hash(password, 10);
+    await p.query(
+      `INSERT INTO usuarios (nombre, username, email, password_hash, rol, auth_origen)
+       VALUES ($1, $2, $3, $4, 'admin', 'local')`,
+      ["Admin", username, email, hash]
+    );
+    console.log(`[db] Usuario administrador local creado: ${username} (${email})`);
+  }
   return p;
 }
 
@@ -153,6 +179,8 @@ async function deleteEstado() {
 module.exports = {
   init,
   getPool,
+  pool,
+  sembrarUsuario,
   getDoc,
   setDoc,
   deleteDoc,
