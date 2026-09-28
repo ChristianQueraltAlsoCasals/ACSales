@@ -11,7 +11,9 @@ CREATE INDEX IF NOT EXISTS idx_app_state_clave_prefix
 
 COMMENT ON TABLE app_state IS
   'Documentos JSON. estado.bcData.<fuente> = caché BC partida (límite JSONB ~256MB); '
-  'estado.fichas / resumen / otFiles; recepcion, avisos, atributos, registro_facturas_compra.';
+  'estado.fichas / resumen / otFiles; recepcion[_slug], avisos[_slug], horas[_slug], '
+  'registro_facturas_compra[_slug], bandeja_facturas, indicadores_macro, chats_ia, '
+  'cambios_bc, reglas_ia, atributos.';
 
 -- Usuarios locales (mirror ERP / SSO), igual que el resto de apps AC.
 CREATE TABLE IF NOT EXISTS usuarios (

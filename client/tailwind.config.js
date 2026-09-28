@@ -1,6 +1,122 @@
 /** @type {import('tailwindcss').Config} */
+/**
+ * Tema visual alineado con Dynamics 365 Business Central (Fluent UI).
+ * Solo afecta colores / radios / tipografía: la lógica de la app no cambia.
+ */
 export default {
   content: ["./index.html", "./src/**/*.{js,jsx}"],
-  theme: { extend: {} },
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: [
+          '"Segoe UI"',
+          '"Segoe UI Web (West European)"',
+          "-apple-system",
+          "BlinkMacSystemFont",
+          "Roboto",
+          "Helvetica Neue",
+          "sans-serif",
+        ],
+      },
+      borderRadius: {
+        DEFAULT: "2px",
+        sm: "2px",
+        md: "2px",
+        lg: "2px",
+        xl: "2px",
+        "2xl": "4px",
+        "3xl": "4px",
+        full: "9999px",
+      },
+      boxShadow: {
+        sm: "0 0.3px 0.9px rgba(0,0,0,0.1), 0 1.6px 3.6px rgba(0,0,0,0.13)",
+        DEFAULT: "0 0.6px 1.8px rgba(0,0,0,0.1), 0 3.2px 7.2px rgba(0,0,0,0.13)",
+        md: "0 1.2px 3.6px rgba(0,0,0,0.1), 0 6.4px 14.4px rgba(0,0,0,0.13)",
+        lg: "0 1.2px 3.6px rgba(0,0,0,0.1), 0 6.4px 14.4px rgba(0,0,0,0.13)",
+        xl: "0 3.2px 7.2px rgba(0,0,0,0.12), 0 12.8px 28.8px rgba(0,0,0,0.14)",
+        "2xl": "0 6.4px 14.4px rgba(0,0,0,0.14), 0 25.6px 57.6px rgba(0,0,0,0.16)",
+      },
+      colors: {
+        /* Fluent neutrals → reemplazan slate en toda la UI */
+        slate: {
+          50: "#FAF9F8",
+          100: "#F3F2F1",
+          200: "#EDEBE9",
+          300: "#E1DFDD",
+          400: "#A19F9D",
+          500: "#8A8886",
+          600: "#605E5C",
+          700: "#484644",
+          800: "#323130",
+          900: "#201F1E",
+          950: "#11100F",
+        },
+        /* Microsoft / BC blue */
+        blue: {
+          50: "#EFF6FC",
+          100: "#DEECF9",
+          200: "#C7E0F4",
+          300: "#71AFE5",
+          400: "#2B88D8",
+          500: "#0078D4",
+          600: "#106EBE",
+          700: "#005A9E",
+          800: "#004578",
+          900: "#002050",
+          950: "#001536",
+        },
+        /* Acentos “IA / memoria” → teal BC (en lugar de púrpura genérico) */
+        purple: {
+          50: "#F0FDFA",
+          100: "#CCFBF1",
+          200: "#99F6E4",
+          300: "#5EEAD4",
+          400: "#2DD4BF",
+          500: "#00B7C3",
+          600: "#038387",
+          700: "#006666",
+          800: "#004D4D",
+          900: "#003333",
+          950: "#001A1A",
+        },
+        emerald: {
+          50: "#F3FAF7",
+          100: "#DFF6DD",
+          200: "#9FD89F",
+          300: "#6BB700",
+          400: "#4EA700",
+          500: "#107C10",
+          600: "#0B6A0B",
+          700: "#094509",
+          800: "#063B06",
+          900: "#042504",
+        },
+        amber: {
+          50: "#FFF9F5",
+          100: "#FFF4CE",
+          200: "#FFE399",
+          300: "#FFB900",
+          400: "#FFAA44",
+          500: "#D83B01",
+          600: "#C73500",
+          700: "#A80000",
+          800: "#8A0000",
+          900: "#6B0000",
+        },
+        red: {
+          50: "#FDF3F4",
+          100: "#FDE7E9",
+          200: "#F1A9AE",
+          300: "#E37D84",
+          400: "#D13438",
+          500: "#A4262C",
+          600: "#8E1920",
+          700: "#750B1C",
+          800: "#5C0010",
+          900: "#3B000A",
+        },
+      },
+    },
+  },
   plugins: [],
 };

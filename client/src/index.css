@@ -2,5 +2,5 @@
 @tailwind components;
 @tailwind utilities;
 
-/* El resto de la UI (pantallas de ventas) sigue en utilidades Tailwind.
-   Login / marca / tokens corporativos: styles.css (mismo patrón que ACTDrive / aclogistics). */
+/* Tema visual Dynamics 365 Business Central: styles.css + tailwind.config.js.
+   Login / shell / tokens Fluent: styles.css. Las pantallas siguen en utilidades Tailwind. */

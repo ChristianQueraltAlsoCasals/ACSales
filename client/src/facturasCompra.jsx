@@ -32,8 +32,9 @@
  * es solo un chequeo antes de entrar la factura.
  */
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet } from "lucide-react";
+import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet, Inbox } from "lucide-react";
 import { emailsPorCodigoDepartamento, EMAIL_POR_DEFECTO } from "./departamentos.js";
+import { empresaGuardada } from "./empresa.jsx";
 
 const fmtEur = (n) =>
   n === null || n === undefined || Number.isNaN(Number(n))
@@ -160,73 +161,140 @@ function construirCuerpoHtml(factura, motivos) {
   </div>`;
 }
 
-// Línea de la factura, ya cruzada con BC. Cuando no se ha encontrado
-// (o el emparejamiento automático se ha equivocado) se puede elegir a
-// mano la línea real del pedido en BC — igual que ya permite hacer
-// Recepción de material con "lineasDisponiblesBC".
+// Línea de la factura, ya cruzada con BC. Vista lado a lado:
+// izquierda = lo leído de la factura; derecha = línea del pedido en BC.
+// Cuando no se ha encontrado (o el emparejamiento se equivoca) se puede
+// elegir a mano la línea real del pedido — igual que Recepción de material.
+function badgeCoincidencia(coincidencia) {
+  if (coincidencia === "alta") return { texto: "Coincidencia alta", cls: "bg-emerald-100 text-emerald-800" };
+  if (coincidencia === "media") return { texto: "Coincidencia media", cls: "bg-amber-100 text-amber-800" };
+  if (coincidencia === "manual") return { texto: "Elegida a mano", cls: "bg-blue-100 text-blue-800" };
+  return { texto: "Sin match", cls: "bg-red-100 text-red-800" };
+}
+
 function LineaFactura({ linea, disponibles, onElegir, onEditar }) {
   const problema = linea.coincidencia === "sin_match" || linea.pendienteRecepcion || linea.diferenciaPrecio;
+  const badge = badgeCoincidencia(linea.coincidencia);
+  const importeFactura =
+    linea.cantidadFacturada != null && linea.precioFacturado != null
+      ? Number(linea.cantidadFacturada) * Number(linea.precioFacturado)
+      : null;
+  const mostrarSelector = disponibles && disponibles.length > 0;
+
   return (
-    <div className={`text-xs px-3 py-2 rounded border ${problema ? "bg-red-50 border-red-200" : "bg-emerald-50 border-emerald-200"}`}>
-      <input
-        value={linea.descripcionFactura}
-        onChange={(e) => onEditar("descripcionFactura", e.target.value)}
-        title="Descripción tal como la ha leído la IA — corrígela si hace falta"
-        className="w-full font-medium text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-blue-400 focus:outline-none focus:bg-white"
-      />
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-500">
-        <span className="flex items-center gap-1">
-          Facturado:
-          <input
-            type="number"
-            step="0.01"
-            value={linea.cantidadFacturada}
-            onChange={(e) => onEditar("cantidadFacturada", e.target.value === "" ? 0 : Number(e.target.value))}
-            className="w-16 border border-slate-200 rounded px-1 py-0.5 bg-white text-slate-700"
-          />
-          ·
-          <input
-            type="number"
-            step="0.01"
-            value={linea.precioFacturado ?? ""}
-            onChange={(e) => onEditar("precioFacturado", e.target.value === "" ? null : Number(e.target.value))}
-            className="w-20 border border-slate-200 rounded px-1 py-0.5 bg-white text-slate-700"
-          />
-          €
-        </span>
-        {linea.lineaBC ? (
-          <span>
-            BC: pedido {linea.lineaBC.cantidadPedida}, recibido {linea.lineaBC.cantidadRecibida} · {fmtEur(linea.lineaBC.precioBC)}
-            {linea.coincidencia === "manual" && <span className="text-blue-600 font-medium"> (elegida a mano)</span>}
-          </span>
-        ) : (
-          <span className="text-red-600 font-medium">No encontrada en el pedido en BC</span>
+    <div className={`rounded-md border overflow-hidden ${problema ? "border-red-200" : "border-emerald-200"}`}>
+      <div className={`flex items-center justify-between gap-2 px-3 py-1.5 text-[11px] font-semibold ${problema ? "bg-red-50 text-red-800" : "bg-emerald-50 text-emerald-800"}`}>
+        <span className={`px-1.5 py-0.5 rounded ${badge.cls}`}>{badge.texto}</span>
+        {linea.pendienteRecepcion && linea.lineaBC && (
+          <span className="text-red-700 font-medium">⚠ Pendiente de recibir/registrar</span>
+        )}
+        {linea.diferenciaPrecio && (
+          <span className="text-red-700 font-medium">⚠ Precio distinto</span>
         )}
       </div>
-      {(!linea.lineaBC || linea.coincidencia === "media") && disponibles && disponibles.length > 0 && (
-        <div className="mt-1.5">
-          <select
-            value={linea.coincidencia === "manual" ? linea.lineaBC?.id || "" : ""}
-            onChange={(e) => e.target.value && onElegir(e.target.value)}
-            className="w-full text-[11px] border border-amber-300 rounded px-1.5 py-1 bg-white text-slate-600"
-          >
-            <option value="">
-              {linea.lineaBC ? "— no es esta línea, elegir otra a mano —" : "— sin coincidencia — elegir a mano —"}
-            </option>
-            {disponibles.map((lb) => (
-              <option key={lb.id} value={lb.id}>
-                {lb.codigo ? `${lb.codigo} — ` : ""}{lb.descripcion} (pedido {lb.cantidadPedida}, recibido {lb.cantidadRecibida})
-              </option>
-            ))}
-          </select>
+      <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-slate-200 bg-white">
+        {/* Columna factura */}
+        <div className="px-3 py-2.5 space-y-1.5">
+          <div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Factura (PDF)</div>
+          <input
+            value={linea.descripcionFactura}
+            onChange={(e) => onEditar("descripcionFactura", e.target.value)}
+            title="Descripción tal como la ha leído la IA — corrígela si hace falta"
+            className="w-full text-xs font-medium text-slate-800 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-blue-400 focus:outline-none focus:bg-white"
+          />
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600">
+            <label className="flex items-center gap-1">
+              Cant.
+              <input
+                type="number"
+                step="0.01"
+                value={linea.cantidadFacturada}
+                onChange={(e) => onEditar("cantidadFacturada", e.target.value === "" ? 0 : Number(e.target.value))}
+                className="w-16 border border-slate-200 rounded px-1 py-0.5 bg-white text-slate-700"
+              />
+            </label>
+            <label className="flex items-center gap-1">
+              P.u.
+              <input
+                type="number"
+                step="0.01"
+                value={linea.precioFacturado ?? ""}
+                onChange={(e) => onEditar("precioFacturado", e.target.value === "" ? null : Number(e.target.value))}
+                className="w-20 border border-slate-200 rounded px-1 py-0.5 bg-white text-slate-700"
+              />
+              €
+            </label>
+            {importeFactura != null && !Number.isNaN(importeFactura) && (
+              <span className="text-slate-500">= {fmtEur(importeFactura)}</span>
+            )}
+          </div>
         </div>
-      )}
-      {linea.pendienteRecepcion && linea.lineaBC && (
-        <div className="mt-1 text-red-700">⚠ Pendiente de recibir/registrar en BC.</div>
-      )}
-      {linea.diferenciaPrecio && (
-        <div className="mt-1 text-red-700">⚠ El precio no coincide con BC.</div>
-      )}
+
+        {/* Columna pedido BC */}
+        <div className="px-3 py-2.5 space-y-1.5">
+          <div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Pedido compra (BC)</div>
+          {linea.lineaBC ? (
+            <>
+              <div className="text-xs font-medium text-slate-800">
+                {linea.lineaBC.codigo ? (
+                  <span className="font-mono text-[11px] text-blue-700 mr-1.5">{linea.lineaBC.codigo}</span>
+                ) : null}
+                {linea.lineaBC.descripcion || "—"}
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-600">
+                <span>Pedido: <b>{linea.lineaBC.cantidadPedida}</b></span>
+                <span className={linea.pendienteRecepcion ? "text-red-700 font-semibold" : ""}>
+                  Recibido: <b>{linea.lineaBC.cantidadRecibida}</b>
+                </span>
+                <span className={linea.diferenciaPrecio ? "text-red-700 font-semibold" : ""}>
+                  P.u.: <b>{fmtEur(linea.lineaBC.precioBC)}</b>
+                </span>
+                {linea.lineaBC.lineType && linea.lineaBC.lineType !== "Item" && (
+                  <span className="text-slate-400">({linea.lineaBC.lineType})</span>
+                )}
+              </div>
+              {(linea.pendienteRecepcion || linea.diferenciaPrecio) && (
+                <div className="text-[11px] text-red-700 space-y-0.5">
+                  {linea.pendienteRecepcion && (
+                    <div>
+                      Facturado {linea.cantidadFacturada} &gt; recibido {linea.lineaBC.cantidadRecibida} — falta recibir/registrar en BC.
+                    </div>
+                  )}
+                  {linea.diferenciaPrecio && (
+                    <div>
+                      Precio factura {fmtEur(linea.precioFacturado)} vs BC {fmtEur(linea.lineaBC.precioBC)}.
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="text-xs text-red-600 font-medium">
+              No encontrada en el pedido en BC — elige una línea abajo o corrige el pedido.
+            </div>
+          )}
+          {mostrarSelector && (
+            <select
+              value={linea.coincidencia === "manual" ? linea.lineaBC?.id || "" : ""}
+              onChange={(e) => e.target.value && onElegir(e.target.value)}
+              className="w-full text-[11px] border border-amber-300 rounded px-1.5 py-1 bg-amber-50 text-slate-700"
+            >
+              <option value="">
+                {linea.lineaBC
+                  ? linea.coincidencia === "alta"
+                    ? "— cambiar emparejamiento a mano —"
+                    : "— no es esta línea, elegir otra a mano —"
+                  : "— sin coincidencia — elegir a mano —"}
+              </option>
+              {disponibles.map((lb) => (
+                <option key={lb.id} value={lb.id}>
+                  {lb.codigo ? `${lb.codigo} — ` : ""}{lb.descripcion} · ped. {lb.cantidadPedida} · rec. {lb.cantidadRecibida} · {fmtEur(lb.precioBC)}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -849,7 +917,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       )}
 
       {abierta && (
-        <div className="px-4 py-3 border-t border-slate-100" onClick={(e) => e.stopPropagation()}>
+        <div className="px-4 py-3 border-t border-slate-100 space-y-4" onClick={(e) => e.stopPropagation()}>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {/* Vista previa del PDF de la factura */}
             <div>
@@ -859,7 +927,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                   src={`data:application/pdf;base64,${f.pdfBase64}`}
                   title={`factura-${cabecera.factura}`}
                   className="w-full border border-slate-200 rounded-md"
-                  style={{ height: 480 }}
+                  style={{ height: 360 }}
                 />
               ) : (
                 <div className="text-sm text-slate-400 border border-dashed border-slate-200 rounded-md p-6 text-center">Sin vista previa</div>
@@ -868,7 +936,8 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
 
             {/* Datos leídos del PDF — todos editables, por si la IA se ha equivocado en algo */}
             <div>
-              <div className="grid grid-cols-2 gap-2 mb-3">
+              <div className="text-[11px] font-semibold text-slate-500 mb-2 uppercase tracking-wide">Cabecera leída del PDF</div>
+              <div className="grid grid-cols-2 gap-2">
                 <label className="text-xs block">
                   <span className="block text-[11px] font-semibold text-slate-500 mb-0.5">Nº factura</span>
                   <input
@@ -907,82 +976,103 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                   />
                 </label>
               </div>
+            </div>
+          </div>
 
-              <div className="space-y-3 overflow-y-auto pr-1" style={{ maxHeight: 380 }}>
-                {pedidosDetalle.map((p, i) => (
-                  <div key={i}>
-                    <div className="flex items-center justify-between gap-2 mb-1">
-                      <div className="text-xs font-semibold text-slate-600">
-                        {/* Enlace directo al pedido en BC (Maria,
-                            2026-09-04) — abre en pestaña nueva la ficha
-                            del pedido de compra en el cliente web. */}
-                        {p.pedido ? (
-                          p.enlaceBC ? (
-                            <a
-                              href={p.enlaceBC}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={(e) => e.stopPropagation()}
-                              title="Abrir este pedido de compra en Business Central"
-                              className="text-blue-700 hover:text-blue-900 hover:underline"
-                            >
-                              Pedido {p.pedido}
-                            </a>
-                          ) : (
-                            <>Pedido {p.pedido}</>
-                          )
-                        ) : (
-                          <span className="text-amber-700">Sin pedido</span>
-                        )}{" "}
-                        {p.vendorName ? `· ${p.vendorName}` : ""}
-                        {p.pedidoElegidoAMano && <span className="text-blue-600 font-medium"> (elegido a mano)</span>}
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {p.pedido && (
-                          <button
-                            onClick={() => refrescarPedido(i)}
-                            disabled={refrescando[i]}
-                            title="Volver a consultar este pedido en BC (líneas, recibido, precio)"
-                            className="flex items-center gap-1 text-[11px] font-medium text-blue-600 hover:text-blue-800 disabled:opacity-50"
-                          >
-                            <RefreshCw size={11} className={refrescando[i] ? "animate-spin" : ""} />
-                            {refrescando[i] ? "Actualizando…" : "Actualizar desde BC"}
-                          </button>
-                        )}
-                        {p.bcError && (
-                          <button
-                            onClick={() => (seleccionActiva === i ? onCancelarSeleccion?.() : onIniciarSeleccion?.(i))}
-                            title="Buscar el pedido correcto en la lista de 'Pedidos de compra pendientes de facturar' de más abajo"
-                            className="text-[11px] font-medium text-amber-700 hover:text-amber-900"
-                          >
-                            {seleccionActiva === i ? "Cancelar" : "Elegir pedido manualmente"}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    {seleccionActiva === i && (
-                      <div className="text-xs text-blue-700 mb-1">
-                        ☝ Busca y elige el pedido correcto en "Pedidos de compra pendientes de facturar", más abajo.
-                      </div>
-                    )}
-                    {p.bcError ? (
-                      <div className="text-xs text-red-600">{p.bcError}</div>
-                    ) : (
-                      <div className="space-y-1.5">
-                        {p.lineas.map((l, j) => (
-                          <LineaFactura
-                            key={j}
-                            linea={l}
-                            disponibles={p.lineasDisponiblesBC}
-                            onElegir={(lineaBcId) => elegirLineaBC(i, j, lineaBcId)}
-                            onEditar={(campo, valor) => editarLinea(i, j, campo, valor)}
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                ))}
+          {/* Cotejo línea a línea: factura vs pedido BC — a ancho completo */}
+          <div>
+            <div className="flex items-baseline justify-between gap-2 mb-2">
+              <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
+                Cotejo línea a línea · factura ↔ pedido de compra
               </div>
+              <div className="text-[11px] text-slate-400">
+                Izquierda = PDF · Derecha = BC
+              </div>
+            </div>
+            <div className="space-y-4">
+              {pedidosDetalle.map((p, i) => (
+                <div key={i} className="border border-slate-200 rounded-lg overflow-hidden">
+                  <div className="flex items-center justify-between gap-2 px-3 py-2 bg-slate-50 border-b border-slate-200">
+                    <div className="text-xs font-semibold text-slate-700">
+                      {p.pedido ? (
+                        p.enlaceBC ? (
+                          <a
+                            href={p.enlaceBC}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            title="Abrir este pedido de compra en Business Central"
+                            className="text-blue-700 hover:text-blue-900 hover:underline"
+                          >
+                            Pedido {p.pedido}
+                          </a>
+                        ) : (
+                          <>Pedido {p.pedido}</>
+                        )
+                      ) : (
+                        <span className="text-amber-700">Sin pedido</span>
+                      )}{" "}
+                      {p.vendorName ? <span className="font-normal text-slate-500">· {p.vendorName}</span> : ""}
+                      {p.pedidoElegidoAMano && <span className="text-blue-600 font-medium"> (elegido a mano)</span>}
+                      {p.lineas?.length > 0 && (
+                        <span className="ml-2 font-normal text-slate-400">
+                          · {p.lineas.length} línea{p.lineas.length === 1 ? "" : "s"}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {p.pedido && (
+                        <button
+                          onClick={() => refrescarPedido(i)}
+                          disabled={refrescando[i]}
+                          title="Volver a consultar este pedido en BC (líneas, recibido, precio)"
+                          className="flex items-center gap-1 text-[11px] font-medium text-blue-600 hover:text-blue-800 disabled:opacity-50"
+                        >
+                          <RefreshCw size={11} className={refrescando[i] ? "animate-spin" : ""} />
+                          {refrescando[i] ? "Actualizando…" : "Actualizar desde BC"}
+                        </button>
+                      )}
+                      {p.bcError && (
+                        <button
+                          onClick={() => (seleccionActiva === i ? onCancelarSeleccion?.() : onIniciarSeleccion?.(i))}
+                          title="Buscar el pedido correcto en la lista de 'Pedidos de compra pendientes de facturar' de más abajo"
+                          className="text-[11px] font-medium text-amber-700 hover:text-amber-900"
+                        >
+                          {seleccionActiva === i ? "Cancelar" : "Elegir pedido manualmente"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {seleccionActiva === i && (
+                    <div className="px-3 py-1.5 text-xs text-blue-700 bg-blue-50 border-b border-blue-100">
+                      ☝ Busca y elige el pedido correcto en "Pedidos de compra pendientes de facturar", más abajo.
+                    </div>
+                  )}
+                  {p.bcError && (
+                    <div className="px-3 py-1.5 text-xs text-red-700 bg-red-50 border-b border-red-100">{p.bcError}</div>
+                  )}
+                  {(p.lineas || []).length === 0 ? (
+                    <div className="px-3 py-3 text-xs text-slate-400">Sin líneas detectadas en este pedido.</div>
+                  ) : (
+                    <div className="p-2 space-y-2">
+                      {p.lineas.map((l, j) => (
+                        <LineaFactura
+                          key={j}
+                          linea={l}
+                          disponibles={p.lineasDisponiblesBC}
+                          onElegir={(lineaBcId) => elegirLineaBC(i, j, lineaBcId)}
+                          onEditar={(campo, valor) => editarLinea(i, j, campo, valor)}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+              {pedidosDetalle.length === 0 && (
+                <div className="text-xs text-slate-400 border border-dashed border-slate-200 rounded-md p-4 text-center">
+                  No hay pedidos/líneas asociados a esta factura.
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1578,6 +1668,122 @@ function RegistroFacturas({ abierto, onCerrar }) {
   );
 }
 
+/** Bandeja de facturacio@: asigna cada PDF a la empresa por CIF. */
+function BandejaFacturas({ onValidar, validando }) {
+  const [abierta, setAbierta] = useState(false);
+  const [dias, setDias] = useState(7);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState(null);
+  const [datos, setDatos] = useState(null);
+  const [verOtras, setVerOtras] = useState(false);
+  const [verProcesadas, setVerProcesadas] = useState(false);
+  const empresa = empresaGuardada();
+
+  const cargar = async (d = dias) => {
+    setCargando(true); setError(null);
+    try {
+      const r = await fetch(`/api/facturas-compra/bandeja?dias=${d}`);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — ") || `Error ${r.status}`);
+      setDatos(j);
+    } catch (e) { setError(e.message || String(e)); }
+    setCargando(false);
+  };
+  useEffect(() => { if (abierta && !datos) cargar(); }, [abierta]);
+
+  const marcar = async (it, quitar = false) => {
+    await fetch("/api/facturas-compra/bandeja/procesada", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ msg: it.msg, att: it.att, quitar }) }).catch(() => {});
+    setDatos((d) => d && { ...d, items: d.items.map((x) => (x.msg === it.msg && x.att === it.att ? { ...x, procesada: quitar ? null : { ts: new Date().toISOString() } } : x)) });
+  };
+  const validar = async (it) => {
+    const ok = await onValidar(it);
+    if (ok) marcar(it);
+  };
+
+  const items = datos?.items || [];
+  const actualId = datos?.empresaActual;
+  const deEsta = items.filter((it) => it.empresaId === actualId);
+  const sinAsignar = items.filter((it) => !it.empresaId);
+  const deOtras = items.filter((it) => it.empresaId && it.empresaId !== actualId);
+  const visibles = [...deEsta, ...sinAsignar, ...(verOtras ? deOtras : [])]
+    .filter((it) => verProcesadas || !it.procesada)
+    .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
+  const pendientesEsta = deEsta.filter((it) => !it.procesada).length;
+
+  return (
+    <div className="mt-4 bg-white border border-slate-200 rounded-lg">
+      <button onClick={() => setAbierta((v) => !v)} className="w-full flex items-center justify-between px-4 py-2.5 text-sm font-semibold text-slate-700">
+        <span className="flex items-center gap-2"><Inbox size={16} className="text-purple-600" /> Bandeja de facturas · {datos?.buzon || "facturacio@alsocasals.com"}
+          {datos && <span className="text-[11px] font-normal text-slate-500">· {pendientesEsta} pendiente(s) de {empresa?.displayName || "esta empresa"}</span>}
+        </span>
+        <span className="text-[11px] text-slate-400">{abierta ? "ocultar ▲" : "mostrar ▼"}</span>
+      </button>
+      {abierta && (
+        <div className="px-4 pb-3">
+          <div className="flex flex-wrap items-center gap-3 text-[12px] mb-2">
+            <label className="flex items-center gap-1">Últimos
+              <select value={dias} onChange={(e) => { setDias(Number(e.target.value)); cargar(Number(e.target.value)); }} className="border border-slate-300 rounded px-1 py-0.5">
+                {[1, 3, 7, 15, 30, 60].map((d) => <option key={d} value={d}>{d} día{d > 1 ? "s" : ""}</option>)}
+              </select>
+            </label>
+            <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={verOtras} onChange={(e) => setVerOtras(e.target.checked)} /> Ver también las de otras empresas ({deOtras.length})</label>
+            <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={verProcesadas} onChange={(e) => setVerProcesadas(e.target.checked)} /> Ver ya validadas</label>
+            <button onClick={() => cargar()} disabled={cargando} className="flex items-center gap-1 text-purple-700 hover:underline disabled:opacity-50">
+              <RefreshCw size={12} className={cargando ? "animate-spin" : ""} /> Actualizar
+            </button>
+            <span className="text-slate-400 ml-auto">No se marca nada como leído en Outlook</span>
+          </div>
+          {error && <div className="text-[12px] text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-2">{error}</div>}
+          {cargando && !datos && <div className="text-[12px] text-slate-400">Leyendo el buzón y detectando el CIF de cada factura…</div>}
+          {datos && visibles.length === 0 && <div className="text-[12px] text-slate-400">No hay facturas pendientes de {empresa?.displayName || "esta empresa"} en este periodo.</div>}
+          {visibles.length > 0 && (
+            <table className="w-full text-[12px]">
+              <thead>
+                <tr className="text-left text-slate-500 border-b border-slate-200">
+                  <th className="py-1 pr-2">Recibido</th><th className="py-1 pr-2">De</th><th className="py-1 pr-2">Asunto / archivo</th><th className="py-1 pr-2">Empresa (por CIF)</th><th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibles.map((it) => {
+                  const otra = it.empresaId && it.empresaId !== actualId;
+                  return (
+                    <tr key={`${it.msg}|${it.att}`} className={`border-b border-slate-100 ${it.procesada ? "opacity-60" : ""}`}>
+                      <td className="py-1 pr-2 whitespace-nowrap text-slate-500">{new Date(it.fecha).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</td>
+                      <td className="py-1 pr-2 truncate max-w-[180px]" title={it.de}>{it.deNombre || it.de}</td>
+                      <td className="py-1 pr-2"><div className="truncate max-w-[320px]" title={it.asunto}>{it.asunto}</div><div className="text-[10px] text-slate-400 truncate max-w-[320px]">{it.nombre}</div></td>
+                      <td className="py-1 pr-2 whitespace-nowrap">
+                        {it.empresaId ? (
+                          <span className={`text-[10px] font-semibold rounded px-1.5 py-0.5 ${otra ? "bg-slate-100 text-slate-500" : "bg-emerald-100 text-emerald-800"}`}>{it.empresaNombre} · {it.cif}</span>
+                        ) : (
+                          <span className="text-[10px] font-semibold rounded px-1.5 py-0.5 bg-amber-100 text-amber-800" title={it.sinTexto ? "PDF escaneado: no se puede leer el CIF automáticamente" : "No aparece ningún CIF de las empresas"}>
+                            {it.variosCif ? `Varios CIF (${it.cif}) · revisar` : it.sinTexto ? "Escaneado · revisar CIF" : "CIF no encontrado"}
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-1 text-right whitespace-nowrap">
+                        {it.procesada ? (
+                          <button onClick={() => marcar(it, true)} className="text-[11px] text-slate-500 hover:underline" title="Volver a dejarla pendiente">✓ validada · deshacer</button>
+                        ) : otra ? (
+                          <span className="text-[11px] text-slate-400">Cambia a {it.empresaNombre} para validarla</span>
+                        ) : (
+                          <span className="flex gap-2 justify-end">
+                            <button onClick={() => validar(it)} disabled={validando} className="text-[11px] font-semibold text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-50 rounded px-2.5 py-1">Validar</button>
+                            <button onClick={() => marcar(it)} className="text-[11px] text-slate-500 hover:underline" title="Marcar como ya tratada sin validarla aquí">descartar</button>
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function FacturasCompra({ pedidos, usuario = null }) {
   const inputRef = useRef(null);
   const [subiendo, setSubiendo] = useState(false);
@@ -1613,36 +1819,50 @@ export default function FacturasCompra({ pedidos, usuario = null }) {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(",")[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    }).catch(() => null);
+    if (base64) await procesarFactura(file.name, base64);
+  };
+
+  const validarDesdeBandeja = async (it) => {
+    try {
+      const r = await fetch(`/api/facturas-compra/bandeja/pdf?msg=${encodeURIComponent(it.msg)}&att=${encodeURIComponent(it.att)}`);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — "));
+      return await procesarFactura(j.nombre || it.nombre, j.base64);
+    } catch (err) {
+      setError(err.message || String(err));
+      return false;
+    }
+  };
+
+  const procesarFactura = async (nombreArchivo, base64) => {
     setSubiendo(true);
     setError(null);
     setResultado(null);
+    let ok = false;
     try {
-      const base64 = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result.split(",")[1]);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
       const r = await fetch("/api/facturas-compra/extraer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nombre: file.name, base64 }),
+        body: JSON.stringify({ nombre: nombreArchivo, base64 }),
       });
       const json = await r.json().catch(() => ({}));
       if (!r.ok) {
-        // Antes se perdía "detalle" (el mensaje real del error en el
-        // backend) y solo se enseñaba el texto genérico — a petición de
-        // Maria (2026-09-04, error genérico sin pista de la causa), se
-        // añade aquí para poder diagnosticar sin tener que mirar la
-        // consola del backend.
         const base = json.error || `Error ${r.status}`;
         throw new Error(json.detalle && json.detalle !== base ? `${base} — ${json.detalle}` : base);
       }
-      setResultado({ archivo: file.name, paginas: json.paginas, facturas: json.facturas || [] });
+      setResultado({ archivo: nombreArchivo, paginas: json.paginas, facturas: json.facturas || [] });
+      ok = true;
     } catch (err) {
       setError(err.message || String(err));
     }
     setSubiendo(false);
+    return ok;
   };
 
   const facturasIdentificadas = (resultado?.facturas || []).filter((f) => f.factura);
@@ -1710,6 +1930,8 @@ export default function FacturasCompra({ pedidos, usuario = null }) {
       </div>
 
       <RegistroFacturas abierto={registroAbierto} onCerrar={() => setRegistroAbierto(false)} />
+
+      <BandejaFacturas onValidar={validarDesdeBandeja} validando={subiendo} />
 
       {error && (
         <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">

@@ -6,7 +6,7 @@ echo  Deja esta ventana ABIERTA mientras uses
 echo  la aplicacion. Para salir: Ctrl+C
 echo ============================================
 echo.
-echo Abriendo en el navegador: http://localhost:5173
-start http://localhost:5173
+echo Abriendo en el navegador: http://localhost:8102
+start http://localhost:8102
 call npm start
 pause

@@ -19,6 +19,16 @@ import {
   Truck,
   TrendingUp,
   Mail,
+  History,
+  ClipboardCheck,
+  Tag,
+  ShoppingCart,
+  CheckSquare,
+  Bot,
+  BarChart3,
+  Timer,
+  Paperclip,
+  Send,
 } from "lucide-react";
 import {
   construirFichasOT,
@@ -44,13 +54,18 @@ import {
   IA_CONFIG,
 } from "./agenteInteligente.js";
 import { OTS_DEMO } from "./datosDemo.js";
-import { generarBorradorFactura } from "./borradorFactura.js";
+import { generarBorradorFactura, htmlBorradorFactura } from "./borradorFactura.js";
 import Recepcion from "./recepcion.jsx";
 import FacturasCompra from "./facturasCompra.jsx";
 import Precios from "./precios.jsx";
-import { EMAILS_DEPARTAMENTO } from "./departamentos.js";
+import { EMAILS_DEPARTAMENTO, EMAIL_POR_DEFECTO } from "./departamentos.js";
 import Correo from "./correo.jsx";
 import Tareas from "./tareas.jsx";
+import ChatIA from "./chatIA.jsx";
+import Ratios from "./ratios.jsx";
+import IAFlotante from "./iaFlotante.jsx";
+import ControlHoras from "./horas.jsx";
+import { SelectorEmpresa, empresaGuardada } from "./empresa.jsx";
 import Papa from "papaparse";
 
 /**
@@ -444,14 +459,14 @@ function SourceCard({ source, state, onLoad, onClear, onEnriquecerExcel }) {
   };
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 p-5 flex flex-col gap-4">
+    <div className="bg-white border border-slate-200 border-t-[3px] border-t-blue-500 p-4 flex flex-col gap-3">
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-2">
-          <Database size={18} className="text-slate-400" />
-          <h3 className="font-semibold text-slate-800 text-[15px]">{source.name}</h3>
+          <Database size={16} className="text-slate-500" />
+          <h3 className="font-semibold text-slate-800 text-[14px]">{source.name}</h3>
           <InfoTooltip origin={source.origin} />
         </div>
-        <span className="text-[11px] font-bold tracking-wide text-blue-700 bg-blue-50 border border-blue-200 rounded px-2 py-0.5">
+        <span className="text-[10px] font-semibold tracking-wide text-blue-700 bg-blue-50 border border-blue-200 px-1.5 py-0.5">
           API · BC
         </span>
       </div>
@@ -1600,9 +1615,9 @@ function VisorDatos({ titulo, filas, onCerrar }) {
 // ---------------------------------------------------------------------
 function departamentoDeFicha(f) {
   // Primero el prefijo del segmento (MAN-P → MAN); si no, el departamento
-  const seg = (f.general.segmento || "").split("-")[0].trim().toUpperCase();
+  const seg = String(f?.general?.segmento || "").split("-")[0].trim().toUpperCase();
   if (EMAILS_DEPARTAMENTO[seg]) return seg;
-  const dep = (f.general.departamento || "").trim().toUpperCase();
+  const dep = String(f?.general?.departamento || "").trim().toUpperCase();
   return EMAILS_DEPARTAMENTO[dep] ? dep : null;
 }
 
@@ -1815,7 +1830,456 @@ function analisisResultadoFicha(ficha, fichas) {
 
 const ESTADOS_EXCLUIDOS_PENDIENTES = ["FACTURAT", "ARCHIVADA", "GARANTIA"];
 
-function PedidosVentaPendientes() {
+// Prefijo de las OTs según la empresa seleccionada (Also: AC…, Ferros: FCA…)
+const prefijoOT = () => (/ferros/i.test(`${empresaGuardada()?.nombre || ""} ${empresaGuardada()?.displayName || ""}`) && !empresaGuardada()?.porDefecto ? "FCA" : "AC");
+
+function resolverOT(texto, fichas) {
+  const t = String(texto || "").trim().toUpperCase();
+  const digitos = parseInt((t.match(/(\d{3,6})(?:\/\d{4})?$/) || t.match(/(\d{3,6})/) || [])[1] || "", 10);
+  if (/^[A-Z]{2,4}\d{6}\/\d{4}$/.test(t)) {
+    const f = fichas ? [...fichas.values()].find((x) => parseInt(x.numeroOT, 10) === digitos) : null;
+    return { noBC: t, ficha: f || null };
+  }
+  if (!digitos) return null;
+  if (fichas) {
+    const cand = [...fichas.values()].filter((x) => parseInt(String(x.numeroOT).replace(/\D/g, ""), 10) === digitos);
+    if (cand.length) {
+      cand.sort((a, b) => String(b.numeroOTOrigenes?.listado || "").localeCompare(String(a.numeroOTOrigenes?.listado || "")));
+      const f = cand[0];
+      const noBC = f.numeroOTOrigenes?.listado || f.numeroOTOrigenes?.lineasVenta || f.numeroOTOrigenes?.lineasCompra || null;
+      if (noBC && /\//.test(noBC)) return { noBC, ficha: f };
+      return { noBC: `${prefijoOT()}${String(digitos).padStart(6, "0")}/${new Date().getFullYear()}`, ficha: f };
+    }
+  }
+  return { noBC: `${prefijoOT()}${String(digitos).padStart(6, "0")}/${new Date().getFullYear()}`, ficha: null };
+}
+
+function mimeDeNombreArchivo(nombre) {
+  const n = String(nombre || "").toLowerCase();
+  if (n.endsWith(".pdf")) return "application/pdf";
+  if (n.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (n.endsWith(".doc")) return "application/msword";
+  if (n.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (n.endsWith(".xls")) return "application/vnd.ms-excel";
+  if (n.endsWith(".png")) return "image/png";
+  if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+  return "application/octet-stream";
+}
+
+function leerArchivoComoAdjunto(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
+      resolve({
+        nombre: file.name,
+        mime: file.type || mimeDeNombreArchivo(file.name),
+        base64,
+        tamaño: file.size,
+      });
+    };
+    reader.onerror = () => reject(new Error(`No se pudo leer «${file.name}»`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function plantillaCorreoValoracion({ num, cliente, descripcion, instrucciones }) {
+  const notas = (instrucciones || "").trim();
+  const cuerpoTexto =
+    `Bon dia,\r\n\r\n` +
+    `Us enviem adjunt la valoració de la OT ${num}${cliente ? ` de ${cliente}` : ""}.` +
+    `\r\n\r\n` +
+    `Client: ${cliente || "—"}\r\n` +
+    `Nº OT: ${num}\r\n` +
+    `Descripció: ${descripcion || "—"}\r\n` +
+    (notas ? `\r\n${notas}\r\n` : "") +
+    `\r\nQuedem a l'espera dels vostres comentaris.\r\n\r\nGràcies.`;
+  const cuerpoHtml = cuerpoTexto
+    .split(/\r?\n/)
+    .map((l) => (l ? l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "<br/>"))
+    .join("<br/>");
+  return {
+    asunto: `Valoració OT ${num}${cliente ? ` — ${cliente}` : ""}`,
+    cuerpoTexto,
+    cuerpoHtml,
+  };
+}
+
+function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado }) {
+  const [para, setPara] = useState((borrador.para || []).join("; "));
+  const [asunto, setAsunto] = useState(borrador.asunto || "");
+  const [cuerpo, setCuerpo] = useState(borrador.cuerpoTexto || "");
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState(null);
+
+  const enviar = async () => {
+    const destinatarios = para.split(/[;,\s]+/).map((e) => e.trim()).filter(Boolean);
+    if (!destinatarios.length) { setError("Indica al menos un destinatario."); return; }
+    if (!asunto.trim()) { setError("Falta el asunto."); return; }
+    setEnviando(true);
+    setError(null);
+    try {
+      const cuerpoHtml = cuerpo
+        .split(/\r?\n/)
+        .map((l) => (l ? l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "<br/>"))
+        .join("<br/>");
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: destinatarios,
+          asunto: asunto.trim(),
+          cuerpoHtml,
+          adjunto: borrador.adjunto
+            ? { nombre: borrador.adjunto.nombre, base64: borrador.adjunto.base64, mime: borrador.adjunto.mime }
+            : null,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      onEnviado?.({ de: json.de, para: destinatarios, asunto: asunto.trim() });
+    } catch (err) {
+      setError(err.message || String(err));
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onCerrar}>
+      <div
+        className="bg-white rounded-lg shadow-xl w-full max-w-xl max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+          <div>
+            <div className="text-sm font-semibold text-slate-800">Correo al responsable · OT {borrador.num}</div>
+            <div className="text-[11px] text-slate-500">
+              {borrador.noBC}{borrador.cliente ? ` · ${borrador.cliente}` : ""}
+              {borrador.departamento ? ` · dpto. ${borrador.departamento}` : ""}
+            </div>
+          </div>
+          <button type="button" onClick={onCerrar} className="p-1 text-slate-400 hover:text-slate-700" aria-label="Cerrar">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="px-4 py-3 space-y-3 text-sm">
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Para</span>
+            <input
+              value={para}
+              onChange={(e) => setPara(e.target.value)}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] focus:outline-none focus:ring-2 focus:ring-purple-400"
+              placeholder="email1@…; email2@…"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Asunto</span>
+            <input
+              value={asunto}
+              onChange={(e) => setAsunto(e.target.value)}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] focus:outline-none focus:ring-2 focus:ring-purple-400"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Mensaje</span>
+            <textarea
+              value={cuerpo}
+              onChange={(e) => setCuerpo(e.target.value)}
+              rows={10}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] font-sans focus:outline-none focus:ring-2 focus:ring-purple-400"
+            />
+          </label>
+          <div className="flex items-center gap-2 text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+            <FileText size={14} className="text-purple-600 flex-shrink-0" />
+            {borrador.adjunto ? (
+              <span>Adjunto: <strong>{borrador.adjunto.nombre}</strong></span>
+            ) : (
+              <span className="text-amber-700">Sin adjunto — el correo se enviará sin valoración.</span>
+            )}
+          </div>
+          {error && <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
+        </div>
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-slate-200 bg-slate-50">
+          <button type="button" onClick={onCerrar} disabled={enviando} className="text-sm px-3 py-1.5 rounded-md border border-slate-300 text-slate-700 hover:bg-white">
+            Cancelar
+          </button>
+          <button
+            type="button"
+            onClick={enviar}
+            disabled={enviando}
+            className="text-sm font-semibold px-4 py-1.5 rounded-md text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+          >
+            <Send size={14} />
+            {enviando ? "Enviando…" : "Enviar correo"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChatOT({ fichas }) {
+  const [abierto, setAbierto] = useState(true);
+  const [mensajes, setMensajes] = useState([
+    {
+      rol: "ia",
+      texto:
+        "Hola 👋 Puedo:\n" +
+        "· Preparar borradores / valoraciones en PDF de las OTs que me digas.\n" +
+        "· Preparar un correo al responsable de una OT adjuntando la valoración que subas al chat (clip 📎).\n\n" +
+        "Ej.: «prepara en PDF las facturas de las OTs 15103, 15129» o «envía esta valoración al responsable de la OT 15129» + adjunto.",
+    },
+  ]);
+  const [entrada, setEntrada] = useState("");
+  const [ocupado, setOcupado] = useState(false);
+  const [adjuntoPendiente, setAdjuntoPendiente] = useState(null);
+  const [borradorCorreo, setBorradorCorreo] = useState(null);
+  const finRef = useRef(null);
+  const fileRef = useRef(null);
+  const ultimoAdjuntoRef = useRef(null);
+  useEffect(() => { finRef.current?.scrollIntoView({ block: "nearest" }); }, [mensajes]);
+
+  const decir = (texto, extra = {}) => setMensajes((m) => [...m, { rol: "ia", texto, ...extra }]);
+
+  const cargarAdjunto = async (file) => {
+    if (!file) return;
+    try {
+      const adj = await leerArchivoComoAdjunto(file);
+      setAdjuntoPendiente(adj);
+      ultimoAdjuntoRef.current = adj;
+    } catch (err) {
+      decir(`✗ ${err.message || err}`);
+    }
+  };
+
+  const prepararBorradores = async (ots) => {
+    const unicos = [...new Set((ots || []).map((x) => String(x).trim()).filter(Boolean))];
+    decir(`Preparando ${unicos.length} borrador(es)… actualizo las líneas de cada OT desde BC.`);
+    const docs = [];
+    const informe = [];
+    for (const [i, t] of unicos.entries()) {
+      const r = resolverOT(t, fichas);
+      if (!r) { informe.push(`✗ ${t}: número de OT no reconocido`); continue; }
+      try {
+        const resp = await fetch(`/api/bc/ot/lineas?no=${encodeURIComponent(r.noBC)}`);
+        const json = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(json.error || `Error ${resp.status}`);
+        const b = filasBorradorDesdeRaw(json.venta || []);
+        if (!b || !b.filas.length) { informe.push(`⚠ ${r.noBC}: sin líneas de venta en BC — no se genera`); continue; }
+        const numeroOT = r.ficha?.numeroOT || String(parseInt(r.noBC.replace(/\D/g, "").slice(0, 6), 10) || r.noBC);
+        const base = b.filas.reduce((a, l) => a + (Number(l.importe) || 0), 0);
+        docs.push({
+          nombre: `Borrador_OT${String(numeroOT).padStart(6, "0")}${r.ficha?.general?.cliente ? "_" + r.ficha.general.cliente.slice(0, 40) : ""}`,
+          html: htmlBorradorFactura({ numeroOT, cliente: r.ficha?.general?.cliente || "", cifCliente: b.cif, filas: b.filas }),
+        });
+        informe.push(`✓ ${r.noBC}${r.ficha?.general?.cliente ? " · " + r.ficha.general.cliente : ""} · base ${base.toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`);
+      } catch (err) {
+        informe.push(`✗ ${r.noBC}: ${err.message || err}`);
+      }
+      if ((i + 1) % 5 === 0 && i + 1 < unicos.length) decir(`… ${i + 1} de ${unicos.length}`);
+    }
+    if (!docs.length) { decir(`No se ha podido generar ningún borrador:\n${informe.join("\n")}`); return; }
+    decir(`Convirtiendo ${docs.length} borrador(es) a PDF…`);
+    try {
+      const resp = await fetch("/api/borradores/pdf", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ docs }) });
+      if (!resp.ok) { const j = await resp.json().catch(() => ({})); throw new Error(j.detalle || j.error || `Error ${resp.status}`); }
+      const blob = await resp.blob();
+      const nombreZip = (resp.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/)?.[1] || "borradores.zip";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = nombreZip; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      let errores = {};
+      try { errores = JSON.parse(decodeURIComponent(resp.headers.get("X-Borradores-Errores") || "%7B%7D")); } catch {}
+      const carpeta = decodeURIComponent(resp.headers.get("X-Borradores-Carpeta") || "");
+      decir(
+        `Listo: ${resp.headers.get("X-Borradores-Ok") || docs.length} PDF descargados en «${nombreZip}».` +
+          (carpeta ? `\nTambién guardados en: ${carpeta}` : "") +
+          `\n\n${informe.join("\n")}` +
+          (Object.keys(errores).length ? `\n\nErrores al convertir: ${Object.entries(errores).map(([k, v]) => `${k}: ${v}`).join(" · ")}` : "")
+      );
+    } catch (err) {
+      decir(`No se pudieron convertir a PDF (${err.message || err}).\n\n${informe.join("\n")}\n\nAlternativa: abre cada OT y usa «Borrador PDF».`);
+    }
+  };
+
+  const prepararCorreoResponsable = async ({ ot, instrucciones }) => {
+    const r = resolverOT(ot, fichas);
+    if (!r) {
+      decir(`✗ No reconozco el número de OT «${ot}».`);
+      return;
+    }
+    const adjunto = ultimoAdjuntoRef.current;
+    if (!adjunto?.base64) {
+      decir(
+        `Para enviar la valoración al responsable de la OT ${r.noBC}, adjunta primero el fichero con el clip 📎 y vuelve a pedírmelo.`
+      );
+      return;
+    }
+    const f = r.ficha;
+    const dep = f ? departamentoDeFicha(f) : null;
+    const para = dep ? [...EMAILS_DEPARTAMENTO[dep]] : [EMAIL_POR_DEFECTO];
+    const num = (f?.numeroOT || String(parseInt(r.noBC.replace(/\D/g, "").slice(0, 6), 10) || ot)).toString().padStart(6, "0");
+    const cliente = f?.general?.cliente || "";
+    const descripcion = f?.general?.descripcion || "";
+    const plantilla = plantillaCorreoValoracion({ num, cliente, descripcion, instrucciones });
+    setBorradorCorreo({
+      num,
+      noBC: r.noBC,
+      cliente,
+      departamento: dep,
+      para,
+      asunto: plantilla.asunto,
+      cuerpoTexto: plantilla.cuerpoTexto,
+      adjunto,
+    });
+    decir(
+      `He preparado el correo al responsable${dep ? ` (dpto. ${dep})` : " (sin dpto. en ficha → Edith)"} de la OT ${r.noBC}` +
+        `${cliente ? ` · ${cliente}` : ""}, con adjunto «${adjunto.nombre}». Revísalo y pulsa Enviar.`
+    );
+  };
+
+  const enviar = async () => {
+    const texto = entrada.trim();
+    if ((!texto && !adjuntoPendiente) || ocupado) return;
+    const adjuntoMsg = adjuntoPendiente;
+    const textoEnvio = texto || (adjuntoMsg ? `(Adjunto: ${adjuntoMsg.nombre})` : "");
+    const textoParaIa = textoEnvio + (adjuntoMsg ? `\n[Adjunto: ${adjuntoMsg.nombre}]` : "");
+    const historial = [...mensajes, { rol: "yo", texto: textoEnvio, adjunto: adjuntoMsg || null }];
+    setMensajes(historial);
+    setEntrada("");
+    setAdjuntoPendiente(null);
+    if (adjuntoMsg) ultimoAdjuntoRef.current = adjuntoMsg;
+    setOcupado(true);
+    try {
+      const resp = await fetch("/api/chat-ot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mensajes: historial
+            .slice(1)
+            .slice(-12)
+            .map((m) => ({
+              rol: m.rol,
+              texto: m.rol === "yo" && m.adjunto ? `${m.texto}\n[Adjunto: ${m.adjunto.nombre}]` : m.texto,
+            })),
+          tieneAdjunto: !!(adjuntoMsg || ultimoAdjuntoRef.current),
+          nombreAdjunto: (adjuntoMsg || ultimoAdjuntoRef.current)?.nombre || null,
+        }),
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(json.detalle || json.error || `Error ${resp.status}`);
+      if (json.texto) decir(json.texto);
+      for (const acc of json.acciones || []) {
+        if (acc.tipo === "preparar_borradores_pdf") await prepararBorradores(acc.datos?.ots || []);
+        if (acc.tipo === "preparar_correo_responsable") {
+          await prepararCorreoResponsable({
+            ot: acc.datos?.ot || textoParaIa,
+            instrucciones: acc.datos?.instrucciones || "",
+          });
+        }
+      }
+      if (!json.texto && !(json.acciones || []).length) decir("(sin respuesta)");
+    } catch (err) {
+      decir(`✗ ${err.message || err}`);
+    }
+    setOcupado(false);
+  };
+
+  return (
+    <div className="mb-4 bg-white border border-purple-200 rounded-lg">
+      <button onClick={() => setAbierto((v) => !v)} className="w-full flex items-center justify-between px-3 py-2 text-sm font-semibold text-purple-800">
+        <span>🤖 Asistente IA de OTs</span>
+        <span className="text-[11px] text-slate-400">{abierto ? "ocultar ▲" : "mostrar ▼"}</span>
+      </button>
+      {abierto && (
+        <div className="px-3 pb-3">
+          <div className="max-h-72 overflow-y-auto space-y-2 mb-2 pr-1">
+            {mensajes.map((m, i) => (
+              <div key={i} className={`flex ${m.rol === "yo" ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[85%] whitespace-pre-wrap text-[12px] rounded-lg px-3 py-2 ${m.rol === "yo" ? "bg-purple-600 text-white" : "bg-slate-100 text-slate-700"}`}>
+                  {m.texto}
+                  {m.adjunto && (
+                    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${m.rol === "yo" ? "text-purple-100" : "text-slate-500"}`}>
+                      <Paperclip size={12} />
+                      {m.adjunto.nombre}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+            {ocupado && <div className="text-[11px] text-slate-400">Trabajando…</div>}
+            <div ref={finRef} />
+          </div>
+          {adjuntoPendiente && (
+            <div className="mb-2 flex items-center gap-2 text-[11px] bg-purple-50 border border-purple-200 text-purple-800 rounded-md px-2 py-1.5">
+              <Paperclip size={12} />
+              <span className="flex-1 truncate">{adjuntoPendiente.nombre}</span>
+              <button
+                type="button"
+                onClick={() => setAdjuntoPendiente(null)}
+                className="p-0.5 hover:text-purple-950"
+                aria-label="Quitar adjunto"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
+          <div className="flex gap-2 items-end">
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,application/pdf"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) cargarAdjunto(f);
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={ocupado}
+              title="Adjuntar valoración (PDF, Word, Excel…)"
+              className="flex-shrink-0 p-2 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+            >
+              <Paperclip size={16} />
+            </button>
+            <textarea
+              value={entrada}
+              onChange={(e) => setEntrada(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } }}
+              rows={2}
+              placeholder="Escribe aquí… (Enter para enviar). Usa 📎 para adjuntar la valoración."
+              className="flex-1 text-[12px] border border-slate-300 rounded-md px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-purple-400"
+            />
+            <button
+              onClick={enviar}
+              disabled={ocupado || (!entrada.trim() && !adjuntoPendiente)}
+              className="text-sm font-semibold text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-50 rounded-md px-4 py-2"
+            >
+              Enviar
+            </button>
+          </div>
+        </div>
+      )}
+      {borradorCorreo && (
+        <ModalCorreoResponsableOT
+          borrador={borradorCorreo}
+          onCerrar={() => setBorradorCorreo(null)}
+          onEnviado={({ de, para, asunto }) => {
+            setBorradorCorreo(null);
+            decir(`✓ Correo enviado (${de || "tu buzón"}) → ${para.join(", ")}\nAsunto: ${asunto}`);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
   const [fichas, setFichas] = useState(null);
   const [cargando, setCargando] = useState(true);
   const [error, setError] = useState(null);
@@ -2062,6 +2526,7 @@ function PantallaOTs({ incrustada = false }) {
 
         {fichas && (
           <>
+            <ChatOT fichas={fichas} />
             {/* Filtros */}
             <div className="flex gap-2 mb-3 flex-wrap">
               <input value={fCliente} onChange={(e) => { setFCliente(e.target.value); setPagina(0); }} placeholder="Filtrar client.."
@@ -4090,7 +4555,7 @@ class CapturaErrores extends React.Component {
               (reemplaza <b>src/ completo</b> + backend/server.cjs + package.json del mismo zip, luego npm install).
             </p>
             <pre className="text-xs bg-slate-100 border border-slate-200 rounded p-3 overflow-auto whitespace-pre-wrap">
-              {String(this.state.error?.message || this.state.error)}
+              {String(this.state.error?.stack || this.state.error?.message || this.state.error)}
             </pre>
           </div>
         </div>
@@ -4263,227 +4728,190 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
     }
   };
 
+  const navItem = (id, label, Icon) => (
+    <div
+      key={id}
+      onClick={() => setSeccion(id)}
+      className={`bc-nav-item${seccion === id ? " activa" : ""}`}
+    >
+      {Icon && <Icon className="bc-nav-icon" size={16} strokeWidth={1.5} aria-hidden />}
+      <span>{label}</span>
+    </div>
+  );
+
   return (
-    <div className="flex min-h-screen bg-slate-100 font-sans">
-      {/* Sidebar */}
-      <aside className="w-60 min-h-screen bg-[#0f2947] text-white flex flex-col shrink-0">
-        <div className="px-5 py-5 border-b border-white/10">
-          <div className="font-bold tracking-wide text-sm">ALSO CASALS</div>
-          <div className="text-[11px] text-blue-200 tracking-wider mt-0.5">AGENTE DE VENTAS</div>
-          {(usuario || onLogout) && (
-            <div className="mt-3 space-y-2">
-              {usuario && (
-                <div
-                  className="text-xs text-blue-100/90 truncate"
-                  title={usuario.email || usuario.username || ""}
-                >
-                  {usuario.nom_treballador || usuario.nombre || usuario.username || "Usuario"}
-                </div>
-              )}
-              {onLogout && (
-                <button
-                  type="button"
-                  onClick={onLogout}
-                  className="w-full rounded-md border border-white/30 bg-white/10 px-3 py-1.5 text-xs font-semibold text-white hover:bg-white/20 transition-colors"
-                >
-                  Cerrar sesión
-                </button>
-              )}
-            </div>
-          )}
+    <div className="bc-app font-sans">
+      {/* Top bar estilo Dynamics 365 Business Central */}
+      <header className="bc-topbar">
+        <div className="bc-topbar-brand">
+          Dynamics 365 Business Central
+          <span>· ACsales</span>
+          <span style={{ marginLeft: "0.75rem", opacity: 0.7, fontWeight: 400, fontSize: "0.8125rem" }}>
+            {(empresaGuardada()?.displayName || "ALSO CASALS")}
+          </span>
         </div>
-        <nav className="flex-1 py-2 text-sm overflow-y-auto">
-          <div
-            onClick={() => setSeccion("cargar")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "cargar" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Cargar datos
+        <div className="bc-topbar-spacer" />
+        {(usuario || onLogout) && (
+          <div className="bc-topbar-user">
+            {usuario && (
+              <span
+                className="nom"
+                title={usuario.email || usuario.username || ""}
+              >
+                {usuario.nom_treballador || usuario.nombre || usuario.username || "Usuario"}
+              </span>
+            )}
+            {onLogout && (
+              <button type="button" onClick={onLogout} className="bc-topbar-logout">
+                Cerrar sesión
+              </button>
+            )}
           </div>
-          <div
-            onClick={() => setSeccion("memoria")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "memoria" ? "bg-purple-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            ✦ Memoria histórica
-          </div>
-          <div
-            onClick={() => setSeccion("explorador")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "explorador" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Explorador de OTs
-          </div>
-          <div
-            onClick={() => setSeccion("recepcion")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "recepcion" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Recepción de material
-          </div>
-          <div
-            onClick={() => setSeccion("facturascompra")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "facturascompra" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Validación de facturas
-          </div>
-          <div
-            onClick={() => setSeccion("precios")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "precios" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Precios de artículos
-          </div>
-          <div
-            onClick={() => setSeccion("pedidosventa")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "pedidosventa" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Pedidos de venta
-          </div>
-          <div
-            onClick={() => setSeccion("correo")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "correo" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Correo
-          </div>
-          <div
-            onClick={() => setSeccion("tareas")}
-            className={`px-5 py-2.5 cursor-pointer ${
-              seccion === "tareas" ? "bg-blue-700 font-medium" : "text-blue-100/80 hover:bg-white/5"
-            }`}
-          >
-            Mis tareas
-          </div>
-
-          <div className="px-5 pt-4 pb-1 text-[10px] tracking-widest text-blue-300/50 font-bold">
-            HOJA DE RUTA
-          </div>
-          {[
-            "Explorar datos",
-            "Pedidos de venta",
-            "Análisis de rentabilidad",
-            "Precios de artículos",
-            "Análisis por cliente",
-            "Comparar periodos",
-          ].map((item) => (
-            <div
-              key={item}
-              className="px-5 py-2 text-blue-100/30 cursor-not-allowed select-none"
-              title="Pendiente de construir — hoja de ruta"
-            >
-              {item}
-            </div>
-          ))}
-        </nav>
-      </aside>
-
-      {/* Main */}
-      <main className="flex-1 p-8">
-        {seccion === "explorador" ? (
-          <PantallaOTs incrustada />
-        ) : seccion === "recepcion" ? (
-          <Recepcion
-            pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
-            lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
-            onActualizarBC={actualizarRecepcionBC}
-            actualizando={actualizandoRecep}
-          />
-        ) : seccion === "facturascompra" ? (
-          <FacturasCompra
-            pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
-            usuario={usuario}
-          />
-        ) : seccion === "precios" ? (
-          <Precios
-            lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
-            pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
-          />
-        ) : seccion === "pedidosventa" ? (
-          <PedidosVentaPendientes />
-        ) : seccion === "correo" ? (
-          <Correo onCrearTarea={crearTareaDesdeCorreo} usuario={usuario} />
-        ) : seccion === "tareas" ? (
-          <Tareas pendienteAlta={tareaPendiente} />
-        ) : seccion === "memoria" ? (
-          <>
-            <div className="flex items-center gap-2">
-              <Sparkles size={22} className="text-purple-600" />
-              <h1 className="text-2xl font-bold text-slate-800">Memoria histórica</h1>
-            </div>
-            <p className="text-slate-500 text-sm mt-1 max-w-3xl">
-              Cruza las facturas de venta, las líneas de BC y el listado descriptivo de OT's para aprender qué se
-              cobró en cada trabajo. Cuando entre una OT nueva, el agente sugiere qué cobrar basándose en trabajos
-              parecidos. Los datos de Business Central se cargan en la sección «Cargar datos».
-            </p>
-            <section className="mt-6">
-              <IntelligentAgentCard bcData={data} estadoInicial={estadoInicial} />
-            </section>
-          </>
-        ) : (
-          <>
-        <h1 className="text-2xl font-bold text-slate-800">Cargar datos</h1>
-        <p className="text-slate-500 text-sm mt-1">
-          Conecta con Business Central para traer los datos del departamento de ventas. Se guardan en caché por rango de fechas.
-        </p>
-
-        {/* Resumen */}
-        <div className="grid grid-cols-4 gap-4 mt-6">
-          <div className="bg-white rounded-xl border border-slate-200 px-5 py-4">
-            <div className="text-2xl font-bold text-slate-800">
-              {summary.loaded}/{SOURCES.length}
-            </div>
-            <div className="text-xs text-slate-500 mt-1">Fuentes cargadas</div>
-          </div>
-          <div className="bg-white rounded-xl border border-slate-200 px-5 py-4">
-            <div className="text-2xl font-bold text-slate-800">{summary.totalRows.toLocaleString()}</div>
-            <div className="text-xs text-slate-500 mt-1">Filas totales</div>
-          </div>
-          <div className="bg-white rounded-xl border border-slate-200 px-5 py-4 col-span-2 flex items-center">
-            <div className="text-xs text-slate-500">
-              Origen: <span className="font-medium text-slate-700">API Business Central</span>
-              <br />
-              La carga es incremental: si un rango ya está en caché, no se vuelve a pedir a la API.
-            </div>
-          </div>
-        </div>
-
-        {/* Tarjetas de fuentes */}
-        <div className="grid grid-cols-3 gap-5 mt-6">
-          {SOURCES.map((s) => (
-            <SourceCard
-              key={s.id}
-              source={s}
-              state={data[s.id]}
-              onLoad={handleLoad}
-              onClear={handleClear}
-              onEnriquecerExcel={enriquecerPedidosConExcel}
-            />
-          ))}
-        </div>
-
-        {/* Acceso directo a la memoria */}
-        <button
-          onClick={() => setSeccion("memoria")}
-          className="mt-8 w-full flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold rounded-xl py-3 transition-colors"
-        >
-          <Sparkles size={16} /> Ir a Memoria histórica → construir y consultar
-        </button>
-          </>
         )}
-      </main>
+      </header>
+
+      <div className="bc-body">
+        {/* Navigation pane (estilo BC) */}
+        <aside className="bc-nav">
+          <div className="bc-nav-empresa">
+            <SelectorEmpresa />
+          </div>
+          <nav className="bc-nav-menu">
+            {navItem("cargar", "Cargar datos", Database)}
+            {navItem("memoria", "Memoria histórica", History)}
+            {navItem("explorador", "Explorador de OTs", Search)}
+            {navItem("recepcion", "Recepción de material", Package)}
+            {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
+            {navItem("precios", "Precios de artículos", Tag)}
+            {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
+            {navItem("correo", "Correo", Mail)}
+            {navItem("tareas", "Mis tareas", CheckSquare)}
+            {navItem("ia", "Asistente IA", Bot)}
+            {navItem("ratios", "Ratios financieros", BarChart3)}
+            {navItem("horas", "Control de horas", Timer)}
+
+            <div className="bc-nav-grupo">Hoja de ruta</div>
+            {[
+              "Explorar datos",
+              "Pedidos de venta",
+              "Análisis de rentabilidad",
+              "Precios de artículos",
+              "Análisis por cliente",
+              "Comparar periodos",
+            ].map((item) => (
+              <div
+                key={item}
+                className="bc-nav-item desactivada"
+                title="Pendiente de construir — hoja de ruta"
+              >
+                {item}
+              </div>
+            ))}
+          </nav>
+        </aside>
+
+        {/* Main */}
+        <main className="bc-main">
+          {seccion === "explorador" ? (
+            <PantallaOTs incrustada />
+          ) : seccion === "recepcion" ? (
+            <Recepcion
+              pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
+              lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
+              onActualizarBC={actualizarRecepcionBC}
+              actualizando={actualizandoRecep}
+            />
+          ) : seccion === "facturascompra" ? (
+            <FacturasCompra
+              pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
+              usuario={usuario}
+            />
+          ) : seccion === "precios" ? (
+            <Precios
+              lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
+              pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
+            />
+          ) : seccion === "pedidosventa" ? (
+            <PedidosVentaPendientes pedidosVenta={data["pedidos_venta"]?.rows || []} lineasPedidoVenta={data["lineas_pedido_venta"]?.rows || []} />
+          ) : seccion === "correo" ? (
+            <Correo onCrearTarea={crearTareaDesdeCorreo} usuario={usuario} />
+          ) : seccion === "tareas" ? (
+            <Tareas pendienteAlta={tareaPendiente} />
+          ) : seccion === "ia" ? (
+            <ChatIA />
+          ) : seccion === "ratios" ? (
+            <Ratios />
+          ) : seccion === "horas" ? (
+            <ControlHoras />
+          ) : seccion === "memoria" ? (
+            <>
+              <div className="flex items-center gap-2">
+                <Sparkles size={22} className="text-purple-600" />
+                <h1 className="bc-page-title">Memoria histórica</h1>
+              </div>
+              <p className="bc-page-sub">
+                Cruza las facturas de venta, las líneas de BC y el listado descriptivo de OT's para aprender qué se
+                cobró en cada trabajo. Cuando entre una OT nueva, el agente sugiere qué cobrar basándose en trabajos
+                parecidos. Los datos de Business Central se cargan en la sección «Cargar datos».
+              </p>
+              <section className="mt-6">
+                <IntelligentAgentCard bcData={data} estadoInicial={estadoInicial} />
+              </section>
+            </>
+          ) : (
+            <>
+              <h1 className="bc-page-title">Cargar datos</h1>
+              <p className="bc-page-sub">
+                Conecta con Business Central para traer los datos del departamento de ventas. Se guardan en caché por rango de fechas.
+              </p>
+
+              {/* Cue tiles estilo Role Center BC */}
+              <div className="bc-cue-row">
+                <div className="bc-cue">
+                  <div className="bc-cue-valor">
+                    {summary.loaded}/{SOURCES.length}
+                  </div>
+                  <div className="bc-cue-label">Fuentes cargadas</div>
+                </div>
+                <div className="bc-cue">
+                  <div className="bc-cue-valor">{summary.totalRows.toLocaleString()}</div>
+                  <div className="bc-cue-label">Filas totales</div>
+                </div>
+                <div className="bc-cue bc-cue-wide">
+                  <div className="text-xs text-slate-500">
+                    Origen: <span className="font-medium text-slate-700">API Business Central</span>
+                    <br />
+                    La carga es incremental: si un rango ya está en caché, no se vuelve a pedir a la API.
+                  </div>
+                </div>
+              </div>
+
+              {/* Tarjetas de fuentes */}
+              <div className="grid grid-cols-3 gap-4 mt-5">
+                {SOURCES.map((s) => (
+                  <SourceCard
+                    key={s.id}
+                    source={s}
+                    state={data[s.id]}
+                    onLoad={handleLoad}
+                    onClear={handleClear}
+                    onEnriquecerExcel={enriquecerPedidosConExcel}
+                  />
+                ))}
+              </div>
+
+              {/* Acceso directo a la memoria */}
+              <button
+                onClick={() => setSeccion("memoria")}
+                className="mt-6 w-full flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold rounded py-2.5 transition-colors"
+              >
+                <Sparkles size={16} /> Ir a Memoria histórica → construir y consultar
+              </button>
+            </>
+          )}
+        </main>
+      </div>
+      <IAFlotante seccion={seccion} />
     </div>
   );
 }
-
-        {/* La memoria histórica vive ahora en su propia sección del menú */}

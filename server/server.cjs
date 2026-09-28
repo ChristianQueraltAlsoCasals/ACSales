@@ -90,6 +90,88 @@ async function fetchConReintento(url, opciones = {}, intentos = 3) {
   throw ultimoError;
 }
 
+// Caché del token de Azure (dura ~1h; lo renovamos 5 min antes)
+let tokenCache = { token: null, expira: 0 };
+
+async function obtenerTokenBC() {
+  if (tokenCache.token && Date.now() < tokenCache.expira) return tokenCache.token;
+
+  const url = `https://login.microsoftonline.com/${process.env.BC_TENANT_ID}/oauth2/v2.0/token`;
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: process.env.BC_CLIENT_ID,
+    client_secret: process.env.BC_CLIENT_SECRET,
+    scope: "https://api.businesscentral.dynamics.com/.default",
+  });
+
+  const response = await fetchConReintento(url, { method: "POST", body });
+  if (!response.ok) throw new Error(`Azure AD respondió ${response.status}: ${await response.text()}`);
+
+  const data = await response.json();
+  tokenCache = {
+    token: data.access_token,
+    expira: Date.now() + (data.expires_in - 300) * 1000,
+  };
+  return tokenCache.token;
+}
+
+// =======================================================================
+// MULTIEMPRESA — Alsocasals / Ferros / Quimlab (AsyncLocalStorage + X-Empresa)
+// Postgres: claveEmpresa("recepcion") → "recepcion" o "recepcion_ferros"
+// =======================================================================
+const { AsyncLocalStorage } = require("async_hooks");
+const contextoEmpresa = new AsyncLocalStorage();
+const EMPRESA_POR_DEFECTO = () => ({ id: process.env.BC_COMPANY_ID, nombre: process.env.BC_COMPANY_NAME, porDefecto: true });
+const EMPRESA_ACTUAL = () => contextoEmpresa.getStore() || EMPRESA_POR_DEFECTO();
+function EMPRESA_ID() { return EMPRESA_ACTUAL().id; }
+function EMPRESA_NOMBRE() { return EMPRESA_ACTUAL().nombre; }
+const RE_EMPRESAS_APP = () => new RegExp(process.env.APP_EMPRESAS || "also|ferros|quimlab", "i");
+let cacheEmpresasApp = null;
+async function empresasApp() {
+  if (cacheEmpresasApp && Date.now() - cacheEmpresasApp.ts < 10 * 60 * 1000) return cacheEmpresasApp.lista;
+  const token = await obtenerTokenBC();
+  const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0`;
+  const r = await fetchConReintento(`${raiz}/companies`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!r.ok) throw new Error(`BC respondió ${r.status} al listar empresas`);
+  const lista = [];
+  for (const c of (await r.json()).value || []) {
+    if (!RE_EMPRESAS_APP().test(`${c.name} ${c.displayName || ""}`) && c.id !== process.env.BC_COMPANY_ID) continue;
+    let cif = "";
+    try {
+      const ri = await fetchConReintento(`${raiz}/companies(${c.id})/companyInformation`, { headers: { Authorization: `Bearer ${token}` } });
+      if (ri.ok) cif = (((await ri.json()).value || [])[0] || {}).taxRegistrationNumber || "";
+    } catch {}
+    lista.push({ id: c.id, nombre: c.name, displayName: c.displayName || c.name, cif, porDefecto: c.id === process.env.BC_COMPANY_ID });
+  }
+  cacheEmpresasApp = { ts: Date.now(), lista };
+  return lista;
+}
+/** Clave Postgres por empresa: ALSO CASALS → base; otra → base_slug (p.ej. recepcion_ferros). */
+function claveEmpresa(nombreBase) {
+  const e = EMPRESA_ACTUAL();
+  if (e.porDefecto || e.id === process.env.BC_COMPANY_ID) return nombreBase;
+  const slug = String(e.nombre || e.id).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  return `${nombreBase}_${slug}`;
+}
+app.use(async (req, res, next) => {
+  const id = req.get("X-Empresa");
+  if (!id || id === process.env.BC_COMPANY_ID) return next();
+  try {
+    const e = (await empresasApp()).find((c) => c.id === id);
+    if (!e) return res.status(400).json({ error: `Empresa no permitida o no encontrada: ${id}` });
+    contextoEmpresa.run({ id: e.id, nombre: e.nombre, porDefecto: false }, next);
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo comprobar la empresa seleccionada.", detalle: String(err.message || err) });
+  }
+});
+app.get("/api/empresas-app", async (req, res) => {
+  try {
+    res.json({ empresas: await empresasApp(), porDefecto: process.env.BC_COMPANY_ID });
+  } catch (err) {
+    res.json({ empresas: [{ id: process.env.BC_COMPANY_ID, nombre: process.env.BC_COMPANY_NAME, displayName: process.env.BC_COMPANY_NAME, cif: "B43831593", porDefecto: true }], porDefecto: process.env.BC_COMPANY_ID, aviso: String(err.message || err) });
+  }
+});
+
 // ---------------------------------------------------------------------
 // 0a) ESTADO DE LA APLICACIÓN — Postgres (app_state, claves estado.*)
 // ---------------------------------------------------------------------
@@ -130,35 +212,305 @@ app.delete("/api/estado", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 0a-bis) RECEPCIÓN — marcas de "revisado" y fechas editadas, COMPARTIDAS
+// 0a-bis) RECEPCIÓN — marcas compartidas (revisados, fechas, reclamados…)
 // ---------------------------------------------------------------------
-//   { revisados: { "PC26-002305": { ts: "2026-..." }, ... },
-//     fechas:    { "PC26-002305": "2026-08-30", ... } }
+//   { revisados, fechas, reclamados, emailsProveedor, notas, registrados }
 // ---------------------------------------------------------------------
+const RECEP_DEFAULT = { revisados: {}, fechas: {}, reclamados: {}, emailsProveedor: {}, notas: {}, registrados: {} };
+const leerRecep = async () => db.getDoc(claveEmpresa("recepcion"), { ...RECEP_DEFAULT });
+const escribirRecep = async (d) => db.setDoc(claveEmpresa("recepcion"), d);
+
 app.get("/api/recepcion", async (req, res) => {
   try {
-    res.json(await db.getDoc("recepcion", { revisados: {}, fechas: {} }));
+    res.json(await leerRecep());
   } catch (err) {
     console.error("Error leyendo recepción:", err);
     res.status(500).json({ error: "No se pudo leer la recepción." });
   }
 });
 
+// Email del PROVEEDOR desde su ficha en BC (API v2.0 /vendors, solo LECTURA).
+app.get("/api/bc/proveedor-email", async (req, res) => {
+  const numero = String(req.query.numero || "").trim();
+  const nombre = String(req.query.nombre || "").trim();
+  if (!numero && !nombre) return res.status(400).json({ error: "Falta 'numero' o 'nombre'." });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/vendors`;
+    const esc = (v) => v.replace(/'/g, "''");
+    const filtros = [];
+    if (numero) filtros.push(`number eq '${esc(numero)}'`);
+    if (nombre) filtros.push(`displayName eq '${esc(nombre)}'`);
+    for (const f of filtros) {
+      const r = await fetchConReintento(`${base}?$filter=${encodeURIComponent(f)}&$select=number,displayName,email`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) continue;
+      const v = ((await r.json()).value || [])[0];
+      if (v) return res.json({ email: v.email || "", numero: v.number, nombre: v.displayName });
+    }
+    res.json({ email: "" });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo consultar el proveedor en BC.", detalle: String(err.message || err) });
+  }
+});
+
 app.post("/api/recepcion", async (req, res) => {
   try {
-    const actual = await db.getDoc("recepcion", { revisados: {}, fechas: {} });
+    const actual = await leerRecep();
     const body = req.body || {};
     const combinado = {
       revisados: { ...(actual.revisados || {}), ...(body.revisados || {}) },
       fechas: { ...(actual.fechas || {}), ...(body.fechas || {}) },
+      reclamados: { ...(actual.reclamados || {}), ...(body.reclamados || {}) },
+      emailsProveedor: { ...(actual.emailsProveedor || {}), ...(body.emailsProveedor || {}) },
+      notas: actual.notas || {},
+      registrados: actual.registrados || {},
     };
-    for (const k in body.revisados || {}) if (body.revisados[k] === null) delete combinado.revisados[k];
-    for (const k in body.fechas || {}) if (body.fechas[k] === null) delete combinado.fechas[k];
-    await db.setDoc("recepcion", combinado);
+    for (const campo of ["revisados", "fechas", "reclamados", "emailsProveedor"]) {
+      for (const k in body[campo] || {}) if (body[campo][k] === null) delete combinado[campo][k];
+    }
+    await escribirRecep(combinado);
     res.json({ guardado: true });
   } catch (err) {
     console.error("Error guardando recepción:", err);
     res.status(500).json({ error: "No se pudo guardar la recepción." });
+  }
+});
+
+// BUSCADOR DE ARTÍCULOS en BC (API v2.0 /items, solo LECTURA)
+app.get("/api/bc/articulos", async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  if (q.length < 2) return res.json({ articulos: [] });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/items`;
+    const esc = (v) => v.replace(/'/g, "''");
+    const cap = q.charAt(0).toUpperCase() + q.slice(1).toLowerCase();
+    const variantes = [...new Set([q, q.toUpperCase(), q.toLowerCase(), cap])];
+    const filtros = [`startswith(number,'${esc(q.toUpperCase())}')`, ...variantes.map((v) => `contains(displayName,'${esc(v)}')`)];
+    const vistos = new Map();
+    for (const f of filtros) {
+      const r = await fetchConReintento(`${base}?$filter=${encodeURIComponent(f)}&$top=15&$select=id,number,displayName,baseUnitOfMeasureCode,unitCost,blocked`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) continue;
+      for (const it of (await r.json()).value || []) {
+        if (!it.blocked && !vistos.has(it.number)) vistos.set(it.number, { numero: it.number, descripcion: it.displayName, ud: it.baseUnitOfMeasureCode || "", coste: it.unitCost ?? null });
+      }
+      if (vistos.size >= 25) break;
+    }
+    res.json({ articulos: [...vistos.values()].slice(0, 25) });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo buscar artículos en BC.", detalle: String(err.message || err) });
+  }
+});
+
+const CARGOS_PROD_FIJOS = [
+  { numero: "COMB", descripcion: "COMBUSTIBLE" },
+  { numero: "CORTE", descripcion: "CORTE" },
+  { numero: "DES", descripcion: "DESCUENTO" },
+  { numero: "ELEC", descripcion: "CARGA ELECTRICA" },
+  { numero: "MANIPULACION", descripcion: "MANIPULACION" },
+  { numero: "REPARACIÓN", descripcion: "REPARACIÓN VEHÍCULO" },
+  { numero: "REPFONDO", descripcion: "REPERCUSIÓN FONDO ECONÓMICO" },
+  { numero: "SEGURO", descripcion: "SEGUROS" },
+  { numero: "TASARES", descripcion: "TASA RESIDUOS" },
+  { numero: "TRANSPORTE", descripcion: "TRANSPORTE" },
+];
+app.get("/api/bc/cargos", async (req, res) => {
+  try {
+    const token = await obtenerTokenBC();
+    const h = { headers: { Authorization: `Bearer ${token}` } };
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+    const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}`;
+    const candidatos = [
+      `${raiz}/api/v2.0/companies(${EMPRESA_ID()})/itemCharges`,
+      ...["Cargos_prod", "ItemCharges", "Item_Charges", "Cargos_producto"].map((n) => `${raiz}/ODataV4/Company('${empresa}')/${encodeURIComponent(n)}`),
+    ];
+    for (const url of candidatos) {
+      try {
+        const r = await fetchConReintento(url, h);
+        if (!r.ok) continue;
+        const v = (await r.json()).value || [];
+        const lista = v
+          .map((x) => ({ numero: x.number || x.No || x.no || "", descripcion: x.displayName || x.description || x.Description || "" }))
+          .filter((x) => x.numero);
+        if (lista.length) return res.json({ cargos: lista, origen: "bc" });
+      } catch {}
+    }
+  } catch {}
+  res.json({ cargos: CARGOS_PROD_FIJOS, origen: "fija" });
+});
+
+app.post("/api/recepcion/nota", async (req, res) => {
+  const pedido = String(req.body?.pedido || "").trim();
+  const texto = String(req.body?.texto || "").trim();
+  const autor = String(req.body?.autor || "").trim() || "—";
+  if (!pedido || !texto) return res.status(400).json({ error: "Falta 'pedido' o 'texto'." });
+  try {
+    const d = await leerRecep();
+    d.notas = d.notas || {};
+    const nota = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ts: new Date().toISOString(), autor, texto: texto.slice(0, 2000) };
+    d.notas[pedido] = [...(d.notas[pedido] || []), nota];
+    await escribirRecep(d);
+    res.json({ ok: true, notas: d.notas[pedido] });
+  } catch (err) {
+    console.error("Error guardando nota:", err);
+    res.status(500).json({ error: "No se pudo guardar la nota." });
+  }
+});
+
+app.post("/api/recepcion/nota/borrar", async (req, res) => {
+  const pedido = String(req.body?.pedido || "").trim();
+  const id = String(req.body?.id || "").trim();
+  if (!pedido || !id) return res.status(400).json({ error: "Falta 'pedido' o 'id'." });
+  try {
+    const d = await leerRecep();
+    d.notas = d.notas || {};
+    d.notas[pedido] = (d.notas[pedido] || []).filter((n) => n.id !== id);
+    if (!d.notas[pedido].length) delete d.notas[pedido];
+    await escribirRecep(d);
+    res.json({ ok: true, notas: d.notas[pedido] || [] });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo borrar la nota." });
+  }
+});
+
+// ---------------------------------------------------------------------
+// CHAT IA del EXPLORADOR DE OTs
+// ---------------------------------------------------------------------
+const HERRAMIENTAS_CHAT_OT = [
+  {
+    name: "preparar_borradores_pdf",
+    description:
+      "Genera el BORRADOR DE FACTURA / VALORACIÓN en PDF (plantilla oficial ALSO CASALS) de una o varias OTs: actualiza sus líneas de venta desde Business Central y descarga un PDF por OT. Úsala cuando pidan facturas, valoraciones, borradores o PDFs de OTs.",
+    input_schema: {
+      type: "object",
+      properties: {
+        ots: {
+          type: "array",
+          items: { type: "string" },
+          description: "Números de OT tal como los ha escrito la usuaria (p.ej. \"15103\", \"AC015129/2026\"). Uno por OT, sin repetir.",
+        },
+      },
+      required: ["ots"],
+    },
+  },
+  {
+    name: "preparar_correo_responsable",
+    description:
+      "Prepara un correo para el responsable de una OT (departamento de la OT) adjuntando la valoración / documento que la usuaria ha subido al chat. Úsala cuando pidan enviar, mandar o reenviar la valoración (u otro adjunto del chat) al responsable, jefe de obra, departamento, etc. Abre un borrador editable; no envía sola.",
+    input_schema: {
+      type: "object",
+      properties: {
+        ot: {
+          type: "string",
+          description: "Número de OT tal como lo ha escrito la usuaria (p.ej. \"15129\" o \"AC015129/2026\").",
+        },
+        instrucciones: {
+          type: "string",
+          description: "Notas opcionales de la usuaria para el cuerpo del correo (tono, qué pedir, etc.).",
+        },
+      },
+      required: ["ot"],
+    },
+  },
+];
+
+app.post("/api/chat-ot", async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: "Falta ANTHROPIC_API_KEY en .env." });
+  const mensajes = Array.isArray(req.body?.mensajes) ? req.body.mensajes : [];
+  if (!mensajes.length) return res.status(400).json({ error: "Falta el mensaje." });
+  const tieneAdjunto = !!req.body?.tieneAdjunto;
+  const nombreAdjunto = req.body?.nombreAdjunto ? String(req.body.nombreAdjunto) : null;
+  try {
+    const r = await fetchConReintento("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
+        max_tokens: 1500,
+        system:
+          "Eres el asistente del Explorador de OTs (órdenes de trabajo) de ALSO CASALS INSTAL·LACIONS, en Business Central. Respondes en castellano, breve y claro. " +
+          "Si la usuaria pide facturas, valoraciones, borradores o PDFs de OTs (generarlos), llama a la herramienta preparar_borradores_pdf con TODOS los números de OT que haya escrito (aunque vengan uno por línea). " +
+          "Si pide enviar / mandar / reenviar la valoración (u otro documento del chat) al responsable de la OT, llama a preparar_correo_responsable con esa OT. " +
+          (tieneAdjunto
+            ? `La usuaria ha adjuntado un fichero al chat${nombreAdjunto ? ` («${nombreAdjunto}»)` : ""}; úsalo como adjunto del correo cuando prepare el mensaje al responsable. `
+            : "Si pide enviar un correo con valoración y no hay adjunto en el chat, dilo y pídele que adjunte el fichero (clip) antes de preparar el correo. ") +
+          "No inventes datos de OTs: si te preguntan algo que no puedes hacer con tus herramientas, dilo y explica qué sí puedes hacer.",
+        tools: HERRAMIENTAS_CHAT_OT,
+        messages: mensajes.map((m) => ({ role: m.rol === "ia" ? "assistant" : "user", content: String(m.texto || "") })),
+      }),
+    });
+    if (!r.ok) throw new Error(`API Claude respondió ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    const data = await r.json();
+    const texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    const acciones = (data.content || []).filter((b) => b.type === "tool_use").map((b) => ({ tipo: b.name, datos: b.input || {} }));
+    res.json({ texto, acciones });
+  } catch (err) {
+    console.error("Error /api/chat-ot:", err);
+    res.status(500).json({ error: "Error hablando con la IA.", detalle: String(err.message || err) });
+  }
+});
+
+app.post("/api/borradores/pdf", async (req, res) => {
+  const docs = Array.isArray(req.body?.docs) ? req.body.docs : [];
+  if (!docs.length) return res.status(400).json({ error: "No hay borradores que convertir." });
+  const fs = require("fs");
+  const os = require("os");
+  const { spawn } = require("child_process");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "borradores-"));
+  const hoy = new Date();
+  const sello = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, "0")}-${String(hoy.getDate()).padStart(2, "0")}_${String(hoy.getHours()).padStart(2, "0")}${String(hoy.getMinutes()).padStart(2, "0")}`;
+  const salida = path.join(__dirname, "..", "borradores", sello);
+  try {
+    const lista = docs.map((d, i) => {
+      const nombre = String(d.nombre || `borrador_${i + 1}`).replace(/[\\/:*?"<>|]+/g, "_").replace(/\.pdf$/i, "") + ".pdf";
+      const rutaHtml = path.join(tmp, `${i}.html`);
+      fs.writeFileSync(rutaHtml, String(d.html || ""), "utf8");
+      return { nombre, html: rutaHtml };
+    });
+    const rutaTrabajo = path.join(tmp, "trabajo.json");
+    fs.writeFileSync(rutaTrabajo, JSON.stringify({ salida, docs: lista }), "utf8");
+    const script = path.join(__dirname, "..", "bc_automation", "html_a_pdf.py");
+
+    const candidatos = [process.env.PYTHON_CMD, "py", "python", "python3"].filter(Boolean);
+    let salidaPy = null, ultimoErr = "";
+    for (const cmd of candidatos) {
+      const r = await new Promise((resolve) => {
+        let out = "", err = "";
+        let proc;
+        try { proc = spawn(cmd, [script, rutaTrabajo], { windowsHide: true }); } catch (e) { return resolve({ code: -1, err: String(e) }); }
+        proc.stdout.on("data", (b) => (out += b));
+        proc.stderr.on("data", (b) => (err += b));
+        proc.on("error", (e) => resolve({ code: -1, err: String(e) }));
+        proc.on("close", (code) => resolve({ code, out, err }));
+      });
+      if (r.code === 0) { salidaPy = r.out; break; }
+      ultimoErr = `${cmd}: ${(r.err || "").slice(-400)}`;
+    }
+    if (salidaPy === null) throw new Error(`No se pudo ejecutar html_a_pdf.py con Python (${ultimoErr}).`);
+    const resultado = JSON.parse(salidaPy.trim().split(/\r?\n/).pop());
+
+    const JSZip = require("jszip");
+    const zip = new JSZip();
+    for (const n of resultado.ok || []) zip.file(n, fs.readFileSync(path.join(salida, n)));
+    const errores = resultado.errores || {};
+    if (Object.keys(errores).length) zip.file("ERRORES.txt", Object.entries(errores).map(([k, v]) => `${k}: ${v}`).join("\r\n"));
+    const buf = await zip.generateAsync({ type: "nodebuffer" });
+    console.log(`[borradores/pdf] ${resultado.ok.length} PDF(s) → ${salida}${Object.keys(errores).length ? ` · ${Object.keys(errores).length} error(es)` : ""}`);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="borradores_${sello}.zip"`);
+    res.setHeader("X-Borradores-Ok", String(resultado.ok.length));
+    res.setHeader("X-Borradores-Errores", encodeURIComponent(JSON.stringify(errores)));
+    res.setHeader("X-Borradores-Carpeta", encodeURIComponent(salida));
+    res.send(buf);
+  } catch (err) {
+    console.error("Error /api/borradores/pdf:", err);
+    res.status(500).json({ error: "No se pudieron generar los PDF.", detalle: String(err.message || err) });
+  } finally {
+    try { require("fs").rmSync(tmp, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -340,6 +692,18 @@ app.post("/api/correo/enviar", async (req, res) => {
   if (!destinatarios.length) return res.status(400).json({ error: "Falta al menos un destinatario en 'para'." });
   if (!asunto) return res.status(400).json({ error: "Falta 'asunto'." });
 
+  const mimeDeNombre = (nombre) => {
+    const n = String(nombre || "").toLowerCase();
+    if (n.endsWith(".pdf")) return "application/pdf";
+    if (n.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (n.endsWith(".doc")) return "application/msword";
+    if (n.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (n.endsWith(".xls")) return "application/vnd.ms-excel";
+    if (n.endsWith(".png")) return "image/png";
+    if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+    return "application/octet-stream";
+  };
+
   try {
     const buzon = await buzonDelUsuario(req, res);
     if (!buzon) return;
@@ -353,8 +717,8 @@ app.post("/api/correo/enviar", async (req, res) => {
       mensaje.attachments = [
         {
           "@odata.type": "#microsoft.graph.fileAttachment",
-          name: adjunto.nombre || "factura.pdf",
-          contentType: "application/pdf",
+          name: adjunto.nombre || "adjunto.pdf",
+          contentType: adjunto.mime || mimeDeNombre(adjunto.nombre) || "application/pdf",
           contentBytes: adjunto.base64,
         },
       ];
@@ -389,7 +753,7 @@ app.post("/api/correo/enviar", async (req, res) => {
 // ---------------------------------------------------------------------
 app.get("/api/avisos", async (req, res) => {
   try {
-    res.json(await db.getDoc("avisos", { enviados: {} }));
+    res.json(await db.getDoc(claveEmpresa("avisos"), { enviados: {} }));
   } catch (err) {
     console.error("Error leyendo avisos:", err);
     res.status(500).json({ error: "No se pudo leer los avisos." });
@@ -398,11 +762,11 @@ app.get("/api/avisos", async (req, res) => {
 
 app.post("/api/avisos", async (req, res) => {
   try {
-    const actual = await db.getDoc("avisos", { enviados: {} });
+    const actual = await db.getDoc(claveEmpresa("avisos"), { enviados: {} });
     const body = req.body || {};
     const combinado = { enviados: { ...(actual.enviados || {}), ...(body.enviados || {}) } };
     for (const k in body.enviados || {}) if (body.enviados[k] === null) delete combinado.enviados[k];
-    await db.setDoc("avisos", combinado);
+    await db.setDoc(claveEmpresa("avisos"), combinado);
     res.json({ guardado: true });
   } catch (err) {
     console.error("Error guardando avisos:", err);
@@ -762,7 +1126,7 @@ const CAMPO_SEGMENTO_BC = process.env.BC_CAMPO_SEGMENTO || "shortcut_Dimension_1
 const BC_PAGE_PEDIDO_COMPRA = process.env.BC_PAGE_PEDIDO_COMPRA || "9307";
 function enlacePedidoCompraBC(numeroPedido) {
   if (!numeroPedido || !process.env.BC_TENANT_ID || !process.env.BC_ENVIRONMENT) return null;
-  const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+  const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
   const filtro = encodeURIComponent(`'No.' IS '${numeroPedido}'`);
   return `https://businesscentral.dynamics.com/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}?company=${empresa}&page=${BC_PAGE_PEDIDO_COMPRA}&filter=${filtro}`;
 }
@@ -859,31 +1223,6 @@ const FUENTES_WS = {
   },
 };
 
-// Caché del token de Azure (dura ~1h; lo renovamos 5 min antes)
-let tokenCache = { token: null, expira: 0 };
-
-async function obtenerTokenBC() {
-  if (tokenCache.token && Date.now() < tokenCache.expira) return tokenCache.token;
-
-  const url = `https://login.microsoftonline.com/${process.env.BC_TENANT_ID}/oauth2/v2.0/token`;
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: process.env.BC_CLIENT_ID,
-    client_secret: process.env.BC_CLIENT_SECRET,
-    scope: "https://api.businesscentral.dynamics.com/.default",
-  });
-
-  const response = await fetchConReintento(url, { method: "POST", body });
-  if (!response.ok) throw new Error(`Azure AD respondió ${response.status}: ${await response.text()}`);
-
-  const data = await response.json();
-  tokenCache = {
-    token: data.access_token,
-    expira: Date.now() + (data.expires_in - 300) * 1000,
-  };
-  return tokenCache.token;
-}
-
 // ---------------------------------------------------------------------
 // 2a) EMPRESAS — GET /api/bc/empresas
 // ---------------------------------------------------------------------
@@ -896,7 +1235,7 @@ async function obtenerTokenBC() {
 // por otro motivo. Solo texto fijo. Súbelo a esta dirección cualquier
 // vez que haya dudas de si el server.cjs nuevo se ha cargado.
 app.get("/api/version", (req, res) => {
-  res.json({ version: "2026-09-02-integra-servicio-registro" });
+  res.json({ version: "2026-09-25-multiempresa-proves" });
 });
 
 app.get("/api/bc/empresas", async (req, res) => {
@@ -938,7 +1277,7 @@ app.get("/api/bc/diag/metadata", async (req, res) => {
   }
   try {
     const token = await obtenerTokenBC();
-    const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
     // El documento $metadata describe el ESQUEMA del servicio entero (no
     // datos), así que en OData v4 normalmente se pide en la RAÍZ, sin la
     // empresa en medio. Por si en este entorno hiciera falta con empresa
@@ -1105,7 +1444,7 @@ app.get("/api/bc/diag/metadata-api", async (req, res) => {
 app.get("/api/bc/proyectos", async (req, res) => {
   try {
     const token = await obtenerTokenBC();
-    const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
     const baseOData = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
 
     // Variantes del nombre del servicio: BC a veces expone "Job List"
@@ -1147,7 +1486,7 @@ app.get("/api/bc/proyectos", async (req, res) => {
     // Respaldo: API estándar de proyectos (sin web service). Trae menos
     // campos (sin línea de negocio) pero confirma la conectividad.
     if (!filas) {
-      const urlStd = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${process.env.BC_COMPANY_ID})/projects`;
+      const urlStd = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/projects`;
       console.log("[proyectos] Web service no disponible; probando API estándar /projects");
       const r = await fetchConReintento(urlStd, { headers: { Authorization: `Bearer ${token}` } });
       intentos.push(`api v2.0 projects → ${r.status}`);
@@ -1215,7 +1554,7 @@ app.get("/api/bc/ot/lineas", async (req, res) => {
   if (!no) return res.status(400).json({ error: "Falta el parámetro no (ej. AC014126/2026)" });
   try {
     const token = await obtenerTokenBC();
-    const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
     const filtro = encodeURIComponent(`Shortcut_Dimension_2_Code eq '${no.replace(/'/g, "''")}'`);
 
@@ -1253,6 +1592,47 @@ app.get("/api/bc/ot/lineas", async (req, res) => {
   }
 });
 
+// DIAGNÓSTICO de líneas de una OT: qué servicios de BC hay y cuántas líneas
+app.get("/api/bc/ot/diagnostico", async (req, res) => {
+  const no = String(req.query.no || "").trim();
+  if (!no) return res.status(400).json({ error: "Falta no" });
+  try {
+    const token = await obtenerTokenBC();
+    const h = { headers: { Authorization: `Bearer ${token}` } };
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+    const rc = await fetchConReintento(base, h);
+    const catalogo = rc.ok ? ((await rc.json()).value || []).map((x) => x.name) : [];
+    const numero = (no.match(/(\d{4,6})\//) || [])[1] || no;
+    const candidatos = [...new Set([
+      FUENTES_WS.lineas_venta.servicio, FUENTES_WS.lineas_compra.servicio,
+      process.env.BC_WS_LINEASVENTA_PFV, "Sales_InvoiceSalesLines_Excel", "SalesInvLines", ...(FUENTES_WS.lineas_venta_reg.servicios || []),
+      ...catalogo.filter((n) => /(line|lin)/i.test(n) && /(sales|venta|invoice|factur|pedido|order)/i.test(n)),
+    ].filter(Boolean))];
+    const salida = [];
+    for (const n of candidatos) {
+      const fila = { servicio: n, publicado: !catalogo.length || catalogo.includes(n) };
+      if (!fila.publicado) { salida.push(fila); continue; }
+      try {
+        const r1 = await fetchConReintento(`${base}/${encodeURIComponent(n)}?$filter=${encodeURIComponent(`Shortcut_Dimension_2_Code eq '${no.replace(/'/g, "''")}'`)}&$top=500`, h);
+        if (r1.ok) fila.conOT = ((await r1.json()).value || []).length; else fila.errorFiltro = `${r1.status}: ${(await r1.text()).slice(0, 160)}`;
+        const r2 = await fetchConReintento(`${base}/${encodeURIComponent(n)}?$top=1`, h);
+        if (r2.ok) {
+          const ej = ((await r2.json()).value || [])[0] || {};
+          fila.camposOT = Object.keys(ej).filter((k) => /dimension_2|ot|job|proyecto|obra/i.test(k)).slice(0, 8);
+          fila.tieneShortcut2 = "Shortcut_Dimension_2_Code" in ej;
+        }
+        const r3 = await fetchConReintento(`${base}/${encodeURIComponent(n)}?$filter=${encodeURIComponent(`contains(Description,'${numero}')`)}&$top=50`, h);
+        if (r3.ok) fila.enDescripcion = ((await r3.json()).value || []).length;
+      } catch (e) { fila.error = String(e.message || e); }
+      salida.push(fila);
+    }
+    res.json({ no, empresa: EMPRESA_NOMBRE(), servicios: salida, totalCatalogo: catalogo.length });
+  } catch (err) {
+    res.status(500).json({ error: "Error en el diagnóstico.", detalle: String(err.message || err) });
+  }
+});
+
 app.get("/api/bc/:fuente", async (req, res) => {
   const { fuente } = req.params;
   const { from, to } = req.query;
@@ -1263,7 +1643,7 @@ app.get("/api/bc/:fuente", async (req, res) => {
     if (!from || !to) return res.status(400).json({ error: "Faltan parámetros from/to (YYYY-MM-DD)." });
     try {
       const token = await obtenerTokenBC();
-      const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+      const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
       const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
       const cabeceras = { headers: { Authorization: `Bearer ${token}` } };
 
@@ -1440,7 +1820,7 @@ app.get("/api/bc/:fuente", async (req, res) => {
 
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0`;
     const filtro = `${config.campoFecha} ge ${from} and ${config.campoFecha} le ${to}`;
-    let url = `${base}/companies(${process.env.BC_COMPANY_ID})/${config.entidad}?$filter=${encodeURIComponent(filtro)}`;
+    let url = `${base}/companies(${EMPRESA_ID()})/${config.entidad}?$filter=${encodeURIComponent(filtro)}`;
 
     // Paginación OData: BC devuelve @odata.nextLink si hay más páginas
     const filas = [];
@@ -1706,14 +2086,14 @@ async function buscarPedidoYLineasBC(pedido) {
     const token = await obtenerTokenBC();
     const cabeceras = { Authorization: `Bearer ${token}` };
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0`;
-    const urlBusca = `${base}/companies(${process.env.BC_COMPANY_ID})/purchaseOrders?$filter=${encodeURIComponent(`number eq '${pedido.replace(/'/g, "''")}'`)}`;
+    const urlBusca = `${base}/companies(${EMPRESA_ID()})/purchaseOrders?$filter=${encodeURIComponent(`number eq '${pedido.replace(/'/g, "''")}'`)}`;
     const rBusca = await fetchConReintento(urlBusca, { headers: cabeceras });
     if (!rBusca.ok) return { error: `BC respondió ${rBusca.status} buscando el pedido en purchaseOrders.` };
     const datosBusca = await rBusca.json();
     const cabecera = (datosBusca.value || [])[0];
     if (!cabecera) return { error: `Pedido "${pedido}" no encontrado en purchaseOrders (api/v2.0).` };
 
-    const urlLineas = `${base}/companies(${process.env.BC_COMPANY_ID})/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${cabecera.id}`)}`;
+    const urlLineas = `${base}/companies(${EMPRESA_ID()})/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${cabecera.id}`)}`;
     const rLineas = await fetchConReintento(urlLineas, { headers: cabeceras });
     // vendorNumber: sin $select, así que si el campo existe en el
     // pedido ya viene en "cabecera" — nombre estándar de la API v2.0,
@@ -1830,18 +2210,47 @@ app.post("/api/recepcion/extraer", async (req, res) => {
   }
 });
 
+function normalizarNumPedido(v) {
+  const s = String(v || "").trim().toUpperCase();
+  const m = s.match(/^(PC|OC)\s*(\d{2})\s*[-/]?\s*(\d{1,7})$/i);
+  if (m) return `${m[1].toUpperCase()}${m[2]}-${String(m[3]).padStart(6, "0")}`;
+  return s || null;
+}
+
+app.post("/api/recepcion/cruzar", async (req, res) => {
+  const pedido = normalizarNumPedido(req.body?.pedido);
+  const lineasPdf = Array.isArray(req.body?.lineasPdf) ? req.body.lineasPdf : [];
+  if (!pedido) return res.status(400).json({ error: "Falta el Nº de pedido." });
+  try {
+    const bc = await buscarPedidoYLineasBC(pedido);
+    const lineasEmparejadas = bc.lineasBC ? emparejarLineas(lineasPdf, bc.lineasBC) : [];
+    const lineasDisponiblesBC = (bc.lineasBC || []).map((lb) => ({
+      id: lb.id,
+      codigo: lb.lineObjectNumber || "",
+      descripcion: lb.description || "",
+      cantidadPedida: Number(lb.quantity) || 0,
+      cantidadRecibida: Number(lb.receivedQuantity) || 0,
+      cantidadPendiente: Math.max(0, (Number(lb.quantity) || 0) - (Number(lb.receivedQuantity) || 0)),
+    }));
+    res.json({ pedido, vendorName: bc.vendorName || null, bcError: bc.error || null, lineasEmparejadas, lineasDisponiblesBC });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo cruzar el pedido con BC.", detalle: String(err.message || err) });
+  }
+});
+
 app.post("/api/recepcion/subir-bc", async (req, res) => {
   if (!PDFDocument) {
     return res.status(503).json({ error: "Falta instalar el paquete 'pdf-lib' en el backend. Ejecuta: npm install pdf-lib (y reinicia npm start)." });
   }
-  const { pedido, albaran, pdfBase64, nombreArchivo, lineas } = req.body || {};
+  const { pedido, albaran, pdfBase64, nombreArchivo, lineas, nuevasLineas } = req.body || {};
+  const registrar = req.body?.registrar !== false; // «Subir este pedido en BC» = subir sin registrar
   if (!pedido) return res.status(400).json({ error: "Falta el Nº de pedido." });
 
-  const resultado = { pedido, version: "subir-bc-v4-con-registro", albaran: { ok: false }, adjunto: { ok: false }, lineas: [] };
+  const resultado = { pedido, version: "subir-bc-v5-cargos", albaran: { ok: false }, adjunto: { ok: false }, lineas: [] };
 
   try {
     const token = await obtenerTokenBC();
-    const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
     const cabeceras = { Authorization: `Bearer ${token}` };
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0`;
 
@@ -1904,7 +2313,7 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
     // tanto para el adjunto como para las líneas).
     let purchaseOrderId = null;
     try {
-      const urlBusca = `${base}/companies(${process.env.BC_COMPANY_ID})/purchaseOrders?$filter=${encodeURIComponent(`number eq '${pedido.replace(/'/g, "''")}'`)}`;
+      const urlBusca = `${base}/companies(${EMPRESA_ID()})/purchaseOrders?$filter=${encodeURIComponent(`number eq '${pedido.replace(/'/g, "''")}'`)}`;
       const rBusca = await fetchConReintento(urlBusca, { headers: cabeceras });
       if (rBusca.ok) {
         const datosBusca = await rBusca.json();
@@ -1931,7 +2340,7 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
         resultado.adjunto.error = `Pedido "${pedido}" no encontrado en purchaseOrders (api/v2.0) — no se puede adjuntar.`;
       } else {
         const contenidoBinario = Buffer.from(pdfBase64, "base64");
-        const urlColeccion = `${base}/companies(${process.env.BC_COMPANY_ID})/attachments`;
+        const urlColeccion = `${base}/companies(${EMPRESA_ID()})/attachments`;
         const intentosAdjunto = [];
 
         // --- Intento A: contenido primero, enlazar después ---
@@ -2000,16 +2409,110 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
       resultado.adjunto.error = "Sin PDF que adjuntar.";
     }
 
-    // 3) LÍNEAS — rellenar "Cantidad a recibir" (receiveQuantity) en las
-    //    líneas confirmadas. NO se registra/postea nada (a propósito):
-    //    queda lista para registrarse desde BC.
+    // 2b) LÍNEAS NUEVAS (cargos/material) — se crean ANTES de registrar
+    resultado.nuevasLineas = [];
+    let fallaNuevaLinea = false;
+    if (Array.isArray(nuevasLineas) && nuevasLineas.length) {
+      if (!purchaseOrderId) {
+        for (const nl of nuevasLineas) resultado.nuevasLineas.push({ codigo: nl.codigo, ok: false, error: "Pedido no localizado en purchaseOrders (api/v2.0)." });
+        fallaNuevaLinea = true;
+      } else {
+        const urlLineasApi = `${base}/companies(${EMPRESA_ID()})/purchaseOrderLines`;
+        let ref = null;
+        try {
+          const rRef = await fetchConReintento(`${urlLineasApi}?$filter=${encodeURIComponent(`documentId eq ${purchaseOrderId}`)}`, { headers: cabeceras });
+          if (rRef.ok) {
+            const ls = (await rRef.json()).value || [];
+            ref = ls.find((l) => /item/i.test(l.lineType || "") && !/charge/i.test(l.lineType || "") && l.lineObjectNumber) || ls.find((l) => l.lineObjectNumber) || null;
+          }
+        } catch {}
+        const raizWS = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+        const servicioLineas = FUENTES_WS.lineas_compra.servicio;
+        const pedidoEsc = pedido.replace(/'/g, "''");
+        const leerFilasWS = async () => {
+          const r = await fetchConReintento(`${raizWS}/${encodeURIComponent(servicioLineas)}?$filter=${encodeURIComponent(`Document_No eq '${pedidoEsc}'`)}`, { headers: cabeceras });
+          if (!r.ok) throw new Error(`web service ${servicioLineas} respondió ${r.status}`);
+          return (await r.json()).value || [];
+        };
+        for (const nl of nuevasLineas) {
+          const info = { codigo: nl.codigo, descripcion: nl.descripcion, ok: false, avisos: [] };
+          try {
+            const cantidad = Number(nl.cantidad) || 0;
+            const coste = Number(nl.coste);
+            if (!nl.codigo || cantidad <= 0) throw new Error("Falta el Nº (artículo o cargo) o la cantidad.");
+            let creada = null, ultimoErr = "";
+            const tipos = nl.tipo === "Item" ? ["Item"] : ["Charge", "Charge (Item)"];
+            for (const tipo of tipos) {
+              const body = { documentId: purchaseOrderId, lineType: tipo, lineObjectNumber: String(nl.codigo).trim(), quantity: cantidad };
+              if (!Number.isNaN(coste) && nl.coste !== null && nl.coste !== "") body.directUnitCost = coste;
+              const r = await fetchConReintento(urlLineasApi, { method: "POST", headers: { ...cabeceras, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+              if (r.ok) { creada = await r.json(); break; }
+              const txt = (await r.text().catch(() => "")).slice(0, 300);
+              if (!ultimoErr) ultimoErr = `BC respondió ${r.status}: ${txt}`;
+              if (!/InvalidOptionEnumValue|is not an option/i.test(txt)) break;
+            }
+            if (!creada) throw new Error(ultimoErr);
+            info.lineaId = creada.id;
+            const parche = { receiveQuantity: cantidad };
+            const dto = Number(nl.dto);
+            if (nl.dto !== null && nl.dto !== undefined && nl.dto !== "" && !Number.isNaN(dto) && dto > 0) parche.discountPercent = dto;
+            if (nl.descripcion && nl.descripcion !== creada.description) parche.description = String(nl.descripcion).slice(0, 100);
+            const rP = await fetchConReintento(`${urlLineasApi}(${creada.id})`, {
+              method: "PATCH", headers: { ...cabeceras, "Content-Type": "application/json", "If-Match": "*" }, body: JSON.stringify(parche),
+            });
+            if (!rP.ok) info.avisos.push(`No se pudo marcar la cantidad a recibir/descripción/descuento: BC ${rP.status}`);
+            info.ok = true;
+            if (creada.sequence != null) {
+              try {
+                const filas = await leerFilasWS();
+                const fNueva = filas.find((f) => Number(f.Line_No) === Number(creada.sequence));
+                let fRef = ref && ref.sequence != null ? filas.find((f) => Number(f.Line_No) === Number(ref.sequence)) : null;
+                if (!fRef) {
+                  const servicioPedidos = FUENTES_WS.pedidos_compra.servicio;
+                  const rCab = await fetchConReintento(`${raizWS}/${encodeURIComponent(servicioPedidos)}(Document_Type='Order',No='${pedidoEsc}')`, { headers: cabeceras });
+                  if (rCab.ok) fRef = await rCab.json();
+                }
+                if (fRef && fNueva) {
+                  const campos = Object.keys(fRef).filter((k) =>
+                    k in fNueva && (/^(Shortcut_Dimension_[12]_Code|Location_Code)$/i.test(k) || /l[ií]n(ea)?.*negocio|business.?line/i.test(k))
+                  );
+                  const cambios = {};
+                  for (const k of campos) {
+                    const v = fRef[k];
+                    if (v !== null && v !== undefined && v !== "" && fNueva[k] !== v) cambios[k] = v;
+                  }
+                  if (Object.keys(cambios).length) {
+                    const clave = `(Document_Type='Order',Document_No='${pedidoEsc}',Line_No=${Number(creada.sequence)})`;
+                    const rC = await fetchConReintento(`${raizWS}/${encodeURIComponent(servicioLineas)}${clave}`, {
+                      method: "PATCH",
+                      headers: { ...cabeceras, "Content-Type": "application/json", "If-Match": fNueva["@odata.etag"] || "*" },
+                      body: JSON.stringify(cambios),
+                    });
+                    if (rC.ok) info.copiado = cambios;
+                    else info.avisos.push(`No se pudieron copiar dimensiones: BC ${rC.status}`);
+                  }
+                }
+              } catch (e) {
+                info.avisos.push(`No se pudo comprobar OT/línea de negocio/almacén (${String(e.message || e)})`);
+              }
+            }
+          } catch (e) {
+            info.error = String(e.message || e);
+            fallaNuevaLinea = true;
+          }
+          resultado.nuevasLineas.push(info);
+        }
+      }
+    }
+
+    // 3) LÍNEAS — rellenar "Cantidad a recibir" (receiveQuantity)
     if (Array.isArray(lineas) && lineas.length) {
       if (!purchaseOrderId) {
         for (const l of lineas) resultado.lineas.push({ lineaId: l.lineaId, ok: false, error: "Pedido no localizado en purchaseOrders (api/v2.0)." });
       } else {
         for (const l of lineas) {
           try {
-            const urlLinea = `${base}/companies(${process.env.BC_COMPANY_ID})/purchaseOrderLines(${l.lineaId})`;
+            const urlLinea = `${base}/companies(${EMPRESA_ID()})/purchaseOrderLines(${l.lineaId})`;
             const rPatchLinea = await fetchConReintento(urlLinea, {
               method: "PATCH",
               headers: { ...cabeceras, "Content-Type": "application/json", "If-Match": "*" },
@@ -2024,30 +2527,80 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
       }
     }
 
-    // 4) REGISTRAR — habla con el servicio local de Python
-    //    (bc_automation/servicio_registro.py), que mantiene el navegador
-    //    YA ABIERTO y hace clic de verdad en "Registrar" → "Recibir".
-    //    Es OPCIONAL: si ese servicio no está arrancado, se avisa
-    //    claramente sin romper el resto — el Nº albarán/adjunto/líneas
-    //    ya se han subido igualmente por la API.
+    // 3-bis) Poner a 0 la cantidad a recibir del resto de líneas
+    let fallaCeros = false;
+    resultado.lineasACero = [];
+    if (purchaseOrderId) {
+      try {
+        const confirmadas = new Set([
+          ...(Array.isArray(lineas) ? lineas.map((l) => String(l.lineaId)) : []),
+          ...(resultado.nuevasLineas || []).filter((n) => n.lineaId).map((n) => String(n.lineaId)),
+        ]);
+        const urlTodas = `${base}/companies(${EMPRESA_ID()})/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${purchaseOrderId}`)}`;
+        const rTodas = await fetchConReintento(urlTodas, { headers: cabeceras });
+        if (!rTodas.ok) throw new Error(`BC respondió ${rTodas.status} al leer las líneas del pedido`);
+        for (const l of (await rTodas.json()).value || []) {
+          if (confirmadas.has(String(l.id))) continue;
+          if (!(Number(l.receiveQuantity) > 0)) continue;
+          const r0 = await fetchConReintento(`${base}/companies(${EMPRESA_ID()})/purchaseOrderLines(${l.id})`, {
+            method: "PATCH",
+            headers: { ...cabeceras, "Content-Type": "application/json", "If-Match": "*" },
+            body: JSON.stringify({ receiveQuantity: 0 }),
+          });
+          const info = { linea: l.sequence, articulo: l.lineObjectNumber, descripcion: l.description, antes: l.receiveQuantity, ok: r0.ok };
+          if (!r0.ok) { info.error = `BC ${r0.status}`; fallaCeros = true; }
+          resultado.lineasACero.push(info);
+        }
+      } catch (e) {
+        fallaCeros = true;
+        resultado.lineasACero.push({ ok: false, error: String(e.message || e) });
+      }
+    } else {
+      fallaCeros = true;
+    }
+    if (fallaCeros) {
+      resultado.registro = { ok: false, error: "No se ha registrado: no se pudo poner a 0 la cantidad a recibir de las demás líneas del pedido (se recibiría de más). Revísalo en BC antes de registrar." };
+      return res.json(resultado);
+    }
+
+    if (!registrar) {
+      resultado.registro = { ok: false, noRegistrar: true };
+      return res.json(resultado);
+    }
+
+    // 4) REGISTRAR — servicio Playwright (BC_REGISTRO_URL)
     resultado.registro = { ok: false };
+    if (fallaNuevaLinea) {
+      resultado.registro.error = "No se ha registrado: alguna línea nueva (cargo) no se pudo crear. Corrígelo y vuelve a confirmar, o regístralo desde BC.";
+      return res.json(resultado);
+    }
     try {
       const rRegistro = await fetch(
         (process.env.BC_REGISTRO_URL || "http://localhost:5055").replace(/\/$/, "") + "/registrar",
         {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(90000),
-        body: JSON.stringify({ numero_pedido: pedido }),
-      });
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(90000),
+          body: JSON.stringify({ numero_pedido: pedido, empresa: EMPRESA_NOMBRE() }),
+        }
+      );
       const datosRegistro = await rRegistro.json().catch(() => ({}));
       if (rRegistro.ok && datosRegistro.ok) {
         resultado.registro.ok = true;
+        try {
+          const d = await leerRecep();
+          d.registrados = d.registrados || {};
+          const clave = `${pedido.toUpperCase()}|${String(albaran || "").trim().toUpperCase()}`;
+          d.registrados[clave] = { ts: new Date().toISOString(), archivo: nombreArchivo || null };
+          await escribirRecep(d);
+        } catch (e) {
+          console.warn("[subir-bc] No se pudo anotar el registro:", e.message);
+        }
       } else {
         resultado.registro.error = datosRegistro.error || `El servicio de registro respondió ${rRegistro.status}.`;
       }
     } catch (e) {
-      resultado.registro.error = `No se pudo contactar con el servicio de registro — ¿está arrancado 'python servicio_registro.py' en bc_automation? (${String(e.message || e)})`;
+      resultado.registro.error = `No se pudo contactar con el servicio de registro — ¿está arrancado 'python servicio_registro.py'? (${String(e.message || e)})`;
     }
 
     res.json(resultado);
@@ -2415,7 +2968,7 @@ async function facturaYaEntradaEnBC(vendorInvoiceNumber) {
   if (!vendorInvoiceNumber) return { encontrada: false };
   try {
     const token = await obtenerTokenBC();
-    const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
     const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
     const cabeceras = { headers: { Authorization: `Bearer ${token}` } };
 
@@ -2570,7 +3123,7 @@ async function obtenerProveedoresDeGasto(raiz, cabeceras) {
 app.get("/api/facturas-compra/proveedores-gasto", async (req, res) => {
   try {
     const token = await obtenerTokenBC();
-    const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
     const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
     const cabeceras = { headers: { Authorization: `Bearer ${token}` } };
     const datos = await obtenerProveedoresDeGasto(raiz, cabeceras);
@@ -2595,12 +3148,12 @@ app.get("/api/facturas-compra/proveedores-gasto", async (req, res) => {
 const REGISTRO_FACTURAS_MAX = 2000; // recorta las más antiguas por encima de esto
 
 async function leerRegistroFacturas() {
-  const lista = await db.getDoc("registro_facturas_compra", []);
+  const lista = await db.getDoc(claveEmpresa("registro_facturas_compra"), []);
   return Array.isArray(lista) ? lista : [];
 }
 
 async function guardarRegistroFacturas(lista) {
-  await db.setDoc("registro_facturas_compra", lista.slice(0, REGISTRO_FACTURAS_MAX));
+  await db.setDoc(claveEmpresa("registro_facturas_compra"), lista.slice(0, REGISTRO_FACTURAS_MAX));
 }
 
 // Se llama una vez por cada factura identificada al subir el PDF
@@ -2765,7 +3318,7 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
       if (porPedido.size === 0 && sinPedido.length && g.proveedor) {
         try {
           const token = await obtenerTokenBC();
-          const empresa = encodeURIComponent(process.env.BC_COMPANY_NAME || "");
+          const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
           const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
           const cabecerasBC = { headers: { Authorization: `Bearer ${token}` } };
           const datosGasto = await obtenerProveedoresDeGasto(raiz, cabecerasBC);
@@ -3086,7 +3639,7 @@ app.post("/api/facturas-compra/entrar-bc", async (req, res) => {
   const token = await obtenerTokenBC();
   const cabeceras = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
   const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0`;
-  const urlBase = `${base}/companies(${process.env.BC_COMPANY_ID})`;
+  const urlBase = `${base}/companies(${EMPRESA_ID()})`;
 
   const facturasCreadas = [];
   for (const [vendorNumber, grupo] of porProveedor) {
@@ -3283,6 +3836,120 @@ app.post("/api/facturas-compra/entrar-bc", async (req, res) => {
 
   res.status(huboError ? 207 : 200).json({ ok: !huboError, facturasCreadas, avisos });
 });
+
+// -----------------------------------------------------------------------
+// BANDEJA DE FACTURAS (facturacio@) — CIF → empresa; Postgres bandeja_facturas
+// -----------------------------------------------------------------------
+const leerBandejaProc = async () => db.getDoc("bandeja_facturas", {});
+const normCif = (v) => String(v || "").toUpperCase().replace(/^ES/, "").replace(/[^A-Z0-9]/g, "");
+const cacheCifPdf = new Map();
+
+async function detectarEmpresaPdf(attId, base64, empresas) {
+  if (cacheCifPdf.has(attId)) return cacheCifPdf.get(attId);
+  let resultado = { cif: null, empresaId: null, sinTexto: false };
+  try {
+    const data = await pdfParse(Buffer.from(base64, "base64"));
+    const texto = String(data.text || "");
+    if (texto.replace(/\s/g, "").length < 30) resultado.sinTexto = true;
+    const plano = texto.toUpperCase().replace(/[\s.\-\/]/g, "");
+    const coinciden = empresas.filter((e) => normCif(e.cif) && plano.includes(normCif(e.cif)));
+    if (coinciden.length === 1) resultado = { cif: normCif(coinciden[0].cif), empresaId: coinciden[0].id, sinTexto: false };
+    else if (coinciden.length > 1) resultado = { cif: coinciden.map((e) => normCif(e.cif)).join(" / "), empresaId: null, sinTexto: false, varios: true };
+  } catch {
+    resultado.sinTexto = true;
+  }
+  cacheCifPdf.set(attId, resultado);
+  return resultado;
+}
+
+app.get("/api/facturas-compra/bandeja", async (req, res) => {
+  if (!process.env.M365_CLIENT_SECRET) return res.status(503).json({ error: "Falta configurar M365_* en .env." });
+  const buzon = M365_BUZONES.facturas;
+  const dias = Math.min(Math.max(Number(req.query.dias) || 7, 1), 90);
+  try {
+    const empresas = await empresasApp().catch(() => [{ id: process.env.BC_COMPANY_ID, nombre: process.env.BC_COMPANY_NAME, cif: "B43831593", porDefecto: true }]);
+    const token = await obtenerTokenGraph();
+    const headers = { Authorization: `Bearer ${token}` };
+    const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/inbox/messages`;
+    const hoy = new Date();
+    const desde = new Date(Date.UTC(hoy.getUTCFullYear(), hoy.getUTCMonth(), hoy.getUTCDate() - (dias - 1))).toISOString().slice(0, 19) + "Z";
+    let url = `${base}?$select=id,subject,from,receivedDateTime,hasAttachments&$top=100&$filter=receivedDateTime ge ${desde}`;
+    const mensajes = [];
+    while (url && mensajes.length < 300) {
+      const r = await fetchConReintento(url, { headers });
+      if (!r.ok) throw new Error(`Graph respondió ${r.status}: ${(await r.text()).slice(0, 300)}`);
+      const j = await r.json();
+      mensajes.push(...(j.value || []));
+      url = j["@odata.nextLink"] || null;
+    }
+    const procesadas = await leerBandejaProc();
+    const items = [];
+    for (const msg of mensajes) {
+      if (!msg.hasAttachments) continue;
+      const ar = await fetchConReintento(`${base}/${msg.id}/attachments`, { headers });
+      if (!ar.ok) continue;
+      for (const att of (await ar.json()).value || []) {
+        const nombre = String(att.name || "");
+        const esPdf = (att.contentType || "").toLowerCase() === "application/pdf" || nombre.toLowerCase().endsWith(".pdf");
+        if (!esPdf || !(att["@odata.type"] || "").endsWith("fileAttachment") || !att.contentBytes) continue;
+        const det = await detectarEmpresaPdf(att.id, att.contentBytes, empresas);
+        const emp = empresas.find((e) => e.id === det.empresaId);
+        const clave = `${msg.id}|${att.id}`;
+        items.push({
+          msg: msg.id, att: att.id, nombre,
+          asunto: msg.subject || "", de: msg.from?.emailAddress?.address || "", deNombre: msg.from?.emailAddress?.name || "",
+          fecha: msg.receivedDateTime || "",
+          empresaId: det.empresaId, empresaNombre: emp ? emp.displayName || emp.nombre : null, cif: det.cif, sinTexto: det.sinTexto, variosCif: !!det.varios,
+          procesada: procesadas[clave] || null,
+        });
+      }
+    }
+    items.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
+    res.json({ buzon, dias, empresaActual: EMPRESA_ID(), items });
+  } catch (err) {
+    console.error("Error /api/facturas-compra/bandeja:", err);
+    res.status(500).json({ error: "No se pudo leer el buzón de facturas.", detalle: String(err.message || err) });
+  }
+});
+
+app.get("/api/facturas-compra/bandeja/pdf", async (req, res) => {
+  try {
+    const token = await obtenerTokenGraph();
+    const buzon = M365_BUZONES.facturas;
+    const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/messages/${encodeURIComponent(req.query.msg)}/attachments/${encodeURIComponent(req.query.att)}`;
+    const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) throw new Error(`Graph respondió ${r.status}`);
+    const a = await r.json();
+    res.json({ nombre: a.name, base64: a.contentBytes });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo descargar la factura.", detalle: String(err.message || err) });
+  }
+});
+
+app.post("/api/facturas-compra/bandeja/procesada", async (req, res) => {
+  try {
+    const { msg, att, quitar } = req.body || {};
+    if (!msg || !att) return res.status(400).json({ error: "Falta msg/att." });
+    const d = await leerBandejaProc();
+    const clave = `${msg}|${att}`;
+    if (quitar) delete d[clave];
+    else d[clave] = { ts: new Date().toISOString(), empresa: EMPRESA_NOMBRE() };
+    await db.setDoc("bandeja_facturas", d);
+    res.json({ ok: true, procesada: d[clave] || null });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Módulos Proves (IA, ratios, macro, horas, correos PC → notas recepción)
+// ---------------------------------------------------------------------
+require("./iaBC.cjs")({ app, obtenerTokenBC, fetchConReintento, db });
+require("./contabilidad.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE });
+require("./macro.cjs")({ app, fetchConReintento, db });
+const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@alsocasals.com";
+require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep, escribirRecep, BUZON_PERSONAL });
+require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, db, claveEmpresa });
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)
 app.get(/^\/(?!api).*/, (req, res) => {
