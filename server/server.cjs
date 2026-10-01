@@ -1141,7 +1141,7 @@ const FUENTES_BC = {
   lineas_venta: { entidad: "salesInvoiceLines", campoFecha: "postingDate" },
   lineas_compra: { entidad: "purchaseInvoiceLines", campoFecha: "postingDate" },
   movs_contabilidad: { entidad: "generalLedgerEntries", campoFecha: "postingDate" },
-  tarifas_venta: { entidad: "salesPrices", campoFecha: "startingDate" },
+  // tarifas_venta va por FUENTES_WS: salesPrices NO existe en la API v2.0 estándar
   facturas_venta: { entidad: "salesInvoices", campoFecha: "invoiceDate" },
 };
 
@@ -1223,6 +1223,52 @@ const FUENTES_WS = {
     permitirSinFecha: true,
     descubrir: [/sales.?order.?line/i, /l[ií]n.*venda|l[ií]n.*venta/i],
   },
+  // Movimientos de OT / proyecto. Preferir Movs_proyecto_Excel (pág. 92)
+  // como en horas.cjs (BC_WS_MOVSPROYECTO). JobLedgerEntries (consulta 268)
+  // también sirve para ingresos por OT (Job_No + Line_Amount_LCY).
+  movs_contabilidad_excel: {
+    servicios: [
+      process.env.BC_WS_MOVSPROYECTO,
+      process.env.BC_WS_JOBLEDGER,
+      "Movs_proyecto_Excel",
+      "Movs_proyecto",
+      "Movimientos_proyecto",
+      "JobLedgerEntries",
+      "Job_Ledger_Entries",
+      "Job_Ledger_Entries_Excel",
+      "Movs_contabilidad_Excel",
+    ].filter(Boolean),
+    camposFecha: [
+      process.env.BC_WS_MOVSPROYECTO_FECHA,
+      process.env.BC_WS_JOBLEDGER_FECHA,
+      "Posting_Date",
+      "Document_Date",
+    ].filter(Boolean),
+    permitirSinFecha: true,
+    descubrir: [/job.?ledger/i, /mov.*(proyecto|ot|contab)/i],
+  },
+  // Tarifas de venta: listas de precios publicadas como Excel en este BC.
+  // Servicio real verificado: Price_List_Lines_Excel (NO SalesPrices / API v2.0).
+  tarifas_venta: {
+    servicios: [
+      process.env.BC_WS_TARIFASVENTA,
+      "Price_List_Lines_Excel",
+      "Price_List_Lines_Part_Excel",
+      "SalesPrices",
+      "Sales_Prices",
+      "Sales_Price",
+      "Price_List_Lines",
+      "PriceListLines",
+    ].filter(Boolean),
+    camposFecha: [
+      process.env.BC_WS_TARIFASVENTA_FECHA,
+      "StartingDate",
+      "Starting_Date",
+      "startingDate",
+    ].filter(Boolean),
+    permitirSinFecha: true,
+    descubrir: [/price.?list.?line/i, /sales.?price/i, /tarif|precio/i],
+  },
 };
 
 // ---------------------------------------------------------------------
@@ -1237,7 +1283,27 @@ const FUENTES_WS = {
 // por otro motivo. Solo texto fijo. Súbelo a esta dirección cualquier
 // vez que haya dudas de si el server.cjs nuevo se ha cargado.
 app.get("/api/version", (req, res) => {
-  res.json({ version: "2026-09-25-multiempresa-proves" });
+  res.json({ version: "2026-10-01-mapeo-historial-articulos" });
+});
+
+/** Mapeo Also→Ferros (CSV del bot Bot_Sustituir_Productes). */
+app.get("/api/mapeo-articulos", (req, res) => {
+  try {
+    const { cargarMapeo } = require("./mapeoArticulos.cjs");
+    const data = cargarMapeo();
+    if (!data.ok && !data.pares?.length) {
+      return res.status(404).json(data);
+    }
+    res.json({
+      ok: true,
+      n: data.n,
+      ruta: data.ruta,
+      porCodigo: data.porCodigo,
+    });
+  } catch (err) {
+    console.error("Error /api/mapeo-articulos:", err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
 });
 
 app.get("/api/bc/empresas", async (req, res) => {
@@ -1756,12 +1822,13 @@ app.get("/api/bc/:fuente", async (req, res) => {
         if (res === true) break;
       }
 
-      // 2) AUTO-DESCUBRIMIENTO: si nada cargó, preguntar a BC el catálogo
-      //    de servicios y buscar los que encajen con esta fuente.
+      // 2) AUTO-DESCUBRIMIENTO: el GET a Company('…') NO lista servicios
+      //    (devuelve la entidad empresa). El catálogo está en ODataV4 root.
       if (!filas && ws.descubrir) {
         try {
           console.log(`[${fuente}] Ningún candidato funcionó: consultando el catálogo de servicios de BC...`);
-          const rCat = await fetchConReintento(raiz, cabeceras);
+          const raizCatalogo = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4`;
+          const rCat = await fetchConReintento(raizCatalogo, cabeceras);
           if (rCat.ok) {
             const cat = await rCat.json();
             const nombres = (cat.value || []).map((v) => v.name || v.url).filter(Boolean);
@@ -1773,6 +1840,8 @@ app.get("/api/bc/:fuente", async (req, res) => {
               const res = await probarServicio(servicio);
               if (res === true) break;
             }
+          } else {
+            intentos.push(`descubrimiento → catálogo HTTP ${rCat.status}`);
           }
         } catch (e) {
           console.warn(`[${fuente}] Descubrimiento falló:`, String(e.message || e));

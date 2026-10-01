@@ -53,6 +53,13 @@ import {
   clasificarLineaCompra,
   IA_CONFIG,
 } from "./agenteInteligente.js";
+import {
+  cargarMapeoArticulos,
+  familiaDe,
+  etiquetaEmpresaParaCodigo,
+  construirIndiceHistorialArticulos,
+  slugEmpresaIndice,
+} from "./mapeoArticulos.js";
 import { OTS_DEMO } from "./datosDemo.js";
 import { generarBorradorFactura, htmlBorradorFactura } from "./borradorFactura.js";
 import Recepcion from "./recepcion.jsx";
@@ -186,12 +193,12 @@ const SOURCES = [
   {
     id: "tarifas_venta",
     name: "Tarifas de Venta",
-    desc: "Precios de venta por cliente, artículo y periodo de vigencia.",
+    desc: "Precios de venta por cliente/grupo, artículo/recurso y vigencia. Web service OData: Price_List_Lines_Excel.",
     origin: {
-      page: "Listas de precios de venta (Sales Price Lists)",
-      pageNo: "7381",
-      table: "Price List Line (7017) · Sales",
-      endpoint: "salesPrices",
+      page: "Líneas de lista de precios (Price List Lines)",
+      pageNo: "7017",
+      table: "Price List Line (7001)",
+      endpoint: "Price_List_Lines_Excel",
     },
   },
 ];
@@ -276,8 +283,20 @@ async function fetchFromBC(sourceId, from, to) {
     if (r.ok) {
       return { rows: json.rows ?? (json.data || []).length, data: json.data || [], simulado: false, sinFecha: !!json.sinFecha };
     }
-    // El backend respondió pero BC dio error: propagar el motivo real
-    return { rows: 0, data: [], simulado: false, error: json.error || `Error ${r.status}`, detalle: json.pistas?.join(" · ") || json.detalle || "" };
+    // El backend respondió pero BC dio error: propagar el motivo real.
+    // Si el proxy corta (timeout) el body suele ser HTML/vacío → sin json.error.
+    const error =
+      json.error ||
+      (r.status === 502
+        ? "Error 502 (posible timeout del proxy o de Business Central; prueba un rango más corto o reinicia INICIAR.bat)"
+        : `Error ${r.status}`);
+    return {
+      rows: 0,
+      data: [],
+      simulado: false,
+      error,
+      detalle: json.pistas?.join(" · ") || json.detalle || json.intentos?.join(" · ") || "",
+    };
   } catch {
     /* backend no arrancado */
   }
@@ -990,8 +1009,15 @@ function IntelligentAgentCard({ bcData = {}, estadoInicial = null }) {
     };
     setResumen(resumenObj);
     // Persistir la memoria completa: recargar la página no la borra y
-    // la pantalla de OTs (ventana nueva) la lee de aquí
-    guardarEstado({ fichas: [...mapa.entries()], resumen: resumenObj });
+    // la pantalla de OTs (ventana nueva) la lee de aquí.
+    // Índice compacto por empresa: permite historial Also+Ferros concatenado.
+    const slug = slugEmpresaIndice();
+    const indice = construirIndiceHistorialArticulos(mapa);
+    guardarEstado({
+      fichas: [...mapa.entries()],
+      resumen: resumenObj,
+      [`indice_hist_${slug}`]: indice,
+    });
     setConstruyendo(false);
   };
 
@@ -4000,58 +4026,101 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
   // Filtro Pedido (PC) | Oferta (OC) del historial de compra.
   // Por defecto: Pedido.
   const [filtroDoc, setFiltroDoc] = useState("PC");
+  const [optsHist, setOptsHist] = useState({ aliases: [], metaMapeo: null, indicesExtra: [] });
+  const [mapeoListo, setMapeoListo] = useState(false);
+
+  useEffect(() => {
+    let cancel = false;
+    (async () => {
+      await cargarMapeoArticulos();
+      if (cancel) return;
+      const fam = familiaDe(codigo);
+      let indicesExtra = [];
+      try {
+        const r = await fetch("/api/estado");
+        if (r.ok) {
+          const est = await r.json();
+          indicesExtra = [est.indice_hist_also, est.indice_hist_ferros].filter(
+            (x) => x && (x.compra || x.venta)
+          );
+        }
+      } catch {}
+      if (cancel) return;
+      setOptsHist({
+        aliases: fam.codigos,
+        metaMapeo: fam.meta,
+        indicesExtra,
+        etiquetaEmpresa: etiquetaEmpresaParaCodigo,
+      });
+      setMapeoListo(true);
+    })();
+    return () => {
+      cancel = true;
+    };
+  }, [codigo]);
 
   const todas = useMemo(() => {
     const memoria =
       tipo === "compra"
-        ? historialCompraArticulo(codigo, descripcion, fichas)
-        : historialVentaArticulo(codigo, descripcion, fichas);
+        ? historialCompraArticulo(codigo, descripcion, fichas, optsHist)
+        : historialVentaArticulo(codigo, descripcion, fichas, optsHist);
 
-    // LÍNEAS VIVAS de la OT actual (botón «Cargar líneas desde BC»):
-    // se fusionan con la memoria para que el historial NUNCA contradiga
-    // a las tablas del detalle aunque la memoria esté desactualizada.
-    const cod = (codigo || "").toString().trim();
+    const aliasSet = new Set((optsHist.aliases || []).map((c) => String(c).trim()).filter(Boolean));
+    if (codigo) aliasSet.add(String(codigo).trim());
     const descN = (descripcion || "").toString().trim().toLowerCase();
-    const coincide = (c, d) => (cod ? (c || "").toString().trim() === cod : (d || "").toString().trim().toLowerCase() === descN);
+    const coincide = (c, d) => {
+      const cc = (c || "").toString().trim();
+      if (aliasSet.size) return aliasSet.has(cc);
+      return (d || "").toString().trim().toLowerCase() === descN;
+    };
 
     let extra = [];
     if (vivas && tipo === "compra") {
       extra = (vivas.compra || [])
         .filter((l) => coincide(l["Nº"], l["Descripción"]))
-        .map((l) => ({
-          ot: otActual,
-          proveedor: l["Nombre de proveedor de compra"] || "",
-          numeroDocumento: l["Nº documento"] || null,
-          descripcion: l["Descripción"] || "",
-          cantidad: Number(l["Cantidad"]) || 0,
-          costeUnitario: Number(l["Coste unitario"]) || 0,
-          importe: Number(l["Importe línea"]) || 0,
-          fechaPedido: l["Fecha pedido"] || null,
-          dtos: [Number(l["% Dto. 1"]) || 0, Number(l["% Dto. 2"]) || 0, Number(l["% Dto. 3"]) || 0],
-        }));
+        .map((l) => {
+          const codLin = (l["Nº"] || "").toString().trim();
+          return {
+            ot: otActual,
+            proveedor: l["Nombre de proveedor de compra"] || "",
+            numeroDocumento: l["Nº documento"] || null,
+            descripcion: l["Descripción"] || "",
+            cantidad: Number(l["Cantidad"]) || 0,
+            costeUnitario: Number(l["Coste unitario"]) || 0,
+            importe: Number(l["Importe línea"]) || 0,
+            fechaPedido: l["Fecha pedido"] || null,
+            dtos: [Number(l["% Dto. 1"]) || 0, Number(l["% Dto. 2"]) || 0, Number(l["% Dto. 3"]) || 0],
+            codigoLinea: codLin,
+            empresa: etiquetaEmpresaParaCodigo(codLin, optsHist.metaMapeo, otActual),
+          };
+        });
     } else if (vivas && tipo === "venta") {
       extra = (vivas.venta || [])
         .filter((l) => coincide(l["Nº"], l["Descripción"]))
-        .map((l) => ({
-          ot: otActual,
-          cliente: "",
-          numeroDocumento: l["Nº documento"] || null,
-          descripcion: l["Descripción"] || "",
-          cantidad: Number(l["Cantidad"]) || 0,
-          precioUnitario: Number(l["Precio unitario"]) || 0,
-          importe: Number(l["Importe línea"]) || 0,
-          fechaPedido: l["Fecha pedido"] || null,
-          dtos: [Number(l["% Dto. 1"]) || 0, Number(l["% Dto. 2"]) || 0, Number(l["% Dto. 3"]) || 0],
-        }));
+        .map((l) => {
+          const codLin = (l["Nº"] || "").toString().trim();
+          return {
+            ot: otActual,
+            cliente: "",
+            numeroDocumento: l["Nº documento"] || null,
+            descripcion: l["Descripción"] || "",
+            cantidad: Number(l["Cantidad"]) || 0,
+            precioUnitario: Number(l["Precio unitario"]) || 0,
+            importe: Number(l["Importe línea"]) || 0,
+            fechaPedido: l["Fecha pedido"] || null,
+            dtos: [Number(l["% Dto. 1"]) || 0, Number(l["% Dto. 2"]) || 0, Number(l["% Dto. 3"]) || 0],
+            codigoLinea: codLin,
+            empresa: etiquetaEmpresaParaCodigo(codLin, optsHist.metaMapeo, otActual),
+          };
+        });
     }
 
-    // Deduplicado: una línea puede estar a la vez en memoria y en vivo
     const clave = (f) =>
-      [normalizarNumeroOT(f.ot), f.numeroDocumento || "", f.descripcion, f.cantidad, f.importe].join("|");
+      [normalizarNumeroOT(f.ot), f.numeroDocumento || "", f.codigoLinea || "", f.descripcion, f.cantidad, f.importe].join("|");
     const enMemoria = new Set(memoria.map(clave));
     const nuevas = extra.filter((f) => !enMemoria.has(clave(f)));
     return [...nuevas, ...memoria];
-  }, [tipo, codigo, descripcion, fichas, vivas, otActual]);
+  }, [tipo, codigo, descripcion, fichas, vivas, otActual, optsHist, mapeoListo]);
 
   const filas = useMemo(() => {
     if (tipo !== "compra") return todas;
@@ -4069,21 +4138,16 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
     [todas, tipo]
   );
 
-  // Precio de venta sugerido: ver normativa en calcularPrecioSugerido().
   const sugerido = useMemo(() => {
     if (tipo !== "venta") return null;
-    return calcularPrecioSugerido(todas, historialCompraArticulo(codigo, descripcion, fichas), clienteActual);
-  }, [tipo, todas, clienteActual, codigo, descripcion, fichas]);
+    return calcularPrecioSugerido(todas, historialCompraArticulo(codigo, descripcion, fichas, optsHist), clienteActual);
+  }, [tipo, todas, clienteActual, codigo, descripcion, fichas, optsHist]);
 
-  // Última COMPRA del artículo, como referencia rápida debajo de la
-  // descripción (visible en el historial de VENTA, para comparar contra
-  // lo que se está cobrando). Importe = Precio Unitario neto de descuento
-  // (sin cantidad, es una referencia unitaria).
   const ultimaCompraRef = useMemo(() => {
     if (tipo !== "venta") return null;
-    const compras = historialCompraArticulo(codigo, descripcion, fichas).filter((c) => Number(c.costeUnitario) > 0);
+    const compras = historialCompraArticulo(codigo, descripcion, fichas, optsHist).filter((c) => Number(c.costeUnitario) > 0);
     if (compras.length === 0) return null;
-    const c = compras[0]; // ya viene ordenado por reciencia
+    const c = compras[0];
     const dtos = (Array.isArray(c.dtos) ? c.dtos : []).map((d) => Number(d) || 0).filter((d) => d > 0);
     const factorNeto = dtos.reduce((f, d) => f * (1 - d / 100), 1);
     const fecha = c.fechaPedido ? new Date(c.fechaPedido) : null;
@@ -4093,21 +4157,47 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
       precioUnitario: c.costeUnitario,
       dtoLabel: dtos.length ? dtos.join("+") + "%" : "—",
       importe: c.costeUnitario * factorNeto,
+      codigoLinea: c.codigoLinea || "",
+      empresa: c.empresa || "",
     };
-  }, [tipo, codigo, descripcion, fichas]);
+  }, [tipo, codigo, descripcion, fichas, optsHist]);
+
+  const meta = optsHist.metaMapeo;
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={onCerrar}>
       <div
-        className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[80vh] flex flex-col"
+        className="bg-white rounded-lg shadow-xl max-w-3xl w-full max-h-[80vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between p-3 border-b border-slate-200">
-          <div>
+          <div className="min-w-0">
             <div className="text-sm font-bold text-slate-800">
               {tipo === "compra" ? "📦 Historial de compra" : "💶 Historial de venta"} — {codigo || descripcion}
             </div>
             <div className="text-[11px] text-slate-500 truncate">{descripcion}</div>
+            {meta && (
+              <div className="mt-1 text-[10px] text-slate-600 flex flex-wrap items-center gap-1.5">
+                <span className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">
+                  {meta.codigo_viejo}
+                </span>
+                <span className="text-slate-400">→</span>
+                <span className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">
+                  {meta.codigo_nuevo}
+                </span>
+                <span
+                  className={`px-1.5 py-0.5 rounded font-semibold ${
+                    meta.pendienteSync
+                      ? "bg-amber-100 text-amber-800"
+                      : "bg-emerald-100 text-emerald-800"
+                  }`}
+                >
+                  {meta.estado}
+                  {meta.pendienteSync ? " · sync Ferros pendiente" : ""}
+                </span>
+                <span className="text-slate-400">Also + Ferros unidos</span>
+              </div>
+            )}
             {ultimaCompraRef && (
               <div className="mt-1.5">
                 <div className="flex items-center gap-3 text-[9px] font-bold text-slate-400 uppercase tracking-wide">
@@ -4127,7 +4217,7 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
               </div>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             {tipo === "compra" && (
               <div className="flex rounded-md border border-slate-300 overflow-hidden text-[11px] font-semibold">
                 <button
@@ -4187,9 +4277,11 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
           )}
           {filas.length > 0 && (
             <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400 uppercase tracking-wide pb-1 border-b border-slate-200">
+              <span className="whitespace-nowrap w-14">Emp.</span>
+              <span className="whitespace-nowrap w-28">Código</span>
               <span className="whitespace-nowrap w-24">Nº Documento</span>
               <span className="whitespace-nowrap w-28">Nº de OT</span>
-              <span className="whitespace-nowrap w-28">{tipo === "compra" ? "Proveedor" : "Cliente"}</span>
+              <span className="whitespace-nowrap w-24">{tipo === "compra" ? "Proveedor" : "Cliente"}</span>
               <span className="whitespace-nowrap w-20">Fecha pedido</span>
               <span className="whitespace-nowrap w-12">Cant.</span>
               <span className="whitespace-nowrap w-16 text-right">{tipo === "compra" ? "PVP unit." : "Precio unit."}</span>
@@ -4199,11 +4291,26 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
           )}
           {filas.map((f, i) => (
             <div key={i} className="flex items-center gap-2 text-[11px] py-1 border-b border-slate-100 last:border-0">
+              <span
+                className={`whitespace-nowrap w-14 text-[10px] font-semibold px-1 py-0.5 rounded text-center ${
+                  f.empresa === "Ferros"
+                    ? "bg-indigo-50 text-indigo-700"
+                    : f.empresa === "Also"
+                      ? "bg-orange-50 text-orange-800"
+                      : "bg-slate-50 text-slate-400"
+                }`}
+                title={f.empresa || ""}
+              >
+                {f.empresa || "—"}
+              </span>
+              <span className="font-mono text-slate-600 whitespace-nowrap w-28 truncate" title={f.codigoLinea}>
+                {f.codigoLinea || "—"}
+              </span>
               <span className="font-mono text-blue-700 whitespace-nowrap w-24 truncate" title={f.numeroDocumento}>
                 {f.numeroDocumento || "—"}
               </span>
               <span className="font-mono text-slate-500 whitespace-nowrap w-28 truncate">{f.ot}</span>
-              <span className="text-slate-600 whitespace-nowrap w-28 truncate" title={tipo === "compra" ? f.proveedor : f.cliente}>
+              <span className="text-slate-600 whitespace-nowrap w-24 truncate" title={tipo === "compra" ? f.proveedor : f.cliente}>
                 {(tipo === "compra" ? f.proveedor : f.cliente) || "—"}
               </span>
               <span className="text-slate-400 whitespace-nowrap w-20 truncate">
@@ -4215,8 +4322,6 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
               </span>
               <span className="text-slate-500 whitespace-nowrap w-14 text-right">
                 {(() => {
-                  // 1º el campo de BC si viene informado (compra i venda);
-                  // 2º cálculo implícito: 1 − importe / (unitario × cantidad).
                   if ((f.dtos || []).some((d) => d > 0)) return f.dtos.filter((d) => d > 0).join("+") + "%";
                   const unitario = Number(tipo === "compra" ? f.costeUnitario : f.precioUnitario) || 0;
                   const bruto = unitario * (Number(f.cantidad) || 0);

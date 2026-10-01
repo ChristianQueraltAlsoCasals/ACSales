@@ -364,17 +364,40 @@ export const API_TARIFA_CAMPOS = {
   codigoVenta: "salesCode", // cliente/grupo al que aplica
 };
 
+/** Campos alternativos del web service OData (Sales Prices / Price List Lines) */
+const WS_TARIFA_CAMPOS = {
+  numero: ["Product_No", "Asset_No", "Item_No", "Item No.", "No"],
+  descripcion: ["Description", "Descripción", "Product_Description"],
+  precio: ["Unit_Price", "Unit Price", "unitPrice"],
+  fechaInicio: ["StartingDate", "Starting_Date", "Starting Date", "startingDate"],
+  codigoVenta: ["AssignToNo", "SourceNo", "Sales_Code", "Sales Code", "salesCode"],
+};
+
+function primerCampo(fila, claves) {
+  for (const k of claves) {
+    if (fila[k] != null && fila[k] !== "") return fila[k];
+  }
+  return null;
+}
+
 const PALABRAS_TARIFA_HORA = ["hora", "hores", "ma obra", "mà obra", "mano de obra", "oficial", "operari", "tecnic", "técnico"];
 
 export function adaptarTarifasAPI(filas, campos = API_TARIFA_CAMPOS) {
-  return (filas || []).map((f) => ({
-    numero: f[campos.numero] ?? null,
-    descripcion: f[campos.descripcion] ?? null,
-    precio: Number(f[campos.precio]) || 0,
-    fechaInicio: f[campos.fechaInicio] ?? null,
-    codigoVenta: f[campos.codigoVenta] ?? null,
-    esManoObra: contieneAlguna(f[campos.descripcion], PALABRAS_TARIFA_HORA),
-  }));
+  return (filas || []).map((f) => {
+    const descripcion =
+      f[campos.descripcion] ?? primerCampo(f, WS_TARIFA_CAMPOS.descripcion) ?? null;
+    // Price List Line: Unit_Price; descuentos no sirven como tarifa horaria
+    const precioRaw =
+      f[campos.precio] ?? primerCampo(f, ["Unit_Price", "Unit Price", "unitPrice"]);
+    return {
+      numero: f[campos.numero] ?? primerCampo(f, WS_TARIFA_CAMPOS.numero) ?? null,
+      descripcion,
+      precio: Number(precioRaw) || 0,
+      fechaInicio: f[campos.fechaInicio] ?? primerCampo(f, WS_TARIFA_CAMPOS.fechaInicio) ?? null,
+      codigoVenta: f[campos.codigoVenta] ?? primerCampo(f, WS_TARIFA_CAMPOS.codigoVenta) ?? null,
+      esManoObra: contieneAlguna(descripcion, PALABRAS_TARIFA_HORA),
+    };
+  });
 }
 
 /** Tarifa horaria sugerida a partir de las tarifas cargadas (mediana de las de mano de obra) */
@@ -739,53 +762,137 @@ function ordenarPorReciencia(filas) {
 
 /** Historial de COMPRA de un artículo (código, o descripción si no hay
  *  código) en TODAS las OTs de la memoria. Incluye compras reales (PC)
- *  y también ofertas (OC), marcando el origen de cada línea. */
-export function historialCompraArticulo(codigo, descripcionFallback, fichasHistoricas) {
-  const clave = claveArticulo(codigo, descripcionFallback);
+ *  y también ofertas (OC), marcando el origen de cada línea.
+ *  opts.aliases: códigos equivalentes Also↔Ferros.
+ *  opts.indicesExtra: [{ compra: { COD: [filas] } }, ...] de otras empresas. */
+export function historialCompraArticulo(codigo, descripcionFallback, fichasHistoricas, opts = {}) {
+  const aliases = (opts.aliases || []).map((c) => String(c || "").trim()).filter(Boolean);
+  const claves = new Set(
+    [claveArticulo(codigo, descripcionFallback), ...aliases.map((a) => claveArticulo(a, ""))].filter(Boolean)
+  );
+  const metaMapeo = opts.metaMapeo || null;
+  const etiquetaFn = opts.etiquetaEmpresa || null;
   const filas = [];
-  for (const f of fichasHistoricas.values()) {
-    const reales = (f.compra?.comprasReales?.lineas || []).map((l) => ({ ...l, origen: "PC · compra real" }));
-    const ofertas = (f.compra?.soloOfertas?.lineas || []).map((l) => ({ ...l, origen: "OC · oferta" }));
-    for (const l of [...reales, ...ofertas]) {
-      if (claveArticulo(l.numero, l.descripcion) !== clave) continue;
-      filas.push({
-        ot: f.numeroOT,
-        proveedor: l.proveedor || "",
-        origen: l.origen,
-        numeroDocumento: l.numeroDocumento || null,
-        descripcion: l.descripcion || "",
-        cantidad: Number(l.cantidad) || 0,
-        costeUnitario: Number(l.costeUnitario) || 0,
-        importe: Number(l.importe) || 0,
-        fechaPedido: l.fechaPedido || null,
-        dtos: Array.isArray(l.dtos) ? l.dtos : [0, 0, 0],
-      });
+  const pushFila = (base) => {
+    const codLin = String(base.codigoLinea || base.numero || codigo || "").trim();
+    filas.push({
+      ...base,
+      codigoLinea: codLin,
+      empresa:
+        base.empresa ||
+        (etiquetaFn ? etiquetaFn(codLin, metaMapeo, base.ot) : "") ||
+        "",
+    });
+  };
+
+  if (fichasHistoricas) {
+    for (const f of fichasHistoricas.values()) {
+      const reales = (f.compra?.comprasReales?.lineas || []).map((l) => ({ ...l, origen: "PC · compra real" }));
+      const ofertas = (f.compra?.soloOfertas?.lineas || []).map((l) => ({ ...l, origen: "OC · oferta" }));
+      for (const l of [...reales, ...ofertas]) {
+        const k = claveArticulo(l.numero, l.descripcion);
+        if (!claves.has(k)) continue;
+        pushFila({
+          ot: f.numeroOT,
+          proveedor: l.proveedor || "",
+          origen: l.origen,
+          numeroDocumento: l.numeroDocumento || null,
+          descripcion: l.descripcion || "",
+          cantidad: Number(l.cantidad) || 0,
+          costeUnitario: Number(l.costeUnitario) || 0,
+          importe: Number(l.importe) || 0,
+          fechaPedido: l.fechaPedido || null,
+          dtos: Array.isArray(l.dtos) ? l.dtos : [0, 0, 0],
+          codigoLinea: String(l.numero || "").trim(),
+        });
+      }
     }
   }
-  return ordenarPorReciencia(filas);
+
+  for (const ind of opts.indicesExtra || []) {
+    if (!ind?.compra) continue;
+    for (const cod of claves) {
+      for (const l of ind.compra[cod] || []) {
+        pushFila({ ...l, codigoLinea: l.codigoLinea || cod });
+      }
+    }
+  }
+
+  return ordenarPorReciencia(_dedupHistorial(filas));
 }
 
 /** Historial de VENTA de un artículo en TODAS les OTs de la memoria. */
-export function historialVentaArticulo(codigo, descripcionFallback, fichasHistoricas) {
-  const clave = claveArticulo(codigo, descripcionFallback);
+export function historialVentaArticulo(codigo, descripcionFallback, fichasHistoricas, opts = {}) {
+  const aliases = (opts.aliases || []).map((c) => String(c || "").trim()).filter(Boolean);
+  const claves = new Set(
+    [claveArticulo(codigo, descripcionFallback), ...aliases.map((a) => claveArticulo(a, ""))].filter(Boolean)
+  );
+  const metaMapeo = opts.metaMapeo || null;
+  const etiquetaFn = opts.etiquetaEmpresa || null;
   const filas = [];
-  for (const f of fichasHistoricas.values()) {
-    for (const l of f.venta?.materiales?.lineas || []) {
-      if (claveArticulo(l.numero, l.descripcion) !== clave) continue;
-      filas.push({
-        ot: f.numeroOT,
-        cliente: f.general?.cliente || "",
-        numeroDocumento: l.numeroDocumento || null,
-        descripcion: l.descripcion || "",
-        cantidad: Number(l.cantidad) || 0,
-        precioUnitario: Number(l.precioUnitario) || 0,
-        importe: Number(l.importe) || 0,
-        fechaPedido: l.fechaPedido || null,
-        dtos: Array.isArray(l.dtos) ? l.dtos : [0, 0, 0],
-      });
+  const pushFila = (base) => {
+    const codLin = String(base.codigoLinea || base.numero || codigo || "").trim();
+    filas.push({
+      ...base,
+      codigoLinea: codLin,
+      empresa:
+        base.empresa ||
+        (etiquetaFn ? etiquetaFn(codLin, metaMapeo, base.ot) : "") ||
+        "",
+    });
+  };
+
+  if (fichasHistoricas) {
+    for (const f of fichasHistoricas.values()) {
+      for (const l of f.venta?.materiales?.lineas || []) {
+        const k = claveArticulo(l.numero, l.descripcion);
+        if (!claves.has(k)) continue;
+        pushFila({
+          ot: f.numeroOT,
+          cliente: f.general?.cliente || "",
+          numeroDocumento: l.numeroDocumento || null,
+          descripcion: l.descripcion || "",
+          cantidad: Number(l.cantidad) || 0,
+          precioUnitario: Number(l.precioUnitario) || 0,
+          importe: Number(l.importe) || 0,
+          fechaPedido: l.fechaPedido || null,
+          dtos: Array.isArray(l.dtos) ? l.dtos : [0, 0, 0],
+          codigoLinea: String(l.numero || "").trim(),
+        });
+      }
     }
   }
-  return ordenarPorReciencia(filas);
+
+  for (const ind of opts.indicesExtra || []) {
+    if (!ind?.venta) continue;
+    for (const cod of claves) {
+      for (const l of ind.venta[cod] || []) {
+        pushFila({ ...l, codigoLinea: l.codigoLinea || cod });
+      }
+    }
+  }
+
+  return ordenarPorReciencia(_dedupHistorial(filas));
+}
+
+function _dedupHistorial(filas) {
+  const seen = new Set();
+  const out = [];
+  for (const f of filas) {
+    const k = [
+      f.ot,
+      f.numeroDocumento || "",
+      f.codigoLinea || "",
+      f.cantidad,
+      f.importe,
+      f.costeUnitario ?? f.precioUnitario ?? "",
+      f.origen || "",
+    ].join("|");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(f);
+  }
+  return out;
 }
 
 /** Precio de venta sugerido para un artículo, según la memoria:
@@ -793,8 +900,8 @@ export function historialVentaArticulo(codigo, descripcionFallback, fichasHistor
  *   2) Si no, precio de la COMPRA MÁS RECIENTE de ese artículo × 1.75.
  *  "Más reciente" usa la fecha real de pedido cuando está disponible;
  *  si no, se aproxima por el número/año de la OT. */
-export function precioVentaSugerido(codigo, descripcionFallback, fichasHistoricas) {
-  const ventas = historialVentaArticulo(codigo, descripcionFallback, fichasHistoricas);
+export function precioVentaSugerido(codigo, descripcionFallback, fichasHistoricas, opts = {}) {
+  const ventas = historialVentaArticulo(codigo, descripcionFallback, fichasHistoricas, opts);
   const conteo = new Map();
   for (const v of ventas) {
     if (v.precioUnitario > 0) {
@@ -808,14 +915,15 @@ export function precioVentaSugerido(codigo, descripcionFallback, fichasHistorica
   }
   if (mejor) return { precio: mejor.precio, regla: `repetido (${mejor.n} veces en el histórico)` };
 
-  const compras = historialCompraArticulo(codigo, descripcionFallback, fichasHistoricas).filter((c) => c.costeUnitario > 0);
+  const compras = historialCompraArticulo(codigo, descripcionFallback, fichasHistoricas, opts).filter((c) => c.costeUnitario > 0);
   if (compras.length > 0) {
     const masReciente = compras[0]; // ya viene ordenado por recencia
     const fecha = aFecha(masReciente.fechaPedido);
     const cuando = fecha ? fecha.toLocaleDateString("es-ES") : `OT ${masReciente.ot}`;
+    const ref = masReciente.codigoLinea ? ` [${masReciente.codigoLinea}]` : "";
     return {
       precio: Math.round(masReciente.costeUnitario * 1.75 * 100) / 100,
-      regla: `compra más reciente (${cuando}, ${masReciente.costeUnitario.toFixed(2)} €) × 1.75`,
+      regla: `compra más reciente (${cuando}, ${masReciente.costeUnitario.toFixed(2)} €)${ref} × 1.75`,
     };
   }
   return { precio: null, regla: "sin histórico de venta ni compra suficiente" };
@@ -1198,26 +1306,51 @@ export function construirFichasOT(listadoOTs, lineasVenta, lineasCompra, movsCue
     }
   }
 
-  // 3.5) Cuenta de ventas (70000000) desde Movs_contabilidad_Excel: esta
-  // fuente trae Nº de cuenta + importe + Nº de OT en la MISMA línea, así
-  // que no hace falta cruzar con nada más. Es el importe REAL contabilizado
-  // (más fiable que sumar líneas de venta/facturas). Los importes de una
-  // cuenta de ingresos llegan en negativo (convención debe−haber de BC),
-  // así que se acumulan en valor absoluto.
+  // 3.5) Ingresos por OT desde movs_contabilidad_excel.
+  // Dos formas admitidas (misma fuente en la UI):
+  //   a) Job Ledger (pág. 1004): Entry_Type = Sale → Line_Amount_LCY + Job_No
+  //   b) Movs. contabilidad Excel: cuenta 70000000 + Amount + Job_No/OT
+  // Los importes de cuenta de ingresos llegan en negativo (debe−haber),
+  // así que se acumulan en valor absoluto. Line_Amount_LCY de Job Ledger
+  // ya viene como importe de venta.
   const CUENTA_VENTAS_OT = "70000000";
   for (const linea of movsCuentaVentas) {
-    const cuenta = (linea["G_L_Account_No"] ?? linea["Nº cuenta"] ?? "").toString().trim();
-    if (cuenta !== CUENTA_VENTAS_OT) continue;
-    const id = normalizarNumeroOT(linea["Job_No"] ?? linea["Cód. OT"] ?? linea[kOT]);
+    const id = normalizarNumeroOT(
+      linea["Job_No"] ?? linea["Job No."] ?? linea["Cód. OT"] ?? linea[kOT]
+    );
     if (!id) continue;
+
+    const cuenta = (linea["G_L_Account_No"] ?? linea["Nº cuenta"] ?? "").toString().trim();
+    const entryType = (linea["Entry_Type"] ?? linea["Entry Type"] ?? "").toString().trim().toLowerCase();
+    const esVentaJob =
+      entryType === "sale" ||
+      entryType === "venta" ||
+      // Algunas publicaciones OData usan el valor numérico del enum (1 = Sale)
+      entryType === "1";
+    const esCuentaVentas = cuenta === CUENTA_VENTAS_OT;
+
+    if (!esVentaJob && !esCuentaVentas) continue;
+
     let ficha = fichas.get(id);
     if (!ficha) {
       ficha = crearFichaHuerfana(id);
-      ficha.avisos.push("OT con apunte de cuenta 70000000 pero sin fila en el Listado de OT's (sin descripción).");
+      ficha.avisos.push(
+        esVentaJob
+          ? "OT con movimiento Job Ledger (venta) pero sin fila en el Listado de OT's (sin descripción)."
+          : "OT con apunte de cuenta 70000000 pero sin fila en el Listado de OT's (sin descripción)."
+      );
       fichas.set(id, ficha);
     }
     if (ficha.venta.importeCuentaVentas == null) ficha.venta.importeCuentaVentas = 0;
-    const importe = Math.abs(num(linea["Amount"] ?? linea["Importe"] ?? linea["Importe (DL)"]));
+    const importe = Math.abs(
+      num(
+        linea["Line_Amount_LCY"] ??
+          linea["Line Amount (LCY)"] ??
+          linea["Amount"] ??
+          linea["Importe"] ??
+          linea["Importe (DL)"]
+      )
+    );
     ficha.venta.importeCuentaVentas += importe;
   }
 

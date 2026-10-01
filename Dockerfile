@@ -16,7 +16,9 @@ COPY server/server.cjs server/db.js server/schema.sql \
      server/auth.js server/erp-auth.js server/erp-db.js server/constellation.js \
      server/achuman-client.js \
      server/iaBC.cjs server/contabilidad.cjs server/macro.cjs \
-     server/correoPC.cjs server/horas.cjs ./
+     server/correoPC.cjs server/horas.cjs \
+     server/mapeoArticulos.cjs ./
+COPY data/mapeo_reemplazo_items.csv ./data/mapeo_reemplazo_items.csv
 COPY --from=web /web/dist ./public
 ENV PORT=8102
 EXPOSE 8102

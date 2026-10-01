@@ -16,6 +16,11 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { Search, ArrowLeft, TrendingDown, Users, Mail } from "lucide-react";
 import { historialVentaArticulo } from "./agenteInteligente.js";
+import {
+  cargarMapeoArticulos,
+  familiaDe,
+  etiquetaEmpresaParaCodigo,
+} from "./mapeoArticulos.js";
 
 const DESV_OK = 3; // % de tolerancia sobre el mínimo antes de marcar "caro"
 
@@ -107,18 +112,38 @@ export default function Precios({ lineas, pedidos }) {
   // Memoria histórica (fichas por OT), para el histórico de VENTA del
   // artículo seleccionado — esta pantalla solo tenía datos de compra.
   const [fichas, setFichas] = useState(null);
+  const [indicesExtra, setIndicesExtra] = useState([]);
+  const [mapeoOk, setMapeoOk] = useState(false);
   useEffect(() => {
-    fetch("/api/estado")
-      .then((r) => r.json())
-      .then((est) => { if (est.fichas?.length) setFichas(new Map(est.fichas)); })
-      .catch(() => {});
+    (async () => {
+      await cargarMapeoArticulos();
+      setMapeoOk(true);
+      try {
+        const est = await fetch("/api/estado").then((r) => r.json());
+        if (est.fichas?.length) setFichas(new Map(est.fichas));
+        setIndicesExtra(
+          [est.indice_hist_also, est.indice_hist_ferros].filter((x) => x && (x.compra || x.venta))
+        );
+      } catch {}
+    })();
   }, []);
+
+  const optsHist = useMemo(() => {
+    if (!sel?.codigo || !mapeoOk) return { aliases: [], indicesExtra, etiquetaEmpresa: etiquetaEmpresaParaCodigo };
+    const fam = familiaDe(sel.codigo);
+    return {
+      aliases: fam.codigos,
+      metaMapeo: fam.meta,
+      indicesExtra,
+      etiquetaEmpresa: etiquetaEmpresaParaCodigo,
+    };
+  }, [sel, mapeoOk, indicesExtra]);
 
   // Histórico de venta del artículo seleccionado (más reciente primero)
   const historialVenta = useMemo(() => {
     if (!fichas || !sel) return [];
-    return historialVentaArticulo(sel.codigo, sel.desc, fichas).filter((v) => v.precioUnitario > 0);
-  }, [fichas, sel]);
+    return historialVentaArticulo(sel.codigo, sel.desc, fichas, optsHist).filter((v) => v.precioUnitario > 0);
+  }, [fichas, sel, optsHist]);
 
   const resumenVenta = useMemo(() => {
     if (!historialVenta.length) return null;
@@ -167,14 +192,17 @@ export default function Precios({ lineas, pedidos }) {
     return [...vistos.values()];
   }, [q, c, lineas]);
 
-  // Detalle de un artículo: todas sus compras
+  // Detalle de un artículo: todas sus compras (Also + Ferros si hay mapeo)
   const detalle = useMemo(() => {
     if (!c || !sel) return null;
+    const fam = sel.codigo && mapeoOk ? familiaDe(sel.codigo) : { codigos: sel.codigo ? [sel.codigo] : [] };
+    const aliasSet = new Set((fam.codigos || []).map((x) => String(x).trim()).filter(Boolean));
+    if (sel.codigo) aliasSet.add(String(sel.codigo).trim());
     const compras = [];
     for (const r of lineas.rows) {
       const cod = String(r[c.cod] || "").trim();
       const desc = String(r[c.desc] || "").trim();
-      const match = sel.codigo ? cod === sel.codigo : desc === sel.desc;
+      const match = aliasSet.size ? aliasSet.has(cod) : desc === sel.desc;
       if (!match) continue;
       const neto = precioNeto(r, c);
       if (isNaN(neto) || neto <= 0) continue;
@@ -189,9 +217,11 @@ export default function Precios({ lineas, pedidos }) {
         dto: ds.length ? ds.map((v) => fmtN(v)).join("+") + " %" : "—",
         importe: r[c.importe],
         ot: String(r[c.ot] || "").trim(),
+        codigo: cod,
+        empresa: etiquetaEmpresaParaCodigo(cod, fam.meta, String(r[c.ot] || "")),
       });
     }
-    if (!compras.length) return { compras: [] };
+    if (!compras.length) return { compras: [], meta: fam.meta || null };
     compras.sort((a, b) => (b.f ? b.f.getTime() : 0) - (a.f ? a.f.getTime() : 0));
     const precios = compras.map((x) => x.precio);
     const min = compras.reduce((a, b) => (b.precio < a.precio ? b : a));
@@ -203,8 +233,8 @@ export default function Precios({ lineas, pedidos }) {
     const rankProv = Object.entries(porProv)
       .map(([p, arr]) => ({ p, media: arr.reduce((s, v) => s + v, 0) / arr.length, n: arr.length, min: Math.min(...arr) }))
       .sort((a, b) => a.media - b.media);
-    return { compras, ultimo: compras[0], min, max, media, provs, rankProv };
-  }, [c, sel, lineas]);
+    return { compras, ultimo: compras[0], min, max, media, provs, rankProv, meta: fam.meta || null };
+  }, [c, sel, lineas, mapeoOk]);
 
   // Vista compradores: histórico global de un artículo (mín 2 años) para el veredicto
   const histGlobalArticulo = useMemo(() => {
@@ -216,7 +246,12 @@ export default function Precios({ lineas, pedidos }) {
       for (const r of lineas.rows) {
         const cod = String(r[c.cod] || "").trim();
         const d = String(r[c.desc] || "").trim();
-        const match = codigo ? cod === codigo : d === desc;
+        const match = (() => {
+          if (!codigo) return d === desc;
+          const fam = mapeoOk ? familiaDe(codigo) : { codigos: [codigo] };
+          const set = new Set((fam.codigos || []).concat(codigo).map((x) => String(x).trim()));
+          return set.has(cod);
+        })();
         if (!match) continue;
         const neto = precioNeto(r, c);
         if (isNaN(neto) || neto <= 0) continue;
@@ -228,7 +263,7 @@ export default function Precios({ lineas, pedidos }) {
       }
       return n ? { n, min, ult, ultF } : null;
     };
-  }, [c, lineas]);
+  }, [c, lineas, mapeoOk]);
 
   // Lista de compradores (del cruce PC → comprador)
   const compradores = useMemo(() => {
@@ -707,7 +742,17 @@ export default function Precios({ lineas, pedidos }) {
         ) : (
           <>
             <h2 className="text-lg font-bold text-slate-800">{sel.desc}</h2>
-            <div className="font-mono text-[11px] text-slate-400 mb-3">{sel.codigo || "(sin código)"}</div>
+            <div className="font-mono text-[11px] text-slate-400 mb-1">{sel.codigo || "(sin código)"}</div>
+            {detalle?.meta && (
+              <div className="text-[10px] text-slate-600 mb-3 flex flex-wrap items-center gap-1.5">
+                <span className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">{detalle.meta.codigo_viejo}</span>
+                <span>→</span>
+                <span className="font-mono bg-slate-100 px-1.5 py-0.5 rounded">{detalle.meta.codigo_nuevo}</span>
+                <span className={`px-1.5 py-0.5 rounded font-semibold ${detalle.meta.pendienteSync ? "bg-amber-100 text-amber-800" : "bg-emerald-100 text-emerald-800"}`}>
+                  {detalle.meta.estado}{detalle.meta.pendienteSync ? " · sync pendiente" : ""}
+                </span>
+              </div>
+            )}
             <div className="grid grid-cols-2 md:grid-cols-6 gap-2 mb-4">
               <Ficha l="Último precio" v={fmtP(d.ultimo.precio)} sub={`${fmtD(d.ultimo.f)} · ${d.ultimo.prov}`} />
               <Ficha l="Precio mínimo" v={fmtP(d.min.precio)} sub={`${fmtD(d.min.f)} · ${d.min.prov}`} color="text-emerald-600" />

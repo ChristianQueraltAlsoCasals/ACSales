@@ -11,7 +11,13 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://localhost:3000",
+      // BC puede tardar varios minutos (paginación OData). Sin esto el
+      // proxy de Vite corta ~60s y el front ve un "Error 502" vacío.
+      "/api": {
+        target: "http://localhost:3000",
+        timeout: 600_000,
+        proxyTimeout: 600_000,
+      },
     },
     // Perfil Edge de Playwright (bc_automation) — no vigilar (EBUSY)
     watch: {
