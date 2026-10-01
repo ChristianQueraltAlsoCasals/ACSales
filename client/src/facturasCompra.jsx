@@ -32,9 +32,12 @@
  * es solo un chequeo antes de entrar la factura.
  */
 import React, { useState, useRef, useMemo, useEffect } from "react";
-import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet, Inbox } from "lucide-react";
+import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet, Inbox, Send } from "lucide-react";
 import { emailsPorCodigoDepartamento, EMAIL_POR_DEFECTO } from "./departamentos.js";
 import { empresaGuardada } from "./empresa.jsx";
+
+/** Buzón Continia Document Capture — facturas OK validadas se reenvían aquí. */
+const EMAIL_CONTINIA = "compras.alsoprod.8020885@cdc.continiaonline.com";
 
 const fmtEur = (n) =>
   n === null || n === undefined || Number.isNaN(Number(n))
@@ -154,10 +157,32 @@ function construirCuerpoHtml(factura, motivos) {
   const filasMotivos = (motivos || []).map((m) => `<li style="margin-bottom:4px;">${E(m)}</li>`).join("");
   return `<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;font-size:14px;">
     <p>Hola,</p>
-    <p>Ha llegado la factura <b>${E(factura)}</b> (adjunta en PDF) y todavía no se puede entrar en Business Central:</p>
+    <p>Ha llegado la factura <b>${E(factura)}</b> (adjunta en PDF) y <b>no cuadra</b> con el pedido de compra en Business Central:</p>
     <ul style="padding-left:18px;">${filasMotivos}</ul>
-    <p>¿Podéis confirmar/recibir el pedido en BC (o revisar el precio) para poder entrar la factura?</p>
-    <p style="color:#94a3b8;font-size:12px;margin-top:18px;">Aviso automático — Validación de facturas.</p>
+    <p>¿Podéis revisar/recibir el pedido en BC (o corregir el precio) para poder validar la factura?</p>
+    <p style="color:#94a3b8;font-size:12px;margin-top:18px;">Incidencia automática — Validación de facturas · ACsales.</p>
+  </div>`;
+}
+
+function construirCuerpoContinia({ factura, fecha, pedidosDetalle, vendorName }) {
+  const E = (s) => (s ?? "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const pcs = (pedidosDetalle || [])
+    .filter((p) => p.pedido)
+    .map((p) => {
+      const nLineas = (p.lineas || []).length;
+      return `<li><b>${E(p.pedido)}</b>${p.vendorName ? ` · ${E(p.vendorName)}` : ""} · ${nLineas} línea${nLineas === 1 ? "" : "s"}</li>`;
+    })
+    .join("");
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;font-size:14px;">
+    <p>Factura de proveedor validada en ACsales — lista para Document Capture.</p>
+    <ul style="padding-left:18px;">
+      <li><b>Nº factura:</b> ${E(factura)}</li>
+      ${fecha ? `<li><b>Fecha:</b> ${E(fecha)}</li>` : ""}
+      ${vendorName ? `<li><b>Proveedor:</b> ${E(vendorName)}</li>` : ""}
+    </ul>
+    <p><b>Esta factura está formada por los pedidos de compra:</b></p>
+    <ul style="padding-left:18px;">${pcs || "<li>(sin pedido identificado)</li>"}</ul>
+    <p style="color:#94a3b8;font-size:12px;margin-top:18px;">Envío automático tras validación OK · ACsales.</p>
   </div>`;
 }
 
@@ -301,7 +326,8 @@ function LineaFactura({ linea, disponibles, onElegir, onEditar }) {
 
 function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCancelarSeleccion, registrarAplicador, remitenteEmail = null }) {
   const [abierta, setAbierta] = useState(true);
-  const [envio, setEnvio] = useState({ estado: "idle" }); // idle | enviando | ok | error
+  const [envio, setEnvio] = useState({ estado: "idle" }); // idle | enviando | ok | error  (incidencia)
+  const [continia, setContinia] = useState({ estado: "idle" }); // idle | enviando | ok | error
   const [entrada, setEntrada] = useState({ estado: "idle" }); // idle | entrando | ok | error
   const [forzarEntrada, setForzarEntrada] = useState(false);
   const [verOtrosGasto, setVerOtrosGasto] = useState(false);
@@ -647,7 +673,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           para: destinatarios,
-          asunto: `Factura ${cabecera.factura} pendiente de validar${pedidosDetalle?.[0]?.pedido ? ` — Pedido ${pedidosDetalle[0].pedido}` : ""}`,
+          asunto: `Incidencia factura ${cabecera.factura}${pedidosDetalle?.[0]?.pedido ? ` — Pedido ${pedidosDetalle[0].pedido}` : ""}`,
           cuerpoHtml: construirCuerpoHtml(cabecera.factura, motivos),
           adjunto: f.pdfBase64 ? { nombre: `Factura_${cabecera.factura}.pdf`, base64: f.pdfBase64 } : null,
         }),
@@ -659,6 +685,50 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       setEnvio({ estado: "error", error: err.message || String(err) });
     }
   };
+
+  // Factura OK → reenviar el PDF al buzón Continia Document Capture
+  // (no crea borrador en BC: Continia lo entra).
+  const enviarAContinia = async (e) => {
+    e.stopPropagation();
+    if (!f.pdfBase64) {
+      setContinia({ estado: "error", error: "No hay PDF de la factura para adjuntar." });
+      return;
+    }
+    setContinia({ estado: "enviando" });
+    try {
+      const vendorName =
+        pedidosDetalle.find((p) => p.vendorName)?.vendorName ||
+        f.proveedor ||
+        "";
+      const pcs = pedidosDetalle.map((p) => p.pedido).filter(Boolean).join(", ");
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: [EMAIL_CONTINIA],
+          asunto: `Factura ${cabecera.factura}${pcs ? ` · ${pcs}` : ""}${vendorName ? ` · ${vendorName}` : ""}`,
+          cuerpoHtml: construirCuerpoContinia({
+            factura: cabecera.factura,
+            fecha: cabecera.fecha,
+            pedidosDetalle,
+            vendorName,
+          }),
+          adjunto: {
+            nombre: `Factura_${cabecera.factura}.pdf`,
+            base64: f.pdfBase64,
+            mime: "application/pdf",
+          },
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      setContinia({ estado: "ok", de: json.de });
+    } catch (err) {
+      setContinia({ estado: "error", error: err.message || String(err) });
+    }
+  };
+
+  const pcsFormanFactura = pedidosDetalle.filter((p) => p.pedido);
 
   if (!f.factura) {
     return (
@@ -689,9 +759,9 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             <div className="text-xs text-slate-500">
               {esGasto
                 ? "sin pedido — proveedor de gasto"
-                : `${pedidosDetalle.filter((p) => p.pedido).length} pedido(s)${
-                    pedidosDetalle.some((p) => !p.pedido) ? " · líneas sin pedido" : ""
-                  }`}{" "}
+                : pcsFormanFactura.length
+                  ? `Formada por: ${pcsFormanFactura.map((p) => p.pedido).join(", ")}`
+                  : "sin pedido identificado"}{" "}
               · páginas {f.paginas.join(", ")}
               {cabecera.importeTotal !== null && cabecera.importeTotal !== undefined && ` · total ${fmtEur(cabecera.importeTotal)}`}
             </div>
@@ -708,7 +778,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               esGasto ? "bg-blue-600 text-white" : ok ? "bg-emerald-600 text-white" : "bg-red-600 text-white"
             }`}
           >
-            {esGasto ? "Proveedor de gasto" : ok ? "Se puede entrar" : "Revisar antes de entrar"}
+            {esGasto ? "Proveedor de gasto" : ok ? "OK · lista para Continia" : "No cuadra — revisar"}
           </span>
           {abierta ? <ChevronDown size={16} className="text-slate-400" /> : <ChevronRight size={16} className="text-slate-400" />}
         </div>
@@ -764,9 +834,31 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       )}
 
       {!ok && !esGasto && motivos.length > 0 && (
-        <div className="px-4 py-2 bg-red-50/60 border-t border-red-100 text-xs text-red-700 space-y-1">
-          {motivos.map((m, i) => (
-            <div key={i}>• {m}</div>
+        <div className="px-4 py-3 bg-red-50/60 border-t border-red-100">
+          <div className="text-xs font-semibold text-red-800 mb-1.5">Por qué no cuadra esta factura</div>
+          <div className="text-xs text-red-700 space-y-1">
+            {motivos.map((m, i) => (
+              <div key={i}>• {m}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {ok && !esGasto && pcsFormanFactura.length > 0 && (
+        <div className="px-4 py-2.5 bg-emerald-50/70 border-t border-emerald-100 text-xs text-emerald-900">
+          <span className="font-semibold">Esta factura está formada por:</span>{" "}
+          {pcsFormanFactura.map((p, i) => (
+            <span key={p.pedido || i}>
+              {i > 0 && " · "}
+              {p.enlaceBC ? (
+                <a href={p.enlaceBC} target="_blank" rel="noopener noreferrer" className="font-semibold text-blue-700 hover:underline" onClick={(e) => e.stopPropagation()}>
+                  {p.pedido}
+                </a>
+              ) : (
+                <b>{p.pedido}</b>
+              )}
+              <span className="text-emerald-700/80"> ({(p.lineas || []).length} línea{(p.lineas || []).length === 1 ? "" : "s"})</span>
+            </span>
           ))}
         </div>
       )}
@@ -774,7 +866,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       {!ok && !esGasto && (
         <div className="px-4 py-2 border-t border-red-100 bg-white flex items-center justify-between gap-3 flex-wrap" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-1.5 text-xs text-slate-500 flex-1 min-w-[220px]">
-            Para:
+            Responsable (dpto. del pedido):
             <input
               value={destinatariosTexto}
               onChange={(e) => {
@@ -782,7 +874,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                 setDestinatariosEditados(true);
               }}
               placeholder="correo1@also-casals.com, correo2@also-casals.com…"
-              title="Destinatarios del aviso — sepáralos por comas. Se calculan solos por el departamento del pedido, pero puedes corregirlos."
+              title="Destinatarios de la incidencia — sepáralos por comas. Se calculan solos por el departamento del pedido."
               className="flex-1 min-w-[180px] text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-blue-400 focus:outline-none focus:bg-white px-0.5"
             />
             {destinatariosEditados && (
@@ -804,7 +896,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                 De: <span className="font-medium text-slate-700">{remitenteEmail}</span>
               </span>
             )}
-            {envio.estado === "ok" && <span className="text-xs text-emerald-600 font-medium">✓ Enviado</span>}
+            {envio.estado === "ok" && <span className="text-xs text-emerald-600 font-medium">✓ Incidencia enviada</span>}
             {envio.estado === "error" && <span className="text-xs text-red-600" title={envio.error}>Error al enviar</span>}
             {!destinatarios.length && <span className="text-xs text-amber-600">Sin destinatarios válidos</span>}
             <button
@@ -813,20 +905,15 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               className="flex items-center gap-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-md px-3 py-1.5"
             >
               {envio.estado === "enviando" ? <Loader2 size={13} className="animate-spin" /> : <Mail size={13} />}
-              {envio.estado === "enviando" ? "Enviando…" : envio.estado === "ok" ? "Enviado" : "Enviar aviso"}
+              {envio.estado === "enviando" ? "Enviando…" : envio.estado === "ok" ? "Enviada" : "Enviar incidencia al responsable"}
             </button>
           </div>
         </div>
       )}
-      {/* "Entrar en BC de todas formas" (Maria, 2026-09-04): deja
-          saltarse el semáforo rojo — a petición explícita, no todos los
-          avisos tienen que bloquear la entrada en BC. Requiere marcar
-          la casilla a propósito para no entrarla sin querer, y el
-          backend vuelve a comprobar en vivo qué se está pasando por
-          alto (queda anotado en "avisos" del resultado). */}
+      {/* Entrada forzada en BC (opcional, secundaria) */}
       {!ok && !esGasto && (
         <div
-          className="px-4 py-2 border-t border-amber-100 bg-amber-50/60 flex items-center justify-between gap-3 flex-wrap"
+          className="px-4 py-2 border-t border-amber-100 bg-amber-50/40 flex items-center justify-between gap-3 flex-wrap"
           onClick={(e) => e.stopPropagation()}
         >
           <label className="flex items-center gap-1.5 text-xs text-amber-800 cursor-pointer">
@@ -836,42 +923,45 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               onChange={(e) => setForzarEntrada(e.target.checked)}
               disabled={entrada.estado === "entrando" || entrada.estado === "ok"}
             />
-            Sé que hay avisos pendientes, quiero entrarla igual en BC
+            Entrar igual en BC como borrador (salta avisos)
           </label>
+          <button
+            onClick={(e) => entrarEnBC(e, true)}
+            disabled={!forzarEntrada || entrada.estado === "entrando" || entrada.estado === "ok"}
+            title={!forzarEntrada ? "Marca la casilla para poder forzar la entrada" : ""}
+            className="flex items-center gap-1.5 text-xs font-semibold text-amber-900 bg-amber-200 hover:bg-amber-300 disabled:opacity-50 rounded-md px-3 py-1.5"
+          >
+            {entrada.estado === "entrando" ? <Loader2 size={13} className="animate-spin" /> : <FileCheck2 size={13} />}
+            {entrada.estado === "entrando" ? "Entrando…" : entrada.estado === "ok" ? "Entrada" : "Forzar entrada BC"}
+          </button>
+        </div>
+      )}
+      {ok && (
+        <div className="px-4 py-2.5 border-t border-emerald-100 bg-white flex items-center justify-between gap-3 flex-wrap" onClick={(e) => e.stopPropagation()}>
+          <div className="text-xs text-slate-600">
+            Todo cuadra con el/los pedido(s). Al confirmar se envía el <b>PDF original</b> a Continia
+            (<span className="text-slate-400"> ({EMAIL_CONTINIA})</span> para Document Capture.
+          </div>
           <div className="flex items-center gap-2">
-            {entrada.estado === "ok" && <span className="text-xs text-emerald-600 font-medium">✓ Entrada en BC</span>}
-            {entrada.estado === "error" && <span className="text-xs text-red-600">Con avisos — mira el detalle</span>}
+            {continia.estado === "ok" && (
+              <span className="text-xs text-emerald-600 font-medium">✓ Enviada a Continia{continia.de ? ` (${continia.de})` : ""}</span>
+            )}
+            {continia.estado === "error" && (
+              <span className="text-xs text-red-600" title={continia.error}>Error al enviar</span>
+            )}
             <button
-              onClick={(e) => entrarEnBC(e, true)}
-              disabled={!forzarEntrada || entrada.estado === "entrando" || entrada.estado === "ok"}
-              title={!forzarEntrada ? "Marca la casilla para poder forzar la entrada" : ""}
-              className="flex items-center gap-1.5 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-50 rounded-md px-3 py-1.5"
+              onClick={enviarAContinia}
+              disabled={continia.estado === "enviando" || continia.estado === "ok" || !f.pdfBase64}
+              className="flex items-center gap-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-3 py-1.5"
             >
-              {entrada.estado === "entrando" ? <Loader2 size={13} className="animate-spin" /> : <FileCheck2 size={13} />}
-              {entrada.estado === "entrando" ? "Entrando en BC…" : entrada.estado === "ok" ? "Entrada" : "Entrar en BC de todas formas"}
+              {continia.estado === "enviando" ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+              {continia.estado === "enviando" ? "Enviando…" : continia.estado === "ok" ? "Enviada" : "Enviar factura a Continia"}
             </button>
           </div>
         </div>
       )}
-      {ok && (
-        <div className="px-4 py-2 border-t border-emerald-100 bg-white flex items-center justify-between gap-3">
-          <div className="text-xs text-slate-500">
-            Se abrirá como <b>borrador</b> en BC (proveedor, nº de factura y fecha) — las líneas las traes tú en BC con
-            "Obtener albaranes de compra".
-          </div>
-          <div className="flex items-center gap-2">
-            {entrada.estado === "ok" && <span className="text-xs text-emerald-600 font-medium">✓ Entrada en BC</span>}
-            {entrada.estado === "error" && <span className="text-xs text-red-600">Con avisos — mira el detalle</span>}
-            <button
-              onClick={entrarEnBC}
-              disabled={entrada.estado === "entrando" || entrada.estado === "ok"}
-              className="flex items-center gap-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-3 py-1.5"
-            >
-              {entrada.estado === "entrando" ? <Loader2 size={13} className="animate-spin" /> : <FileCheck2 size={13} />}
-              {entrada.estado === "entrando" ? "Entrando en BC…" : entrada.estado === "ok" ? "Entrada" : "Entrar en BC"}
-            </button>
-          </div>
-        </div>
+      {continia.estado === "error" && continia.error && (
+        <div className="px-4 py-2 text-xs text-red-600 bg-red-50 border-t border-red-100">{continia.error}</div>
       )}
       {(entrada.estado === "ok" || entrada.estado === "error") && entrada.resultado && (
         <div className="px-4 py-2 text-xs bg-slate-50 border-t border-slate-100 space-y-1">
@@ -1898,7 +1988,7 @@ export default function FacturasCompra({ pedidos, usuario = null }) {
         <div>
           <h1 className="text-2xl font-bold text-slate-800">Validación de facturas</h1>
           <p className="text-slate-500 text-sm mt-1">
-            Sube la factura de proveedor y te digo, pedido a pedido, si ya está recibida/registrada en BC y si el precio coincide.
+            Coteja el PDF con los pedidos de compra en BC. Si cuadra → envías el PDF a Continia. Si no → te digo el porqué y puedes avisar al responsable del pedido.
           </p>
         </div>
         <div className="flex items-center gap-2">

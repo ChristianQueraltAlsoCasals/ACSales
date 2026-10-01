@@ -68,24 +68,52 @@ const estilo = (nombre) => {
 export function SelectorEmpresa() {
   const [empresas, setEmpresas] = useState([]);
   const [error, setError] = useState(null);
+  const [cargando, setCargando] = useState(true);
   const actual = empresaGuardada();
 
-  useEffect(() => {
-    fetch("/api/empresas-app")
+  const esNoUsar = (e) => /no\s*usar/i.test(`${e?.nombre || ""} ${e?.displayName || ""}`);
+
+  const cargar = (refrescar = false) => {
+    setCargando(true);
+    setError(null);
+    fetch(`/api/empresas-app${refrescar ? "?refrescar=1" : ""}`)
       .then((r) => r.json())
       .then((d) => {
-        const lista = d.empresas || [];
-        setEmpresas(lista);
-        if (d.aviso) setError("No se pudo leer la lista de empresas de BC");
-        // Primera vez (o empresa ya no disponible): ALSO CASALS
+        const crudas = d.empresas || [];
+        // Las marcadas "(no usar)" en BC no se ofrecen para trabajar
+        const lista = crudas.filter((e) => !esNoUsar(e));
+        const ocultas = crudas.length - lista.length;
+        setEmpresas(lista.length ? lista : crudas); // si todas son "no usar", mostrarlas igual
+        if (d.aviso) setError(`No se pudo leer la lista completa de BC: ${d.aviso}`);
+        else if (ocultas > 0) setError(null);
+
         const g = empresaGuardada();
-        if (!g || !lista.some((e) => e.id === g.id)) {
+        // Si no hay empresa, o la guardada ya no existe, o es una de
+        // "no usar" → saltar a la de por defecto (ALSO CASALS).
+        const guardadaInvalida =
+          !g ||
+          !lista.some((e) => e.id === g.id) ||
+          esNoUsar(g);
+        if (guardadaInvalida && lista.length) {
           const def = lista.find((e) => e.porDefecto) || lista[0];
-          if (def) localStorage.setItem(LS_EMPRESA_APP, JSON.stringify(def));
+          if (def && def.id !== g?.id) {
+            try { localStorage.setItem(LS_EMPRESA_APP, JSON.stringify(def)); } catch {}
+            window.location.reload();
+            return;
+          }
+          if (def && !g) {
+            try { localStorage.setItem(LS_EMPRESA_APP, JSON.stringify(def)); } catch {}
+          }
+        }
+        if (!lista.length && crudas.length) {
+          setError("Solo hay empresas marcadas «no usar» en BC. Revisa los nombres en Business Central.");
         }
       })
-      .catch(() => setError("Backend no disponible"));
-  }, []);
+      .catch(() => setError("Backend no disponible — no se pueden listar empresas"))
+      .finally(() => setCargando(false));
+  };
+
+  useEffect(() => { cargar(false); }, []);
 
   const elegir = (e) => {
     if (actual?.id === e.id) return;
@@ -96,7 +124,23 @@ export function SelectorEmpresa() {
   const idActual = actual?.id || empresas.find((e) => e.porDefecto)?.id;
   return (
     <div>
-      <div className="text-[10px] tracking-wider text-slate-500 font-semibold mb-1.5 px-0.5">EMPRESA</div>
+      <div className="flex items-center justify-between mb-1.5 px-0.5">
+        <div className="text-[10px] tracking-wider text-slate-500 font-semibold">EMPRESA</div>
+        <button
+          type="button"
+          onClick={() => cargar(true)}
+          disabled={cargando}
+          title="Volver a leer las empresas desde Business Central"
+          className="text-[10px] text-blue-600 hover:underline disabled:opacity-50"
+        >
+          {cargando ? "…" : "↻"}
+        </button>
+      </div>
+      {actual && (
+        <div className="text-[10px] text-slate-600 mb-1.5 px-0.5 truncate" title={actual.displayName || actual.nombre}>
+          Activa: <span className="font-semibold">{actual.displayName || actual.nombre}</span>
+        </div>
+      )}
       <div className="space-y-1.5">
         {empresas.map((e) => {
           const st = estilo(e.nombre);
@@ -106,22 +150,28 @@ export function SelectorEmpresa() {
               key={e.id}
               onClick={() => elegir(e)}
               title={`${e.displayName || e.nombre}${e.cif ? ` · CIF ${e.cif}` : ""}`}
-              className={`w-full h-11 flex items-center justify-center rounded px-2 bg-white border transition-all ${
+              className={`w-full flex flex-col items-center justify-center gap-0.5 rounded px-2 py-1.5 bg-white border transition-all ${
                 activa
                   ? "border-blue-500 ring-1 ring-blue-500 shadow-sm"
-                  : "border-slate-200 opacity-60 hover:opacity-100 hover:border-slate-400"
+                  : "border-slate-200 opacity-70 hover:opacity-100 hover:border-slate-400"
               }`}
             >
               {st.logo ? (
-                <img src={st.logo} alt={e.displayName || e.nombre} className="max-h-7 max-w-full object-contain" />
+                <img src={st.logo} alt={e.displayName || e.nombre} className="max-h-6 max-w-full object-contain" />
               ) : (
-                <span className={`font-extrabold tracking-wider text-[14px] ${st.color}`}>{st.inicial}</span>
+                <span className={`font-extrabold tracking-wider text-[13px] ${st.color}`}>{st.inicial}</span>
               )}
+              <span className="text-[9px] text-slate-500 leading-tight truncate max-w-full">
+                {e.displayName || e.nombre}
+              </span>
             </button>
           );
         })}
+        {!cargando && empresas.length === 0 && (
+          <div className="text-[10px] text-amber-700 px-0.5">Ninguna empresa disponible</div>
+        )}
       </div>
-      {error && <div className="text-[10px] text-amber-600 mt-1">{error}</div>}
+      {error && <div className="text-[10px] text-amber-600 mt-1 leading-snug">{error}</div>}
     </div>
   );
 }

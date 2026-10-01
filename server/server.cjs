@@ -166,7 +166,9 @@ app.use(async (req, res, next) => {
 });
 app.get("/api/empresas-app", async (req, res) => {
   try {
-    res.json({ empresas: await empresasApp(), porDefecto: process.env.BC_COMPANY_ID });
+    if (req.query.refrescar === "1" || req.query.refrescar === "true") cacheEmpresasApp = null;
+    const lista = await empresasApp();
+    res.json({ empresas: lista, porDefecto: process.env.BC_COMPANY_ID });
   } catch (err) {
     res.json({ empresas: [{ id: process.env.BC_COMPANY_ID, nombre: process.env.BC_COMPANY_NAME, displayName: process.env.BC_COMPANY_NAME, cif: "B43831593", porDefecto: true }], porDefecto: process.env.BC_COMPANY_ID, aviso: String(err.message || err) });
   }
