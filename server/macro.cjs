@@ -154,16 +154,25 @@ module.exports = function montarMacro({ app, fetchConReintento, db }) {
     const { empresa = "la empresa", modo = "uno", filas = [], resumen = {} } = req.body || {};
     if (!filas.length) return res.status(400).json({ error: "No hay ningún indicador para explicar." });
     const eurTxt = (v) => (v == null || !isFinite(v) ? "—" : `${Math.round(v).toLocaleString("es-ES")} €`);
-    const detalle = filas.map((f) =>
-      `- ${f.nombre}: dato actual ${f.valor} (${f.fecha}). Qué indica: ${f.que}. Cómo afecta en general: ${f.afecta}.` +
-      (f.escenario != null && f.escenario !== "" ? ` ESCENARIO: ${Number(f.escenario) > 0 ? "sube" : "baja"} ${Math.abs(Number(f.escenario))} ${f.unidad}. Cálculo con la contabilidad real: ${f.texto} Efecto anual: ${eurTxt(f.efectoAnual)}. Base afectada: ${eurTxt(f.base)} (${f.etiqueta}).` : " Sin escenario: explica qué pasaría si subiera o bajara de forma notable.")
-    ).join("\n");
-    const cifras = `Cifras anualizadas de la empresa: ventas ${eurTxt(resumen.ventas)}, EBITDA ${eurTxt(resumen.ebitda)}, margen EBITDA ${resumen.margen != null ? (resumen.margen * 100).toFixed(1) + " %" : "—"}, gastos de personal ${eurTxt(resumen.personal)}, compras/consumos ${eurTxt(resumen.consumos)}, deuda bancaria ${eurTxt(resumen.deuda)}.` +
-      (resumen.totalEbitda != null ? ` Efecto total del escenario: EBITDA ${eurTxt(resumen.totalEbitda)}/año, intereses ${eurTxt(resumen.totalFin)}/año.` : "");
+    const detalle = modo === "ratio"
+      ? filas.map((f) =>
+        `- ${f.nombre} (apartado: ${f.grupo || "ratios"}). Fórmula: ${f.formula || "—"}. Periodo actual (${f.etiqActual || "actual"}): ${f.valor}. Mismo periodo del año anterior (${f.etiqPrev || "anterior"}): ${f.anterior}. Guía ya mostrada en pantalla: ${f.que || "—"}.`
+      ).join("\n")
+      : filas.map((f) =>
+        `- ${f.nombre}: dato actual ${f.valor} (${f.fecha}). Qué indica: ${f.que}. Cómo afecta en general: ${f.afecta}.` +
+        (f.escenario != null && f.escenario !== "" ? ` ESCENARIO: ${Number(f.escenario) > 0 ? "sube" : "baja"} ${Math.abs(Number(f.escenario))} ${f.unidad}. Cálculo con la contabilidad real: ${f.texto} Efecto anual: ${eurTxt(f.efectoAnual)}. Base afectada: ${eurTxt(f.base)} (${f.etiqueta}).` : " Sin escenario: explica qué pasaría si subiera o bajara de forma notable.")
+      ).join("\n");
+    const pctTxt = (v) => (v == null || !isFinite(v) ? "—" : `${(v * 100).toFixed(1)} %`);
+    const cifras = modo === "ratio"
+      ? `Cifras reales del periodo (${resumen.periodo || "actual"}), comparadas con ${resumen.periodoPrev || "el año anterior"}: ventas ${eurTxt(resumen.ventas)} (antes ${eurTxt(resumen.ventasPrev)}), EBITDA ${eurTxt(resumen.ebitda)} (antes ${eurTxt(resumen.ebitdaPrev)}), EBIT ${eurTxt(resumen.ebit)}, beneficio líquido ${eurTxt(resumen.bn)}, margen EBITDA ${pctTxt(resumen.margen)}, tesorería ${eurTxt(resumen.tesoreria)}, clientes ${eurTxt(resumen.clientes)}, proveedores ${eurTxt(resumen.proveedores)}, fondo de maniobra ${eurTxt(resumen.fondoManiobra)}, activo ${eurTxt(resumen.activo)}, patrimonio ${eurTxt(resumen.patrimonio)}, deudas ${eurTxt(resumen.deudas)}.`
+      : `Cifras anualizadas de la empresa: ventas ${eurTxt(resumen.ventas)}, EBITDA ${eurTxt(resumen.ebitda)}, margen EBITDA ${pctTxt(resumen.margen)}, gastos de personal ${eurTxt(resumen.personal)}, compras/consumos ${eurTxt(resumen.consumos)}, deuda bancaria ${eurTxt(resumen.deuda)}.` +
+        (resumen.totalEbitda != null ? ` Efecto total del escenario: EBITDA ${eurTxt(resumen.totalEbitda)}/año, intereses ${eurTxt(resumen.totalFin)}/año.` : "");
     const sistema = `Eres un asesor financiero que explica las cosas de forma FÁCIL a la responsable de administración de ${empresa} (Grup AC, Tortosa). ${/also/i.test(empresa) ? "ALSO CASALS es una empresa instaladora (electricidad, fontanería, clima, mantenimiento industrial) que trabaja con OTs, materiales (cable de cobre, tubería, acero…), técnicos con furgonetas y clientes industriales y de obra. " : "Es una empresa del grupo; no supongas detalles de su actividad que no se deduzcan de las cifras. "}Escribe en castellano, frases cortas, sin tecnicismos (si usas uno, explícalo). Usa SIEMPRE los números reales que te doy (en €). Las soluciones deben ser concretas y aplicables por una pyme (precios, tarifas por hora, cláusulas de revisión de precios en presupuestos, compras, stock, rutas, financiación, etc.). No inventes datos que no te doy; si das un ejemplo inventado, dilo ("por ejemplo, una obra de 10.000 €…").`;
     const instr = modo === "todo"
       ? `Explica el ESCENARIO COMPLETO de estos indicadores y su efecto conjunto. Responde SOLO con JSON: {"explicacion": "3-5 frases fáciles sobre qué está pasando y qué significa para la empresa", "ejemplo": "un caso concreto con los números reales (ej.: una OT o un mes típico)", "soluciones": ["5-7 acciones concretas, ordenadas de más a menos importante, cada una de 1-2 frases"], "prioridad": "la UNA cosa que haría esta semana"}`
-      : `Explica este indicador. Responde SOLO con JSON: {"explicacion": "2-4 frases fáciles: qué es y cómo afecta a la empresa", "ejemplo": "un caso concreto con los números reales (ej.: en una OT típica, en un mes, en la furgoneta de un técnico…)", "soluciones": ["3-5 posibles soluciones concretas, 1-2 frases cada una"], "prioridad": "la acción más urgente, en una frase"}`;
+      : modo === "ratio"
+        ? `Explica este ratio o esta masa del balance con las cifras REALES de la empresa (periodo actual y año anterior). Di si ha mejorado o empeorado. Responde SOLO con JSON: {"explicacion": "2-4 frases fáciles: qué significa ESTE número para la empresa", "ejemplo": "un caso concreto usando estos euros o este ratio (una obra, un mes de cobros, el banco, el almacén…)", "soluciones": ["3-5 acciones concretas, 1-2 frases cada una: qué hacer si el dato es flojo, o cómo aprovecharlo si es bueno"], "prioridad": "la acción más útil esta semana, en una frase"}`
+        : `Explica este indicador. Responde SOLO con JSON: {"explicacion": "2-4 frases fáciles: qué es y cómo afecta a la empresa", "ejemplo": "un caso concreto con los números reales (ej.: en una OT típica, en un mes, en la furgoneta de un técnico…)", "soluciones": ["3-5 posibles soluciones concretas, 1-2 frases cada una"], "prioridad": "la acción más urgente, en una frase"}`;
     try {
       let r;
       for (let intento = 0; intento < 3; intento++) {

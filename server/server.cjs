@@ -257,6 +257,100 @@ app.get("/api/bc/proveedor-email", async (req, res) => {
   }
 });
 
+// Email del CLIENTE desde su ficha en BC (API v2.0 /customers, solo LECTURA).
+app.get("/api/bc/cliente-email", async (req, res) => {
+  const numero = String(req.query.numero || "").trim();
+  const nombre = String(req.query.nombre || "").trim();
+  if (!numero && !nombre) return res.status(400).json({ error: "Falta 'numero' o 'nombre'." });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/customers`;
+    const esc = (v) => v.replace(/'/g, "''");
+    const filtros = [];
+    if (numero) filtros.push(`number eq '${esc(numero)}'`);
+    if (nombre) filtros.push(`displayName eq '${esc(nombre)}'`);
+    for (const f of filtros) {
+      const r = await fetchConReintento(`${base}?$filter=${encodeURIComponent(f)}&$select=number,displayName,email,taxRegistrationNumber`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) continue;
+      const v = ((await r.json()).value || [])[0];
+      if (v) return res.json({ email: v.email || "", cif: v.taxRegistrationNumber || "", numero: v.number, nombre: v.displayName });
+    }
+    res.json({ email: "" });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo consultar el cliente en BC.", detalle: String(err.message || err) });
+  }
+});
+
+// PDF oficial de una factura de venta registrada (API v2.0, pdfDocument).
+async function leerPdfBC(url, headers) {
+  const r = await fetchConReintento(url, { headers });
+  if (!r.ok) {
+    const detalle = await r.text().catch(() => "");
+    return { ok: false, status: r.status, error: `BC respondió ${r.status} al descargar el PDF.`, detalle: detalle.slice(0, 400) };
+  }
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length < 5 || buf.subarray(0, 5).toString("latin1") !== "%PDF-") {
+    return { ok: false, error: "Business Central no ha devuelto un PDF.", detalle: buf.subarray(0, 240).toString("utf8") };
+  }
+  return { ok: true, base64: buf.toString("base64") };
+}
+
+app.get("/api/bc/factura-venta-pdf", async (req, res) => {
+  const numero = String(req.query.numero || "").trim();
+  let id = String(req.query.id || "").trim();
+  const esGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const auth = { Authorization: `Bearer ${token}` };
+    if (!esGuid) {
+      if (!numero) return res.status(400).json({ error: "Falta el número de factura." });
+      const esc = numero.replace(/'/g, "''");
+      const busca = await fetchConReintento(`${base}/salesInvoices?$filter=${encodeURIComponent(`number eq '${esc}'`)}&$select=id,number&$top=1`, { headers: auth });
+      if (!busca.ok) {
+        const detalle = await busca.text();
+        return res.status(502).json({ error: `BC respondió ${busca.status} buscando la factura.`, detalle: detalle.slice(0, 400) });
+      }
+      const v = ((await busca.json()).value || [])[0];
+      if (!v?.id) return res.status(404).json({ error: `No está la factura ${numero} en Business Central.` });
+      id = v.id;
+    }
+
+    const raiz = `${base}/salesInvoices(${id})/pdfDocument`;
+    let ultimo = null;
+    for (const accept of ["application/pdf", "application/octet-stream"]) {
+      const got = await leerPdfBC(`${raiz}/pdfDocumentContent`, { ...auth, Accept: accept });
+      if (got.ok) {
+        const nombre = `Factura_${(numero || "venta").replace(/[^\w.-]+/g, "_")}.pdf`;
+        return res.json({ nombre, base64: got.base64, mime: "application/pdf" });
+      }
+      ultimo = got;
+    }
+
+    const meta = await fetchConReintento(raiz, { headers: { ...auth, Accept: "application/json" } });
+    if (meta.ok) {
+      const j = await meta.json();
+      const link = j["pdfDocumentContent@odata.mediaReadLink"] || (j.id ? `${raiz}(${j.id})/pdfDocumentContent` : "");
+      if (link) {
+        const got = await leerPdfBC(link, { ...auth, Accept: "application/pdf" });
+        if (got.ok) {
+          const nombre = `Factura_${(numero || "venta").replace(/[^\w.-]+/g, "_")}.pdf`;
+          return res.json({ nombre, base64: got.base64, mime: "application/pdf" });
+        }
+        ultimo = got;
+      }
+    } else {
+      const detalle = await meta.text().catch(() => "");
+      ultimo = { error: `BC respondió ${meta.status} al pedir el PDF de la factura.`, detalle: detalle.slice(0, 400) };
+    }
+    return res.status(502).json({ error: ultimo?.error || "Business Central no ha devuelto el PDF de la factura.", detalle: ultimo?.detalle || "" });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo obtener el PDF de la factura.", detalle: String(err.message || err) });
+  }
+});
+
 app.post("/api/recepcion", async (req, res) => {
   try {
     const actual = await leerRecep();
@@ -456,6 +550,58 @@ app.post("/api/chat-ot", async (req, res) => {
   }
 });
 
+function binarioChromium() {
+  const fs = require("fs");
+  if (process.env.CHROMIUM_PATH && fs.existsSync(process.env.CHROMIUM_PATH)) return process.env.CHROMIUM_PATH;
+  const { execFileSync } = require("child_process");
+  const which = process.platform === "win32" ? "where" : "which";
+  for (const n of ["chromium", "chromium-browser", "google-chrome", "msedge"]) {
+    try {
+      const out = execFileSync(which, [n], { encoding: "utf8" }).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+      if (out && fs.existsSync(out)) return out;
+    } catch {}
+  }
+  return null;
+}
+
+function pdfsConChromium(bin, lista, salida) {
+  const fs = require("fs");
+  const { spawn } = require("child_process");
+  fs.mkdirSync(salida, { recursive: true });
+  const uno = (doc, headless) => new Promise((resolve) => {
+    const destino = path.join(salida, doc.nombre);
+    const archivo = doc.html.replace(/\\/g, "/");
+    const args = [
+      headless,
+      "--disable-gpu",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      `--print-to-pdf=${destino}`,
+      "--no-pdf-header-footer",
+      `file://${archivo}`,
+    ];
+    let err = "";
+    let proc;
+    try { proc = spawn(bin, args, { windowsHide: true }); } catch (e) { return resolve({ ok: false, err: String(e) }); }
+    proc.stderr.on("data", (b) => { err += b; });
+    proc.on("error", (e) => resolve({ ok: false, err: String(e) }));
+    proc.on("close", (code) => {
+      const vale = code === 0 && fs.existsSync(destino) && fs.statSync(destino).size > 0;
+      resolve({ ok: vale, err: vale ? "" : (err || `código ${code}`).slice(-400) });
+    });
+  });
+  return (async () => {
+    const resultado = { ok: [], errores: {} };
+    for (const doc of lista) {
+      let r = await uno(doc, "--headless=new");
+      if (!r.ok) r = await uno(doc, "--headless");
+      if (r.ok) resultado.ok.push(doc.nombre);
+      else resultado.errores[doc.nombre] = r.err || "Chromium no generó el PDF.";
+    }
+    return resultado;
+  })();
+}
+
 app.post("/api/borradores/pdf", async (req, res) => {
   const docs = Array.isArray(req.body?.docs) ? req.body.docs : [];
   if (!docs.length) return res.status(400).json({ error: "No hay borradores que convertir." });
@@ -475,6 +621,15 @@ app.post("/api/borradores/pdf", async (req, res) => {
     });
     const rutaTrabajo = path.join(tmp, "trabajo.json");
     fs.writeFileSync(rutaTrabajo, JSON.stringify({ salida, docs: lista }), "utf8");
+    const binCromo = binarioChromium();
+    let resultado;
+    if (binCromo) {
+      resultado = await pdfsConChromium(binCromo, lista, salida);
+      if (!resultado.ok.length) {
+        const detalle = Object.values(resultado.errores)[0] || "Chromium no generó el PDF.";
+        throw new Error(detalle);
+      }
+    } else {
     const script = path.join(__dirname, "..", "bc_automation", "html_a_pdf.py");
 
     const candidatos = [process.env.PYTHON_CMD, "py", "python", "python3"].filter(Boolean);
@@ -493,12 +648,22 @@ app.post("/api/borradores/pdf", async (req, res) => {
       ultimoErr = `${cmd}: ${(r.err || "").slice(-400)}`;
     }
     if (salidaPy === null) throw new Error(`No se pudo ejecutar html_a_pdf.py con Python (${ultimoErr}).`);
-    const resultado = JSON.parse(salidaPy.trim().split(/\r?\n/).pop());
+    resultado = JSON.parse(salidaPy.trim().split(/\r?\n/).pop());
+    }
+    const errores = resultado.errores || {};
+    if (req.body?.formato === "base64") {
+      const nombre = (resultado.ok || [])[0];
+      if (!nombre) {
+        const detalle = Object.entries(errores).map(([k, v]) => `${k}: ${v}`).join(" · ") || "No se generó el PDF.";
+        return res.status(500).json({ error: "No se pudo generar el borrador.", detalle });
+      }
+      const base64 = fs.readFileSync(path.join(salida, nombre)).toString("base64");
+      return res.json({ nombre, base64, mime: "application/pdf" });
+    }
 
     const JSZip = require("jszip");
     const zip = new JSZip();
     for (const n of resultado.ok || []) zip.file(n, fs.readFileSync(path.join(salida, n)));
-    const errores = resultado.errores || {};
     if (Object.keys(errores).length) zip.file("ERRORES.txt", Object.entries(errores).map(([k, v]) => `${k}: ${v}`).join("\r\n"));
     const buf = await zip.generateAsync({ type: "nodebuffer" });
     console.log(`[borradores/pdf] ${resultado.ok.length} PDF(s) → ${salida}${Object.keys(errores).length ? ` · ${Object.keys(errores).length} error(es)` : ""}`);
@@ -4020,6 +4185,7 @@ require("./contabilidad.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_
 require("./macro.cjs")({ app, fetchConReintento, db });
 const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@alsocasals.com";
 require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep, escribirRecep, BUZON_PERSONAL });
+require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL });
 require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, db, claveEmpresa });
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)

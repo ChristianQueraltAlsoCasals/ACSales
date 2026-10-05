@@ -3,6 +3,7 @@ import {
   Database,
   RefreshCw,
   Trash2,
+  StickyNote,
   Eye,
   Check,
   Clock,
@@ -64,6 +65,7 @@ import { OTS_DEMO } from "./datosDemo.js";
 import { generarBorradorFactura, htmlBorradorFactura } from "./borradorFactura.js";
 import Recepcion from "./recepcion.jsx";
 import FacturasCompra from "./facturasCompra.jsx";
+import FacturasVenta from "./facturasVenta.jsx";
 import Precios from "./precios.jsx";
 import { EMAILS_DEPARTAMENTO, EMAIL_POR_DEFECTO } from "./departamentos.js";
 import Correo from "./correo.jsx";
@@ -133,6 +135,17 @@ const SOURCES = [
       pageNo: "526",
       table: "Sales Invoice Line (113)",
       endpoint: "Sales_Invoice_Line_Excel (web service)",
+    },
+  },
+  {
+    id: "facturas_venta",
+    name: "Facturas de venta emitidas",
+    desc: "Cabeceras de las facturas de venta contabilizadas: número, fecha, cliente, estado e importe.",
+    origin: {
+      page: "Facturas venta registradas (Posted Sales Invoices)",
+      pageNo: "143",
+      table: "Sales Invoice Header (112)",
+      endpoint: "salesInvoices",
     },
   },
   {
@@ -1647,6 +1660,31 @@ function departamentoDeFicha(f) {
   return EMAILS_DEPARTAMENTO[dep] ? dep : null;
 }
 
+function borradorCorreoFacturacion(f) {
+  const dep = departamentoDeFicha(f);
+  const para = dep ? [...EMAILS_DEPARTAMENTO[dep]] : ["edith.galvez@alsocasals.com"];
+  const num = (f.numeroOT || "").toString().padStart(6, "0");
+  const cliente = f.general.cliente || "";
+  const descripcion = f.general.descripcion || "";
+  const cuerpoTexto =
+    `Bon dia,\n\n` +
+    `Ens podríeu confirmar si podem procedir a la facturació de la següent OT ${num} de ${cliente} o, en cas contrari, quina previsió hi ha per acabar aquestes feines?\n\n` +
+    `Client: ${cliente}\n` +
+    `Nº OT: ${num}\n` +
+    `Descripció: ${descripcion}\n\n` +
+    `Us adjuntem el borrador de factura d'aquesta OT.\n\n` +
+    `Quedem a l'espera de la vostra confirmació per poder gestionar la facturació.`;
+  return {
+    para,
+    asunto: `Confirmació facturació OT ${num} — ${cliente}`,
+    cuerpoTexto,
+    num,
+    noBC: f.numeroOTOrigenes?.listado || f.numeroOT || num,
+    cliente,
+    departamento: dep,
+  };
+}
+
 function mailtoFacturacion(f) {
   const dep = departamentoDeFicha(f);
   const para = (dep ? EMAILS_DEPARTAMENTO[dep] : ["edith.galvez@alsocasals.com"]).join(";");
@@ -1932,12 +1970,20 @@ function plantillaCorreoValoracion({ num, cliente, descripcion, instrucciones })
   };
 }
 
-function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado }) {
+function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = false, titulo, estadoAdjunto = null }) {
   const [para, setPara] = useState((borrador.para || []).join("; "));
   const [asunto, setAsunto] = useState(borrador.asunto || "");
   const [cuerpo, setCuerpo] = useState(borrador.cuerpoTexto || "");
   const [enviando, setEnviando] = useState(false);
   const [error, setError] = useState(null);
+  const [de, setDe] = useState("");
+
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => { if (d.email) setDe(d.email); })
+      .catch(() => {});
+  }, []);
 
   const enviar = async () => {
     const destinatarios = para.split(/[;,\s]+/).map((e) => e.trim()).filter(Boolean);
@@ -1979,10 +2025,11 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado }) {
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
           <div>
-            <div className="text-sm font-semibold text-slate-800">Correo al responsable · OT {borrador.num}</div>
+            <div className="text-sm font-semibold text-slate-800">{titulo || "Correo al responsable"} · OT {borrador.num}</div>
             <div className="text-[11px] text-slate-500">
               {borrador.noBC}{borrador.cliente ? ` · ${borrador.cliente}` : ""}
               {borrador.departamento ? ` · dpto. ${borrador.departamento}` : ""}
+              {de ? ` · desde ${de}` : ""}
             </div>
           </div>
           <button type="button" onClick={onCerrar} className="p-1 text-slate-400 hover:text-slate-700" aria-label="Cerrar">
@@ -2016,14 +2063,20 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado }) {
               className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] font-sans focus:outline-none focus:ring-2 focus:ring-purple-400"
             />
           </label>
+          {!sinAdjunto && (
           <div className="flex items-center gap-2 text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
             <FileText size={14} className="text-purple-600 flex-shrink-0" />
             {borrador.adjunto ? (
               <span>Adjunto: <strong>{borrador.adjunto.nombre}</strong></span>
+            ) : estadoAdjunto?.cargando ? (
+              <span>Preparando el borrador de factura…</span>
+            ) : estadoAdjunto?.error ? (
+              <span className="text-amber-700">{estadoAdjunto.error}</span>
             ) : (
               <span className="text-amber-700">Sin adjunto — el correo se enviará sin valoración.</span>
             )}
           </div>
+          )}
           {error && <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
         </div>
         <div className="flex justify-end gap-2 px-4 py-3 border-t border-slate-200 bg-slate-50">
@@ -2033,16 +2086,81 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado }) {
           <button
             type="button"
             onClick={enviar}
-            disabled={enviando}
+            disabled={enviando || estadoAdjunto?.cargando}
             className="text-sm font-semibold px-4 py-1.5 rounded-md text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-50 inline-flex items-center gap-1.5"
           >
             <Send size={14} />
-            {enviando ? "Enviando…" : "Enviar correo"}
+            {enviando ? "Enviando…" : estadoAdjunto?.cargando ? "Preparando borrador…" : "Enviar correo"}
           </button>
         </div>
       </div>
     </div>
   );
+}
+
+function BotonCorreoFacturacion({ ficha, onRegistrado }) {
+  const [abierto, setAbierto] = useState(false);
+  const [enviado, setEnviado] = useState(false);
+  const [adjunto, setAdjunto] = useState(null);
+  const [estadoAdjunto, setEstadoAdjunto] = useState(null);
+  const dep = departamentoDeFicha(ficha);
+
+  const abrir = () => {
+    setAbierto(true);
+    setAdjunto(null);
+    setEstadoAdjunto({ cargando: true });
+    adjuntoBorradorDeFicha(ficha)
+      .then((a) => { setAdjunto(a); setEstadoAdjunto(null); })
+      .catch((e) => setEstadoAdjunto({ error: e.message || String(e) }));
+  };
+
+  return (
+    <span className="inline-flex items-center justify-center gap-1">
+      <button
+        type="button"
+        onClick={abrir}
+        title={`Enviar desde la app al responsable (${dep || "sin dpto. — Edith"}) el borrador de factura de esta OT`}
+        className="inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"
+      >
+        <Mail size={14} />
+      </button>
+      {enviado && <span className="text-[10px] font-semibold text-emerald-600">✓</span>}
+      {abierto && (
+        <ModalCorreoResponsableOT
+          titulo="Confirmar facturación"
+          estadoAdjunto={estadoAdjunto}
+          borrador={{ ...borradorCorreoFacturacion(ficha), adjunto }}
+          onCerrar={() => setAbierto(false)}
+          onEnviado={(info) => { setAbierto(false); setEnviado(true); onRegistrado?.(info); }}
+        />
+      )}
+    </span>
+  );
+}
+
+async function adjuntoBorradorDeFicha(ficha) {
+  const noBC = ficha.numeroOTOrigenes?.listado || ficha.numeroOTOrigenes?.lineasVenta || ficha.numeroOTOrigenes?.lineasCompra || ficha.numeroOT;
+  const resp = await fetch(`/api/bc/ot/lineas?no=${encodeURIComponent(noBC)}`);
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(json.error || `No se pudieron leer las líneas (${resp.status})`);
+  const b = filasBorradorDesdeRaw(json.venta || []);
+  if (!b?.filas?.length) throw new Error("Esta OT no tiene líneas de venta en BC, así que no hay borrador.");
+  const numeroOT = ficha.numeroOT || noBC;
+  const nombre = `Borrador_OT${String(numeroOT).padStart(6, "0")}${ficha.general?.cliente ? "_" + String(ficha.general.cliente).slice(0, 40) : ""}`;
+  const html = htmlBorradorFactura({
+    numeroOT,
+    cliente: ficha.general?.cliente || "",
+    cifCliente: b.cif,
+    filas: b.filas,
+  });
+  const r = await fetch("/api/borradores/pdf", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ formato: "base64", docs: [{ nombre, html }] }),
+  });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.detalle || out.error || `No se pudo generar el PDF (${r.status})`);
+  return { nombre: out.nombre || `${nombre}.pdf`, base64: out.base64, mime: out.mime || "application/pdf" };
 }
 
 function ChatOT({ fichas }) {
@@ -2305,12 +2423,381 @@ function ChatOT({ fichas }) {
   );
 }
 
+function leerCampoFila(row, nombres) {
+  if (!row || typeof row !== "object") return "";
+  for (const n of nombres) {
+    const v = row[n];
+    if (v != null && String(v).trim() !== "") return v;
+  }
+  const mapa = new Map(Object.keys(row).map((k) => [k.toLowerCase(), k]));
+  for (const n of nombres) {
+    const k = mapa.get(String(n).toLowerCase());
+    if (k != null && row[k] != null && String(row[k]).trim() !== "") return row[k];
+  }
+  return "";
+}
+
+function numFilaBC(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (v == null || v === "") return 0;
+  let s = String(v).trim().replace(/\s|€/g, "");
+  if (/,\d{1,2}$/.test(s)) s = s.replace(/\./g, "").replace(",", ".");
+  else s = s.replace(/,/g, "");
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fechaCorta(s) {
+  const t = String(s || "").trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(t);
+  if (m) return `${m[3]}/${m[2]}/${m[1]}`;
+  return t ? t.slice(0, 10) : "";
+}
+
+const eurPedido = (n) =>
+  (Number(n) || 0).toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " €";
+
+const fmtCantPedido = (n) =>
+  (Number(n) || 0).toLocaleString("es-ES", { maximumFractionDigits: 2 });
+
+function lineaPedidoDesdeFila(l) {
+  return {
+    lineaNo: Number(leerCampoFila(l, ["Line_No", "lineNumber", "sequence"])) || 0,
+    tipo: String(leerCampoFila(l, ["Type", "lineType"]) || ""),
+    numero: String(leerCampoFila(l, ["No", "No.", "lineObjectNumber", "itemId"]) || "").trim(),
+    descripcion: String(leerCampoFila(l, ["Description", "description"]) || "").trim(),
+    cantidad: numFilaBC(leerCampoFila(l, ["Quantity", "quantity"])),
+    precio: numFilaBC(leerCampoFila(l, ["Unit_Price", "unitPrice"])),
+    importe: numFilaBC(leerCampoFila(l, ["Line_Amount", "lineAmount", "Amount", "amount"])),
+    ot: String(leerCampoFila(l, ["Shortcut_Dimension_2_Code", "shortcutDimension2Code", "noOT", "Job_No", "jobNo"]) || "").trim(),
+  };
+}
+
+// Pedidos de venta (PV) cuyas líneas llevan esa OT. Las líneas vivas
+// mandan (una OT puede estar en varios pedidos). La cabecera aporta
+// cliente, fecha y estado. Si no hay líneas cargadas, se usa la OT de
+// la cabecera y, en la ficha, los documentos que empiezan por PV.
+function indicePedidosPorOT(pedidosVenta, lineasPedidoVenta) {
+  const cabeceras = new Map();
+  for (const cab of pedidosVenta || []) {
+    const num = String(leerCampoFila(cab, ["number", "No", "No.", "Document_No", "documentNumber"]) || "").trim();
+    if (!num) continue;
+    cabeceras.set(num, {
+      num,
+      cliente: String(leerCampoFila(cab, ["customerName", "sellToCustomerName", "Sell_to_Customer_Name", "billToName", "Bill_to_Name"]) || "").trim(),
+      fecha: String(leerCampoFila(cab, ["orderDate", "Order_Date", "documentDate", "Document_Date"]) || "").trim(),
+      estado: String(leerCampoFila(cab, ["status", "Status"]) || "").trim(),
+      total: numFilaBC(leerCampoFila(cab, ["totalAmountIncludingTax", "amountIncludingVAT", "Amount_Including_VAT", "totalAmountExcludingTax", "amount"])),
+      ot: String(leerCampoFila(cab, ["noOT", "shortcutDimension2Code", "Shortcut_Dimension_2_Code", "jobNo", "Job_No"]) || "").trim(),
+    });
+  }
+
+  const porOT = new Map();
+  const lineasPorDoc = new Map();
+  const meter = (otRaw, num, extra) => {
+    const clave = normalizarNumeroOT(otRaw);
+    if (!clave || !num) return;
+    if (!porOT.has(clave)) porOT.set(clave, new Map());
+    const docs = porOT.get(clave);
+    const cab = cabeceras.get(num);
+    const prev = docs.get(num) || {
+      num,
+      cliente: cab?.cliente || "",
+      fecha: cab?.fecha || "",
+      estado: cab?.estado || "",
+      total: cab?.total || 0,
+      importeOT: 0,
+      lineas: 0,
+    };
+    if (extra) {
+      prev.importeOT += extra.importe || 0;
+      prev.lineas += extra.lineas || 0;
+      if (!prev.cliente && extra.cliente) prev.cliente = extra.cliente;
+      if (!prev.fecha && extra.fecha) prev.fecha = extra.fecha;
+    }
+    docs.set(num, prev);
+  };
+
+  let hayLineasConOT = false;
+  for (const l of lineasPedidoVenta || []) {
+    const tipo = String(leerCampoFila(l, ["Document_Type", "documentType"]) || "");
+    if (tipo && !/order|pedido/i.test(tipo)) continue;
+    const num = String(leerCampoFila(l, ["Document_No", "documentNo", "documentNumber"]) || "").trim();
+    if (!num) continue;
+    const linea = lineaPedidoDesdeFila(l);
+    if (!lineasPorDoc.has(num)) lineasPorDoc.set(num, []);
+    lineasPorDoc.get(num).push(linea);
+    if (!linea.ot) continue;
+    hayLineasConOT = true;
+    meter(linea.ot, num, {
+      importe: linea.importe,
+      lineas: 1,
+      cliente: String(leerCampoFila(l, ["Sell_to_Customer_Name", "sellToCustomerName"]) || "").trim(),
+      fecha: String(leerCampoFila(l, ["Order_Date", "orderDate", "Shipment_Date", "Document_Date"]) || "").trim(),
+    });
+  }
+
+  if (!hayLineasConOT) {
+    for (const cab of cabeceras.values()) {
+      if (cab.ot) meter(cab.ot, cab.num, { importe: 0, lineas: 0 });
+    }
+  }
+
+  for (const docs of porOT.values()) {
+    for (const p of docs.values()) {
+      p.detalle = [...(lineasPorDoc.get(p.num) || [])].sort((a, b) => a.lineaNo - b.lineaNo || a.numero.localeCompare(b.numero, "es"));
+    }
+  }
+
+  return { porOT, cabeceras, hayLineasConOT, lineasPorDoc };
+}
+
+function detalleLineasFicha(f, num) {
+  const out = [];
+  const grupos = [f.venta?.horas?.lineas, f.venta?.materiales?.lineas, f.venta?.desplazamiento?.lineas, f.venta?.otros?.lineas];
+  for (const arr of grupos) {
+    for (const l of arr || []) {
+      if (String(l.numeroDocumento || "").trim() !== num) continue;
+      out.push({
+        lineaNo: out.length + 1,
+        tipo: "",
+        numero: String(l.numero || "").trim(),
+        descripcion: String(l.descripcion || "").trim(),
+        cantidad: Number(l.cantidad) || 0,
+        precio: Number(l.precioUnitario) || 0,
+        importe: Number(l.importe) || 0,
+        ot: "",
+      });
+    }
+  }
+  return out;
+}
+
+function pedidosDeFicha(f, indice) {
+  const mapa = new Map();
+  const claves = [f.numeroOT, f.numeroOTOrigenes?.listado, f.numeroOTOrigenes?.lineasVenta].filter(Boolean);
+  for (const c of claves) {
+    const docs = indice.porOT.get(normalizarNumeroOT(c));
+    if (!docs) continue;
+    for (const [num, p] of docs) if (!mapa.has(num)) mapa.set(num, { ...p });
+  }
+  const desdeFicha = new Map();
+  const grupos = [f.venta?.horas?.lineas, f.venta?.materiales?.lineas, f.venta?.desplazamiento?.lineas, f.venta?.otros?.lineas];
+  for (const arr of grupos) {
+    for (const l of arr || []) {
+      const num = String(l.numeroDocumento || "").trim();
+      if (!/^PV/i.test(num)) continue;
+      const prev = desdeFicha.get(num) || { importeOT: 0, lineas: 0, fecha: "" };
+      prev.importeOT += Number(l.importe) || 0;
+      prev.lineas += 1;
+      if (!prev.fecha && l.fechaPedido) prev.fecha = String(l.fechaPedido);
+      desdeFicha.set(num, prev);
+    }
+  }
+  for (const [num, extra] of desdeFicha) {
+    const cab = indice.cabeceras.get(num);
+    const ya = mapa.get(num);
+    const detalleBC = indice.lineasPorDoc.get(num) || [];
+    const detalle = detalleBC.length ? detalleBC : detalleLineasFicha(f, num);
+    if (ya && ya.lineas > 0) {
+      ya.cliente = ya.cliente || cab?.cliente || "";
+      ya.fecha = ya.fecha || cab?.fecha || extra.fecha;
+      ya.estado = ya.estado || cab?.estado || "";
+      ya.total = ya.total || cab?.total || 0;
+      if (!ya.detalle?.length) ya.detalle = detalle;
+      continue;
+    }
+    mapa.set(num, {
+      num,
+      cliente: ya?.cliente || cab?.cliente || "",
+      fecha: ya?.fecha || cab?.fecha || extra.fecha,
+      estado: ya?.estado || cab?.estado || "",
+      total: ya?.total || cab?.total || 0,
+      importeOT: extra.importeOT,
+      lineas: extra.lineas,
+      detalle,
+    });
+  }
+  return [...mapa.values()].sort((a, b) => a.num.localeCompare(b.num, "es"));
+}
+
+function ListaPedidosOT({ pedidos }) {
+  const [abierto, setAbierto] = useState(null);
+  if (!pedidos.length) {
+    return <span className="text-[11px] text-slate-400">Sin pedidos de venta con esta OT</span>;
+  }
+  return (
+    <ul className="my-1 ml-4 border-l-2 border-slate-200">
+      {pedidos.map((p) => {
+        const importe = p.importeOT > 0.005 ? p.importeOT : p.total;
+        const abiertoEste = abierto === p.num;
+        const detalle = p.detalle || [];
+        return (
+          <li key={p.num} className="border-b border-slate-100 last:border-b-0">
+            <button
+              type="button"
+              onClick={() => setAbierto(abiertoEste ? null : p.num)}
+              className="w-full flex items-center gap-3 px-2 py-1 text-left hover:bg-white"
+            >
+              <span className="w-3 text-slate-400">{abiertoEste ? "▾" : "▸"}</span>
+              <span className="font-mono font-semibold text-slate-900">{p.num}</span>
+              {p.fecha ? <span className="text-slate-500">{fechaCorta(p.fecha)}</span> : null}
+              {p.cliente ? <span className="truncate text-slate-500 max-w-[220px]">{p.cliente}</span> : null}
+              {p.estado ? <span className="text-slate-400">{p.estado}</span> : null}
+              <span className="ml-auto font-semibold text-blue-700 whitespace-nowrap">{importe > 0.005 ? eurPedido(importe) : "—"}</span>
+            </button>
+            {abiertoEste && (
+              <div className="mx-2 mb-2 bg-white border border-slate-200 rounded-md overflow-hidden">
+                {detalle.length === 0 ? (
+                  <p className="px-3 py-2 text-[11px] text-slate-400">No hay líneas cargadas de este pedido.</p>
+                ) : (
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="bg-slate-100 text-slate-500 text-left">
+                        <th className="px-2 py-1 font-semibold">Nº</th>
+                        <th className="px-2 py-1 font-semibold">Descripción</th>
+                        <th className="px-2 py-1 font-semibold text-right">Cantidad</th>
+                        <th className="px-2 py-1 font-semibold text-right">Precio</th>
+                        <th className="px-2 py-1 font-semibold text-right">Importe</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {detalle.map((l, i) => (
+                        <tr key={`${l.lineaNo}-${i}`} className="border-t border-slate-100">
+                          <td className="px-2 py-1 font-mono whitespace-nowrap">{l.numero || "—"}</td>
+                          <td className="px-2 py-1 text-slate-700">{l.descripcion || "—"}</td>
+                          <td className="px-2 py-1 text-right whitespace-nowrap">{fmtCantPedido(l.cantidad)}</td>
+                          <td className="px-2 py-1 text-right whitespace-nowrap">{eurPedido(l.precio)}</td>
+                          <td className="px-2 py-1 text-right whitespace-nowrap font-semibold">{eurPedido(l.importe)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+const CLAVE_AUTOR_NOTA = "recepcion_autor_v1";
+const leerAutorNota = () => { try { return localStorage.getItem(CLAVE_AUTOR_NOTA) || ""; } catch { return ""; } };
+const selloSeguimiento = (iso) => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+};
+
+function aliasCorreoOT(f) {
+  const clave = String(f.numeroOT || "").trim();
+  const listado = String(f.numeroOTOrigenes?.listado || "").trim();
+  const dig = clave.replace(/\D/g, "");
+  const pad = dig.padStart(6, "0");
+  const patrones = new Set();
+  if (listado) patrones.add(listado);
+  if (dig) {
+    patrones.add(`AC${pad}`);
+    patrones.add(`OT ${dig}`);
+    patrones.add(`OT ${pad}`);
+  }
+  return { clave, patrones: [...patrones].filter((p) => p.length >= 4) };
+}
+
+function NotasOT({ ot, notas, onCambio }) {
+  const [texto, setTexto] = useState("");
+  const [autor, setAutor] = useState(leerAutorNota);
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState(null);
+
+  const añadir = async () => {
+    const t = texto.trim();
+    if (!t) return;
+    if (!autor.trim()) { setError("Escribe tu nombre (solo la primera vez)."); return; }
+    setGuardando(true);
+    setError(null);
+    try { localStorage.setItem(CLAVE_AUTOR_NOTA, autor.trim()); } catch {}
+    try {
+      const r = await fetch("/api/pedidos-venta/nota", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ot, texto: t, autor: autor.trim() }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.error || `Error ${r.status}`);
+      onCambio(ot, json.notas || []);
+      setTexto("");
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+    setGuardando(false);
+  };
+
+  const borrar = async (id) => {
+    try {
+      const r = await fetch("/api/pedidos-venta/nota/borrar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ot, id }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (r.ok) onCambio(ot, json.notas || []);
+    } catch {}
+  };
+
+  return (
+    <div className="mt-2 bg-amber-50/60 border border-amber-200 rounded p-2">
+      <div className="text-[11px] font-semibold text-amber-800 mb-1 flex items-center gap-1"><StickyNote size={12} /> Notas internas</div>
+      {(notas || []).length === 0 && <div className="text-[11px] text-slate-400 mb-1">Sin notas todavía.</div>}
+      {(notas || []).map((n) => (
+        <div key={n.id} className="group flex items-start gap-2 text-[11px] py-0.5">
+          <span className="text-slate-400 whitespace-nowrap">{selloSeguimiento(n.ts)}</span>
+          <span className="font-semibold text-slate-600 whitespace-nowrap">{n.autor}:</span>
+          <span className="text-slate-700 whitespace-pre-wrap flex-1">
+            {n.texto}
+            {n.enlace ? <> <a href={n.enlace} target="_blank" rel="noreferrer" className="text-blue-600 underline whitespace-nowrap">Abrir en Outlook</a></> : null}
+          </span>
+          <button type="button" onClick={() => borrar(n.id)} className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600" title="Borrar nota"><Trash2 size={12} /></button>
+        </div>
+      ))}
+      <div className="flex items-center gap-2 mt-1.5">
+        {!leerAutorNota() && (
+          <input value={autor} onChange={(e) => setAutor(e.target.value)} placeholder="Tu nombre" className="border border-slate-300 rounded px-2 py-1 text-[11px] w-28 bg-white" />
+        )}
+        <input
+          value={texto}
+          onChange={(e) => setTexto(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") añadir(); }}
+          placeholder="Añadir nota interna… (Enter para guardar)"
+          className="flex-1 border border-slate-300 rounded px-2 py-1 text-[11px] bg-white"
+        />
+        <button type="button" onClick={añadir} disabled={guardando || !texto.trim()} className="text-[11px] font-semibold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-50 rounded px-3 py-1">
+          {guardando ? "Guardando…" : "Añadir"}
+        </button>
+      </div>
+      {error && <div className="text-[11px] text-red-600 mt-1">✗ {error}</div>}
+    </div>
+  );
+}
+
 function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
   const [fichas, setFichas] = useState(null);
   const [cargando, setCargando] = useState(true);
   const [error, setError] = useState(null);
   const [fCliente, setFCliente] = useState("");
   const [fDepartament, setFDepartament] = useState("");
+  const [fEstats, setFEstats] = useState([]);
+  const [estatsAbiertos, setEstatsAbiertos] = useState(false);
+  const cajaEstats = useRef(null);
+  const [fCorreo, setFCorreo] = useState("");
+  const [seg, setSeg] = useState({ notas: {}, enviados: {} });
+  const [notasAbiertas, setNotasAbiertas] = useState(() => new Set());
+  const [buscandoCorreos, setBuscandoCorreos] = useState(false);
+  const [estadoCorreo, setEstadoCorreo] = useState("");
+  const [avisoEnvio, setAvisoEnvio] = useState(null);
+  const buscandoRef = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -2327,6 +2814,15 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
     })();
   }, []);
 
+  useEffect(() => {
+    if (!estatsAbiertos) return;
+    const cerrar = (ev) => {
+      if (cajaEstats.current && !cajaEstats.current.contains(ev.target)) setEstatsAbiertos(false);
+    };
+    document.addEventListener("mousedown", cerrar);
+    return () => document.removeEventListener("mousedown", cerrar);
+  }, [estatsAbiertos]);
+
   const pendientes = useMemo(() => {
     if (!fichas) return [];
     const qC = fCliente.trim().toLowerCase();
@@ -2336,12 +2832,13 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
       .filter(({ f }) => !(f.general.cliente || "").toUpperCase().includes("TALLER"));
     if (qC) arr = arr.filter(({ f }) => (f.general.cliente || "").toLowerCase().includes(qC));
     if (fDepartament) arr = arr.filter(({ f }) => f.general.departamento === fDepartament);
+    if (fEstats.length) arr = arr.filter(({ f }) => fEstats.includes(f.general.estadoApp));
     arr.sort((a, b) => b.gasto - a.gasto);
     // El análisis Ingresos/Resultado solo se calcula para las filas
     // visibles tras filtrar (más caro: recorre historial de compra por
     // artículo de taller), no para las 11k+ fichas antes de filtrar.
     return arr.map(({ f, gasto }) => ({ f, gasto, ...analisisResultadoFicha(f, fichas) }));
-  }, [fichas, fCliente, fDepartament]);
+  }, [fichas, fCliente, fDepartament, fEstats]);
 
   const departaments = useMemo(() => {
     if (!fichas) return [];
@@ -2350,17 +2847,141 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
     return [...dep].sort();
   }, [fichas]);
 
-  const totalPendiente = pendientes.reduce((acc, { gasto }) => acc + gasto, 0);
+  const estats = useMemo(() => {
+    if (!fichas) return [];
+    const s = new Set();
+    for (const f of fichas.values()) {
+      if (!f.general.estadoApp || ESTADOS_EXCLUIDOS_PENDIENTES.includes(f.general.estadoApp)) continue;
+      if ((f.general.cliente || "").toUpperCase().includes("TALLER")) continue;
+      if (gastoAsociadoDeFicha(f) <= 0.01) continue;
+      s.add(f.general.estadoApp);
+    }
+    return [...s].sort();
+  }, [fichas]);
+
+  const indicePedidos = useMemo(
+    () => indicePedidosPorOT(pedidosVenta, lineasPedidoVenta),
+    [pedidosVenta, lineasPedidoVenta]
+  );
+
+  const visibles = useMemo(() => {
+    if (fCorreo === "si") return pendientes.filter(({ f }) => seg.enviados[f.numeroOT]);
+    if (fCorreo === "no") return pendientes.filter(({ f }) => !seg.enviados[f.numeroOT]);
+    return pendientes;
+  }, [pendientes, fCorreo, seg.enviados]);
+
+  const totalVisible = visibles.reduce((acc, { gasto }) => acc + gasto, 0);
+
+  useEffect(() => {
+    fetch("/api/pedidos-venta/seguimiento")
+      .then((r) => r.json())
+      .then((d) => setSeg({ notas: d.notas || {}, enviados: d.enviados || {} }))
+      .catch(() => {});
+  }, []);
+
+  const pendientesRef = useRef(pendientes);
+  pendientesRef.current = pendientes;
+
+  const buscarCorreos = async ({ silencioso = false } = {}) => {
+    if (buscandoRef.current) return;
+    const ots = pendientesRef.current.map(({ f }) => aliasCorreoOT(f)).filter((o) => o.clave && o.patrones.length);
+    if (!ots.length) {
+      if (!silencioso) setAvisoEnvio("No hay OTs en pantalla para buscar en el correo.");
+      return;
+    }
+    buscandoRef.current = true;
+    setBuscandoCorreos(true);
+    try {
+      const r = await fetch("/api/pedidos-venta/correos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ots, dias: 60 }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.detalle || j.error || `Error ${r.status}`);
+      setSeg((prev) => ({ ...prev, notas: j.notas || prev.notas }));
+      setEstadoCorreo(`Correo revisado a las ${new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}${j.añadidas ? ` · ${j.añadidas} nuevo(s)` : ""}`);
+      if (j.añadidas || !silencioso) {
+        setAvisoEnvio(j.añadidas
+          ? `📧 ${j.añadidas} correo(s) añadidos a las notas de ${(j.ots || []).length} OT(s)`
+          : `📧 Revisados ${j.leidos} correos de los últimos 60 días: no hay correos nuevos de estas OT.`);
+      }
+    } catch (e) {
+      setEstadoCorreo("✗ Error revisando el correo");
+      setAvisoEnvio(`✗ Correo: ${e.message || e}`);
+    }
+    buscandoRef.current = false;
+    setBuscandoCorreos(false);
+  };
+
+  const buscarRef = useRef(buscarCorreos);
+  buscarRef.current = buscarCorreos;
+  const hayOTs = pendientes.length > 0;
+  useEffect(() => {
+    if (!hayOTs) return;
+    const t0 = setTimeout(() => buscarRef.current({ silencioso: true }), 1500);
+    const t = setInterval(() => buscarRef.current({ silencioso: true }), 10 * 60 * 1000);
+    return () => { clearTimeout(t0); clearInterval(t); };
+  }, [hayOTs]);
+
+  const onCambioNotas = (ot, lista) => setSeg((prev) => {
+    const notas = { ...(prev.notas || {}) };
+    if (lista.length) notas[ot] = lista;
+    else delete notas[ot];
+    return { ...prev, notas };
+  });
+
+  const registrarEnvio = async (ot, para) => {
+    const textoPara = Array.isArray(para) ? para.join("; ") : String(para || "");
+    try {
+      const r = await fetch("/api/pedidos-venta/enviado", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ot, para: textoPara }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
+      setSeg((prev) => ({ ...prev, enviados: { ...prev.enviados, [ot]: j.enviado } }));
+      setAvisoEnvio(`✓ Correo enviado${textoPara ? ` a ${textoPara}` : ""}`);
+      setTimeout(() => buscarRef.current({ silencioso: true }), 30000);
+    } catch (e) {
+      setAvisoEnvio(`✗ No se pudo registrar el correo: ${e.message || e}`);
+    }
+  };
+
+  const toggleNotas = (ot) => setNotasAbiertas((prev) => {
+    const n = new Set(prev);
+    if (n.has(ot)) n.delete(ot);
+    else n.add(ot);
+    return n;
+  });
 
   if (cargando) return <div className="text-sm text-slate-500 p-4">Cargando memoria histórica…</div>;
   if (error) return <div className="text-sm text-amber-700 bg-amber-50 border border-amber-300 rounded-lg p-3">{error}</div>;
 
   return (
     <div>
-      <h1 className="text-xl font-bold text-slate-800 mb-1">Pedidos de venta pendientes de facturar</h1>
-      <p className="text-sm text-slate-500 mb-4">
-        OTs con Gasto asociado (materiales + mano de obra a coste) por encima de 0,01 € y cuyo Estat App no sea <strong>FACTURAT</strong>, <strong>ARCHIVADA</strong> ni <strong>GARANTIA</strong>.
-      </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-bold text-slate-800 mb-1">Pedidos de venta pendientes de facturar</h1>
+          <p className="text-sm text-slate-500 mb-4">
+            OTs con Gasto asociado (materiales + mano de obra a coste) por encima de 0,01 € y cuyo Estat App no sea <strong>FACTURAT</strong>, <strong>ARCHIVADA</strong> ni <strong>GARANTIA</strong>.
+            Debajo de cada OT está la lista de pedidos de venta. Al pulsar un pedido se abren sus líneas.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => buscarCorreos()}
+            disabled={buscandoCorreos}
+            title="Busca en tu correo (recibidos y enviados, últimos 60 días) los mensajes que mencionan una OT y los añade a sus notas"
+            className="flex items-center gap-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 disabled:opacity-60 rounded-md px-3 py-2"
+          >
+            {buscandoCorreos ? "Buscando correos…" : "📧 Buscar correos"}
+          </button>
+          {estadoCorreo && <span className={`text-[11px] max-w-[140px] ${estadoCorreo.startsWith("✗") ? "text-red-600" : "text-slate-400"}`}>{estadoCorreo}</span>}
+        </div>
+      </div>
 
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <input
@@ -2379,16 +3000,48 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
             <option key={d} value={d}>{d}</option>
           ))}
         </select>
-        {(fCliente || fDepartament) && (
+        <div className="relative" ref={cajaEstats}>
           <button
-            onClick={() => { setFCliente(""); setFDepartament(""); }}
+            type="button"
+            onClick={() => setEstatsAbiertos((v) => !v)}
+            className="border border-slate-300 rounded-md px-2 py-1.5 text-sm bg-white min-w-[150px] text-left"
+          >
+            {fEstats.length === 0 ? "Estat App..." : fEstats.length === 1 ? fEstats[0] : `${fEstats.length} estados`}
+          </button>
+          {estatsAbiertos && (
+            <div className="absolute z-20 mt-1 w-56 max-h-64 overflow-auto bg-white border border-slate-300 rounded-md shadow-lg py-1">
+              {estats.map((estado) => (
+                <label key={estado} className="flex items-center gap-2 px-2 py-1 hover:bg-slate-50 cursor-pointer text-sm">
+                  <input
+                    type="checkbox"
+                    checked={fEstats.includes(estado)}
+                    onChange={() => setFEstats((prev) => prev.includes(estado) ? prev.filter((x) => x !== estado) : [...prev, estado])}
+                  />
+                  {estado}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+        <select
+          value={fCorreo}
+          onChange={(e) => setFCorreo(e.target.value)}
+          className="border border-slate-300 rounded-md px-2 py-1.5 text-sm bg-white"
+        >
+          <option value="">Correo</option>
+          <option value="si">Con correo enviado</option>
+          <option value="no">Sin correo</option>
+        </select>
+        {(fCliente || fDepartament || fEstats.length > 0 || fCorreo) && (
+          <button
+            onClick={() => { setFCliente(""); setFDepartament(""); setFEstats([]); setFCorreo(""); setEstatsAbiertos(false); }}
             className="text-sm text-slate-500 border border-slate-300 rounded-md px-3 py-1.5 bg-white hover:bg-slate-50"
           >
             Restablir
           </button>
         )}
         <span className="ml-auto text-sm text-slate-600">
-          {pendientes.length.toLocaleString()} OT(s) · <strong>{eur(totalPendiente)}</strong> pendientes de facturar
+          {visibles.length.toLocaleString()} OT(s) · <strong>{eur(totalVisible)}</strong> pendientes de facturar
         </span>
       </div>
 
@@ -2404,51 +3057,83 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
               <th className="px-2 py-2 font-semibold text-right" title="Materiales (compras PC) + mano de obra a coste 21,50 €/h">Gasto asociado</th>
               <th className="px-2 py-2 font-semibold text-right" title="Suma de la cuenta contable 70000000 (Ventas) para esta OT, según Movs. Contabilidad (detalle OT)">Ingresos</th>
               <th className="px-2 py-2 font-semibold text-right" title="Resultado = margen bruto − estructura (22% de la venta), igual que en el detalle de la OT">Margen</th>
+              <th className="px-2 py-2 font-semibold text-center">Notas</th>
+              <th className="px-2 py-2 font-semibold text-center" title="Correos enviados desde la app">Correo</th>
               <th className="px-2 py-2 font-semibold text-center">✉</th>
             </tr>
           </thead>
           <tbody>
-            {pendientes.length === 0 && (
+            {visibles.length === 0 && (
               <tr>
-                <td colSpan={9} className="px-3 py-6 text-center text-slate-400">
+                <td colSpan={11} className="px-3 py-6 text-center text-slate-400">
                   No hay OTs pendientes de facturar con estos filtros.
                 </td>
               </tr>
             )}
-            {pendientes.map(({ f, gasto, ingresos, resultado, pct }) => (
-              <tr key={f.numeroOT} className="border-t border-slate-100 hover:bg-purple-50/50">
-                <td className="px-3 py-1.5 font-bold text-slate-800 whitespace-nowrap">{f.numeroOTOrigenes?.listado || f.numeroOT}</td>
-                <td className="px-2 py-1.5 whitespace-nowrap">
-                  {f.general.estadoApp && (
-                    <span className={`text-[10px] font-bold rounded border px-1.5 py-0.5 ${COLOR_ESTADO_APP[f.general.estadoApp] || "bg-slate-50 text-slate-600 border-slate-200"}`}>
-                      {f.general.estadoApp}
-                    </span>
-                  )}
-                </td>
-                <td className="px-2 py-1.5 text-slate-600 max-w-[200px] truncate">{f.general.cliente}</td>
-                <td className="px-2 py-1.5 text-slate-700 max-w-lg truncate" title={f.general.descripcion}>{f.general.descripcion || "—"}</td>
-                <td className="px-2 py-1.5 whitespace-nowrap">
-                  {f.general.segmento && <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5">{f.general.segmento}</span>}
-                </td>
-                <td className="px-2 py-1.5 text-right whitespace-nowrap font-semibold text-slate-700">{eur(gasto)}</td>
-                <td className="px-2 py-1.5 text-right whitespace-nowrap text-blue-700">{eur(ingresos)}</td>
-                <td className={`px-2 py-1.5 text-right whitespace-nowrap font-semibold ${resultado < 0 ? "text-red-600" : "text-emerald-600"}`}>
-                  {eur(resultado)}{pct != null && <span className="text-[10px] font-normal ml-1">({pct}%)</span>}
-                </td>
-                <td className="px-2 py-1.5 text-center">
-                  <a
-                    href={mailtoFacturacion(f)}
-                    title={`Preguntar al responsable (${departamentoDeFicha(f) || "sin dpto. — Edith"}) si se puede facturar esta OT`}
-                    className="inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"
-                  >
-                    <Mail size={14} />
-                  </a>
-                </td>
-              </tr>
-            ))}
+            {visibles.map(({ f, gasto, ingresos, resultado, pct }) => {
+              const pedidos = pedidosDeFicha(f, indicePedidos);
+              const notasP = seg.notas[f.numeroOT] || [];
+              const ultNota = notasP[notasP.length - 1];
+              const rc = seg.enviados[f.numeroOT];
+              const notasAbierta = notasAbiertas.has(f.numeroOT);
+              return (
+                <React.Fragment key={f.numeroOT}>
+                  <tr className="border-t border-slate-200 hover:bg-purple-50/50">
+                    <td className="px-3 py-1.5 font-bold text-slate-800 whitespace-nowrap">{f.numeroOTOrigenes?.listado || f.numeroOT}</td>
+                    <td className="px-2 py-1.5 whitespace-nowrap">
+                      {f.general.estadoApp && (
+                        <span className={`text-[10px] font-bold rounded border px-1.5 py-0.5 ${COLOR_ESTADO_APP[f.general.estadoApp] || "bg-slate-50 text-slate-600 border-slate-200"}`}>
+                          {f.general.estadoApp}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-slate-600 max-w-[200px] truncate">{f.general.cliente}</td>
+                    <td className="px-2 py-1.5 text-slate-700 max-w-lg truncate" title={f.general.descripcion}>{f.general.descripcion || "—"}</td>
+                    <td className="px-2 py-1.5 whitespace-nowrap">
+                      {f.general.segmento && <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5">{f.general.segmento}</span>}
+                    </td>
+                    <td className="px-2 py-1.5 text-right whitespace-nowrap font-semibold text-slate-700">{eur(gasto)}</td>
+                    <td className="px-2 py-1.5 text-right whitespace-nowrap text-blue-700">{eur(ingresos)}</td>
+                    <td className={`px-2 py-1.5 text-right whitespace-nowrap font-semibold ${resultado < 0 ? "text-red-600" : "text-emerald-600"}`}>
+                      {eur(resultado)}{pct != null && <span className="text-[10px] font-normal ml-1">({pct}%)</span>}
+                    </td>
+                    <td className="px-2 py-1.5 text-center">
+                      <button
+                        type="button"
+                        onClick={() => toggleNotas(f.numeroOT)}
+                        className={`inline-flex items-center gap-0.5 text-[10px] ${notasP.length ? "text-amber-700 font-semibold" : "text-slate-300 hover:text-amber-600"}`}
+                        title={ultNota ? `${ultNota.autor} · ${selloSeguimiento(ultNota.ts)}\n${ultNota.texto}` : "Añadir nota interna"}
+                      >
+                        <StickyNote size={14} />{notasP.length || ""}
+                      </button>
+                    </td>
+                    <td className="px-2 py-1.5 whitespace-nowrap text-[10px] text-blue-700" title={rc ? `Enviado a ${rc.para || ""}` : ""}>
+                      {rc ? `✉ ${rc.veces || 1}× · ${selloSeguimiento(rc.ts)}` : ""}
+                    </td>
+                    <td className="px-2 py-1.5 text-center">
+                      <BotonCorreoFacturacion ficha={f} onRegistrado={(info) => registrarEnvio(f.numeroOT, info?.para)} />
+                    </td>
+                  </tr>
+                  <tr className="bg-slate-50/80">
+                    <td colSpan={11} className="px-3 pt-0 pb-2">
+                      <ListaPedidosOT pedidos={pedidos} />
+                      {notasAbierta && (
+                        <NotasOT ot={f.numeroOT} notas={notasP} onCambio={onCambioNotas} />
+                      )}
+                    </td>
+                  </tr>
+                </React.Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>
+      {avisoEnvio && (
+        <div className="fixed bottom-4 right-4 z-40 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm rounded-lg shadow px-4 py-2 flex items-center gap-3 max-w-md">
+          {avisoEnvio}
+          <button type="button" onClick={() => setAvisoEnvio(null)} className="text-emerald-500 hover:text-emerald-700">✕</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -2625,13 +3310,7 @@ function PantallaOTs({ incrustada = false }) {
                         })()}
                       </td>
                       <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}>
-                        <a
-                          href={mailtoFacturacion(f)}
-                          title={`Preguntar al responsable (${departamentoDeFicha(f) || "sin dpto. — Edith"}) si se puede facturar esta OT`}
-                          className="inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"
-                        >
-                          <Mail size={14} />
-                        </a>
+                        <BotonCorreoFacturacion ficha={f} />
                       </td>
                       <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}>
                         <button
@@ -4800,6 +5479,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
 
   const [seccion, setSeccion] = useState("cargar"); // cargar | memoria | explorador | recepcion
   const [actualizandoRecep, setActualizandoRecep] = useState(false);
+  const [actualizandoFacVenta, setActualizandoFacVenta] = useState(false);
   const [tareaPendiente, setTareaPendiente] = useState(null); // tarea creada desde Correo
 
   // El Correo llama a esto para crear una tarea; cambia a la pantalla Tareas.
@@ -4830,6 +5510,36 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
       }
     } finally {
       setActualizandoRecep(false);
+    }
+  };
+
+  // Añade las facturas de venta del rango a las ya cargadas (por id o número).
+  const actualizarFacturasVenta = async (desde, hasta) => {
+    setActualizandoFacVenta(true);
+    try {
+      const res = await fetchFromBC("facturas_venta", desde, hasta);
+      if (!res.error && res.data) {
+        setData((prev) => {
+          const previas = prev.facturas_venta?.rows || [];
+          const porClave = new Map();
+          for (const r of previas) porClave.set(String(r.id || r.number || ""), r);
+          for (const r of res.data) porClave.set(String(r.id || r.number || ""), r);
+          const rows = [...porClave.values()].filter((r) => r.id || r.number);
+          const next = {
+            ...prev,
+            facturas_venta: {
+              cached: [{ from: desde, to: hasta }],
+              totalRows: rows.length,
+              rows,
+            },
+          };
+          persistirBcData(next);
+          return next;
+        });
+      }
+      return res;
+    } finally {
+      setActualizandoFacVenta(false);
     }
   };
 
@@ -4889,6 +5599,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
             {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
             {navItem("precios", "Precios de artículos", Tag)}
             {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
+            {navItem("facturasventa", "Facturas de venta", FileText)}
             {navItem("correo", "Correo", Mail)}
             {navItem("tareas", "Mis tareas", CheckSquare)}
             {navItem("ia", "Asistente IA", Bot)}
@@ -4938,6 +5649,13 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
             />
           ) : seccion === "pedidosventa" ? (
             <PedidosVentaPendientes pedidosVenta={data["pedidos_venta"]?.rows || []} lineasPedidoVenta={data["lineas_pedido_venta"]?.rows || []} />
+          ) : seccion === "facturasventa" ? (
+            <FacturasVenta
+              facturas={data["facturas_venta"]?.rows || []}
+              lineas={data["lineas_venta_reg"]?.rows || []}
+              onActualizar={actualizarFacturasVenta}
+              actualizando={actualizandoFacVenta}
+            />
           ) : seccion === "correo" ? (
             <Correo onCrearTarea={crearTareaDesdeCorreo} usuario={usuario} />
           ) : seccion === "tareas" ? (

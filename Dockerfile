@@ -10,13 +10,15 @@ RUN npm run build
 FROM node:22-alpine
 ENV NODE_ENV=production
 WORKDIR /app
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont
+ENV CHROMIUM_PATH=/usr/bin/chromium
 COPY server/package.json server/package-lock.json* ./
 RUN npm install --omit=dev
 COPY server/server.cjs server/db.js server/schema.sql \
      server/auth.js server/erp-auth.js server/erp-db.js server/constellation.js \
      server/achuman-client.js \
      server/iaBC.cjs server/contabilidad.cjs server/macro.cjs \
-     server/correoPC.cjs server/horas.cjs \
+     server/correoPC.cjs server/horas.cjs server/pedidosVentaSeguimiento.cjs \
      server/mapeoArticulos.cjs ./
 COPY data/mapeo_reemplazo_items.csv ./data/mapeo_reemplazo_items.csv
 COPY --from=web /web/dist ./public
