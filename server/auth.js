@@ -23,22 +23,11 @@ const SECRET = process.env.JWT_SECRET || "clau-nomes-per-desenvolupament";
 const COOKIE = "sesion";
 const DIAS_SESION = 30;
 const EMPRESA_DEFECTE = String(process.env.ERP_EMPRESA_DEFECTE || "0001").trim();
-const SUPER_USERNAME = String(
-  process.env.SUPER_USERNAME || process.env.ADMIN_USER || "Ramon"
-).trim().toLowerCase();
 
 const accesCache = new Map();
 const ACCES_CACHE_MS = 60_000;
 const emailCache = new Map();
 const EMAIL_CACHE_MS = 10 * 60_000;
-
-async function asegurarAdmin(u) {
-  if (!u) return u;
-  if (String(u.username || "").trim().toLowerCase() !== SUPER_USERNAME) return u;
-  if (u.rol === "admin") return u;
-  await pool.query("UPDATE usuarios SET rol = $1 WHERE id = $2", ["admin", u.id]);
-  return { ...u, rol: "admin" };
-}
 
 function crearToken(usuario) {
   return jwt.sign({ id: usuario.id }, SECRET, { expiresIn: `${DIAS_SESION}d` });
@@ -282,7 +271,7 @@ router.post("/login", async (req, res) => {
               error: "Usuario desactivado en ACsales. Contacta con un administrador.",
             });
           }
-          let local = await asegurarAdmin(local0);
+          let local = local0;
           if (!(await exigirAccesPortal(local.username, res))) return;
           local = await enriquecerUsuario(local);
           ponerCookie(res, crearToken(local));
@@ -302,7 +291,7 @@ router.post("/login", async (req, res) => {
     const u = rows[0];
     const ok = u && (await bcrypt.compare(password, u.password_hash));
     if (!ok) return res.status(401).json({ error: "Usuario o contraseña incorrectos" });
-    let uu = await asegurarAdmin(u);
+    let uu = u;
     const clauPortal = uu.username || uu.email;
     if (!(await exigirAccesPortal(clauPortal, res))) return;
     uu = await enriquecerUsuario(uu);
@@ -340,7 +329,7 @@ async function manejarSso(req, res) {
       }
       return res.status(403).json({ error: "Usuario desactivado en esta aplicación." });
     }
-    let local = await asegurarAdmin(local0);
+    let local = local0;
     local = await enriquecerUsuario(local);
     ponerCookie(res, crearToken(local));
     if (req.method === "GET") {
