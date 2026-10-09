@@ -165,11 +165,57 @@ function rolDesDeNivell(nivell) {
   return "usuari";
 }
 
+/** Login degradado: valida contra el espejo del portal (ERP caído). */
+async function validarCredencial({ username, password, empresa }) {
+  if (!configurat()) {
+    return { ok: false, status: 503, error: "Portal no configurado" };
+  }
+  try {
+    const { ok, status, cos } = await crida("/api/intern/validar-credencial", {
+      method: "POST",
+      body: {
+        username,
+        password,
+        empresa: empresa || "0001",
+        app: APP_CLAU,
+      },
+    });
+    if (!ok) {
+      return {
+        ok: false,
+        status,
+        error: cos.error || "Usuario o contraseña incorrectos",
+        cos,
+      };
+    }
+    return {
+      ok: true,
+      modo_degradado: true,
+      acces: !!cos.acces && !!cos.actiu,
+      nivell: cos.nivell || "cap",
+      rol: cos.rol || null,
+      portal_super: !!cos.portal_super,
+      permisos: cos.permisos || null,
+      accions: cos.accions || null,
+      trobat: !!cos.trobat,
+      actiu: !!cos.actiu,
+      usuari: cos.usuari || null,
+      treballador: cos.treballador || cos.usuari?.treballador || null,
+      nombre: cos.nombre || null,
+      empresa: cos.empresa || null,
+    };
+  } catch (e) {
+    console.error("Error validarCredencial portal:", e.message);
+    return { ok: false, status: 503, error: "No se ha podido validar con el portal" };
+  }
+}
+
 module.exports = {
   APP_CLAU,
   configurat,
   consultarAcces,
   consumirTicket,
+  validarCredencial,
   rolDesDeNivell,
   candidatsUsername,
 };

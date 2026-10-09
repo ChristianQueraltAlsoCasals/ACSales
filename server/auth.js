@@ -3,7 +3,7 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const { pool, sembrarUsuario } = require("./db");
-const { erpConfigurado } = require("./erp-db");
+const { erpConfigurado, esErrorConectividadErp, resetPool } = require("./erp-db");
 const {
   verificarPasswordAcapp,
   buscarUsuarioErp,
@@ -14,6 +14,7 @@ const {
   configurat: constellationConfigurat,
   consultarAcces,
   consumirTicket,
+  validarCredencial,
   rolDesDeNivell,
 } = require("./constellation");
 const { resolverEmailEnvio } = require("./achuman-client");
@@ -261,6 +262,7 @@ router.post("/login", async (req, res) => {
     return res.status(400).json({ error: "Falta el usuario o la contraseña" });
   }
   try {
+    let erpCaido = !erpConfigurado();
     if (erpConfigurado()) {
       try {
         const erpUser = await buscarUsuarioErp(login, empresa);
@@ -277,8 +279,38 @@ router.post("/login", async (req, res) => {
           ponerCookie(res, crearToken(local));
           return res.json(datosPublicos(local));
         }
+        // ERP ha respondido: no usar cache si la pass no coincide
       } catch (e) {
         console.error("Error consultando el ERP en el login:", e.message);
+        if (esErrorConectividadErp(e)) resetPool();
+        erpCaido = true;
+      }
+    }
+
+    if (erpCaido && constellationConfigurat()) {
+      const portalCache = await validarCredencial({
+        username: login,
+        password,
+        empresa,
+      });
+      if (portalCache.ok && portalCache.acces && portalCache.usuari) {
+        const local0 = await asegurarDesdePortal(portalCache.usuari, portalCache.nivell);
+        if (!local0) {
+          return res.status(500).json({ error: "No se ha podido crear la sesión" });
+        }
+        if (local0.bloqueado) {
+          return res.status(403).json({
+            error: "Usuario desactivado en ACsales. Contacta con un administrador.",
+          });
+        }
+        let local = await enriquecerUsuario(local0);
+        ponerCookie(res, crearToken(local));
+        return res.json({ ...datosPublicos(local), modo_degradado: true, erp_disponible: false });
+      }
+      if (portalCache.ok && !portalCache.acces) {
+        return res.status(403).json({
+          error: "No tienes acceso a ACsales. Pide acceso en ACconstelation.",
+        });
       }
     }
 

@@ -2783,7 +2783,7 @@ PR000000547065,PR000001595161,Terminal bimetálico KTBIM 16,OK,2026-09-29T01:35:
 PR000000547110,PR000001595162,"Inversor SAI Schneider Electric Easy UPS BVS, 800 VA, 230V ac, 4 salidas",OK,2026-09-29T01:35:27,
 PR000000547119,PR000001595163,Puntera doble preaislado AI 2x4/12 twin gris,OK,2026-09-29T01:35:34,
 PR000000547182,PR000001595164,Capuchón conexión B60 5P,OK,2026-09-29T01:35:41,
-PR000000547211,,Maletín herramientas Troley XH 142PZ Xhander,FAIL_CREATE,2026-10-01T10:24:02,"POST item falló 400: {""error"":{""code"":""Application_FieldValidationException"",""message"":""Type must be equal to 'Inventory'  in Item: No.=PR000001596545. Current value is 'Service'.  CorrelationId:  d35923c4-4917-412d-88d5-9a618c2da32b."",""target"":""inventoryPostingGroupCode""}}"
+PR000000547211,,Maletín herramientas Troley XH 142PZ Xhander,SKIP,2026-10-01T10:24:02,"POST item falló 400: {""error"":{""code"":""Application_FieldValidationException"",""message"":""Type must be equal to 'Inventory'  in Item: No.=PR000001596545. Current value is 'Service'.  CorrelationId:  d35923c4-4917-412d-88d5-9a618c2da32b."",""target"":""inventoryPostingGroupCode""}}"
 PR000000547264,PR000001595165,Fusible NH-00 gG 160A 500V con indicador superior,OK,2026-09-29T01:35:49,
 PR000000547321,PR000001595166,Base portafusible PMX-14 3 módulos 2P 14x51 con indicador,OK,2026-09-29T01:35:56,
 PR000000547402,PR000001595167,Transformador monofásico TR24 2500VA 230-400V,OK,2026-09-29T01:36:03,
