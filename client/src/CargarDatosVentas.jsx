@@ -26,6 +26,7 @@ import {
   ShoppingCart,
   CheckSquare,
   Bot,
+  Minimize2,
   BarChart3,
   Timer,
   Paperclip,
@@ -1711,11 +1712,12 @@ function destinatariosRevisio(f) {
   return { para, asunto, num };
 }
 
-/** Versió VISUAL del correu (taula amb colors, com la maqueta de Maria).
- *  Es copia al porta-retalls en format HTML perquè es pugui enganxar
- *  (Ctrl+V) al cos del correu d'Outlook conservant el format. Tot amb
- *  estils inline perquè els clients de correu els respectin. */
-function construirHtmlRevisio(f, dif) {
+/** Versió VISUAL de la revisió de material (taula amb colors).
+ *  Va dins del correu que envia l'app (sobre / «Revisió material»), amb
+ *  estils inline perquè Outlook els respecti. soloRevision = només el
+ *  bloc de la taula, per afegir-lo al text del correu sense repetir
+ *  la salutació. */
+function construirHtmlRevisio(f, dif, { soloRevision = false } = {}) {
   const { num } = destinatariosRevisio(f);
   const cliente = f.general.cliente || "";
   const descripcion = f.general.descripcion || "";
@@ -1757,11 +1759,7 @@ function construirHtmlRevisio(f, dif) {
       <div style="font-size:11px;color:#475467;margin-top:4px;">${extra}</div>
     </td></tr></table></td>`;
 
-  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;max-width:1100px;">
-    <p style="font-size:14px;">Bon dia,</p>
-    <p style="font-size:14px;">Ens podríeu confirmar si podem procedir a la facturació de la següent ordre de treball o, en cas contrari, indicar-nos quina previsió hi ha per finalitzar els treballs pendents?</p>
-    <p style="font-size:14px;margin:0 0 14px 0;">Client: <b>${E(cliente)}</b><br/>Núm. OT: <b>${num}</b><br/>Descripció: <b>${E(descripcion)}</b></p>
-    <h2 style="font-size:20px;margin:0 0 2px 0;color:#0f2740;">Revisió de material – OT ${num}</h2>
+  const bloque = `<h2 style="font-size:20px;margin:18px 0 2px 0;color:#0f2740;">Revisió de material – OT ${num}</h2>
     <p style="font-size:13px;color:#6b7280;margin:0 0 12px 0;">Resum de diferències entre comprat i venut · Data revisió: ${hoy}</p>
     <table cellpadding="0" cellspacing="0" style="width:100%;margin-bottom:14px;"><tr>
       ${dif.costeNoFacturado > 0 ? tarjeta("#b42318", "#fff1f2", "#fecdca", "FALTA COBRAR", "Comprat sense facturar", eurTxt(dif.costeNoFacturado), `${dif.nFaltaCobrar} article/s — revisar si s'ha de cobrar al client`) : ""}
@@ -1774,9 +1772,70 @@ function construirHtmlRevisio(f, dif) {
       </tr></thead>
       <tbody>${filas}</tbody>
     </table>
-    <p style="font-size:13px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-top:12px;color:#475467;"><b style="color:#111827;">Indicacions per als encarregats:</b> si us plau, reviseu les línies marcades com a <b>FALTA COBRAR</b> i <b>SIN COSTE</b> i indiqueu la vostra resposta per poder tancar correctament la facturació.</p>
+    <p style="font-size:13px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-top:12px;color:#475467;"><b style="color:#111827;">Indicacions per als encarregats:</b> si us plau, reviseu les línies marcades com a <b>FALTA COBRAR</b> i <b>SIN COSTE</b> i indiqueu la vostra resposta per poder tancar correctament la facturació.</p>`;
+
+  if (soloRevision) {
+    return `<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;max-width:1100px;">${bloque}</div>`;
+  }
+
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;max-width:1100px;">
+    <p style="font-size:14px;">Bon dia,</p>
+    <p style="font-size:14px;">Ens podríeu confirmar si podem procedir a la facturació de la següent ordre de treball o, en cas contrari, indicar-nos quina previsió hi ha per finalitzar els treballs pendents?</p>
+    <p style="font-size:14px;margin:0 0 14px 0;">Client: <b>${E(cliente)}</b><br/>Núm. OT: <b>${num}</b><br/>Descripció: <b>${E(descripcion)}</b></p>
+    ${bloque}
     <p style="font-size:14px;">Quedem pendents de la vostra confirmació per poder gestionar-ne la facturació.<br/>Gràcies.</p>
   </div>`;
+}
+
+/** Diferències comprat ↔ venut a partir de la memòria de la fitxa
+ *  (el mateix càlcul que la pantalla de detall, sense línies BC en viu). */
+function difMaterialDeFicha(ficha) {
+  const ventaMaterial = ficha?.venta?.materiales?.lineas || [];
+  const vistas = new Set();
+  const compraReal = (ficha?.compra?.comprasReales?.lineas || []).filter((l) => {
+    const k = [l.numeroDocumento ?? l["Nº documento"], l.numero ?? l["Nº"], l.cantidad ?? l["Cantidad"], l.importe ?? l["Importe línea"]].join("|");
+    if (vistas.has(k)) return false;
+    vistas.add(k);
+    return true;
+  });
+  return compararMaterialOT(ventaMaterial, compraReal);
+}
+
+/** Text de la revisió (el que abans anava al porta-retalls) per enganxar-lo
+ *  DINS del missatge del correu, on es veu i s'edita. */
+function textoRevisionMaterial(dif) {
+  const items = dif?.items || [];
+  const grupos = [
+    ["falta_cobrar", `FALTA COBRAR — comprat sense facturar (${eur(dif?.costeNoFacturado)}):`, "Confirmar si s'ha de facturar al client."],
+    ["sin_coste", `SIN COSTE (magatzem/taller) — venut sense compra associada (${eur(dif?.ventaSinCoste)}):`, "Confirmar si s'ha agafat del taller o magatzem."],
+    ["cantidad_distinta", "CANTITATS DIFERENTS:", "Revisar les quantitats."],
+    ["codigo_distinto", "MATEIX ARTICLE, CODI DIFERENT?:", "Revisar les referències."],
+  ];
+  const bloques = [];
+  for (const [estado, titulo, accion] of grupos) {
+    const lineas = items.filter((it) => it.estado === estado);
+    if (!lineas.length) continue;
+    bloques.push(
+      titulo + "\n" +
+      lineas.map((it) =>
+        `  · ${it.codigo || "—"} · ${it.descripcion} · compra ${it.udsCompradas || 0} ud (${eur(it.costeCompra)}) · venda ${it.udsVendidas || 0} ud (${eur(it.importeVenta)}) → ${accion}`
+      ).join("\n")
+    );
+  }
+  if (!bloques.length) return "";
+  return "Revisió de material (comprat ↔ venut):\n\n" + bloques.join("\n\n");
+}
+
+function borradorConRevision(ficha, dif) {
+  const base = borradorCorreoFacturacion(ficha);
+  const extra = textoRevisionMaterial(dif);
+  if (!extra) return base;
+  const marca = "Quedem a l'espera";
+  const i = base.cuerpoTexto.indexOf(marca);
+  const cuerpoTexto = i === -1
+    ? `${base.cuerpoTexto}\n\n${extra}`
+    : `${base.cuerpoTexto.slice(0, i)}${extra}\n\n${base.cuerpoTexto.slice(i)}`;
+  return { ...base, cuerpoTexto };
 }
 
 /** Correu de REVISIÓ DE MATERIAL d'una OT (Diferències comprat ↔ venut):
@@ -1992,10 +2051,13 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
     setEnviando(true);
     setError(null);
     try {
-      const cuerpoHtml = cuerpo
+      const intro = cuerpo
         .split(/\r?\n/)
         .map((l) => (l ? l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "<br/>"))
         .join("<br/>");
+      const cuerpoHtml = borrador.htmlRevision
+        ? `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;">${intro}</div>${borrador.htmlRevision}`
+        : intro;
       const r = await fetch("/api/correo/enviar", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2020,7 +2082,7 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onCerrar}>
       <div
-        className="bg-white rounded-lg shadow-xl w-full max-w-xl max-h-[90vh] overflow-y-auto"
+        className={`bg-white rounded-lg shadow-xl w-full max-h-[90vh] overflow-y-auto ${borrador.htmlRevision ? "max-w-4xl" : "max-w-xl"}`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
@@ -2059,10 +2121,19 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
             <textarea
               value={cuerpo}
               onChange={(e) => setCuerpo(e.target.value)}
-              rows={10}
+              rows={borrador.htmlRevision ? 6 : 10}
               className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] font-sans focus:outline-none focus:ring-2 focus:ring-purple-400"
             />
           </label>
+          {borrador.htmlRevision && (
+            <div>
+              <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Revisión de material</span>
+              <div
+                className="mt-1 max-h-64 overflow-auto border border-slate-200 rounded-md p-2 bg-white"
+                dangerouslySetInnerHTML={{ __html: borrador.htmlRevision }}
+              />
+            </div>
+          )}
           {!sinAdjunto && (
           <div className="flex items-center gap-2 text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
             <FileText size={14} className="text-purple-600 flex-shrink-0" />
@@ -2098,12 +2169,16 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
   );
 }
 
-function BotonCorreoFacturacion({ ficha, onRegistrado }) {
+function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, className, title, children }) {
   const [abierto, setAbierto] = useState(false);
   const [enviado, setEnviado] = useState(false);
   const [adjunto, setAdjunto] = useState(null);
   const [estadoAdjunto, setEstadoAdjunto] = useState(null);
   const dep = departamentoDeFicha(ficha);
+  const diferencias = dif || difMaterialDeFicha(ficha);
+  const htmlRevision = (diferencias?.items || []).length
+    ? construirHtmlRevisio(ficha, diferencias, { soloRevision: true })
+    : null;
 
   const abrir = () => {
     setAbierto(true);
@@ -2119,17 +2194,17 @@ function BotonCorreoFacturacion({ ficha, onRegistrado }) {
       <button
         type="button"
         onClick={abrir}
-        title={`Enviar desde la app al responsable (${dep || "sin dpto. — Edith"}) el borrador de factura de esta OT`}
-        className="inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"
+        title={title || `Enviar desde la app al responsable (${dep || "sin dpto. — Edith"}) el borrador de factura y la revisión de material`}
+        className={className || "inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"}
       >
-        <Mail size={14} />
+        {children || <Mail size={14} />}
       </button>
       {enviado && <span className="text-[10px] font-semibold text-emerald-600">✓</span>}
       {abierto && (
         <ModalCorreoResponsableOT
           titulo="Confirmar facturación"
           estadoAdjunto={estadoAdjunto}
-          borrador={{ ...borradorCorreoFacturacion(ficha), adjunto }}
+          borrador={{ ...borradorConRevision(ficha, diferencias), adjunto, htmlRevision }}
           onCerrar={() => setAbierto(false)}
           onEnviado={(info) => { setAbierto(false); setEnviado(true); onRegistrado?.(info); }}
         />
@@ -2163,7 +2238,7 @@ async function adjuntoBorradorDeFicha(ficha) {
   return { nombre: out.nombre || `${nombre}.pdf`, base64: out.base64, mime: out.mime || "application/pdf" };
 }
 
-function ChatOT({ fichas }) {
+function ChatOT({ fichas, incrustado = false }) {
   const [abierto, setAbierto] = useState(true);
   const [mensajes, setMensajes] = useState([
     {
@@ -2331,15 +2406,31 @@ function ChatOT({ fichas }) {
     setOcupado(false);
   };
 
-  return (
-    <div className="mb-4 bg-white border border-purple-200 rounded-lg">
-      <button onClick={() => setAbierto((v) => !v)} className="w-full flex items-center justify-between px-3 py-2 text-sm font-semibold text-purple-800">
-        <span>🤖 Asistente IA de OTs</span>
-        <span className="text-[11px] text-slate-400">{abierto ? "ocultar ▲" : "mostrar ▼"}</span>
+  if (!incrustado && !abierto) {
+    return (
+      <button
+        type="button"
+        onClick={() => setAbierto(true)}
+        className="fixed top-14 right-4 z-50 flex items-center gap-2 rounded-full bg-purple-700 hover:bg-purple-800 text-white shadow-lg px-4 py-3"
+        title="Abrir el asistente de OTs"
+      >
+        <Bot size={18} /> <span className="text-sm font-medium">IA OTs</span>
       </button>
-      {abierto && (
-        <div className="px-3 pb-3">
-          <div className="max-h-72 overflow-y-auto space-y-2 mb-2 pr-1">
+    );
+  }
+
+  return (
+    <div className={incrustado ? "flex flex-col h-full min-h-0 bg-white" : "fixed top-14 right-4 z-50 w-[440px] max-w-[calc(100vw-2rem)] max-h-[calc(100vh-8rem)] h-[70vh] flex flex-col rounded-xl shadow-2xl border border-purple-200 bg-white"}>
+      {!incrustado && (
+      <div className="flex items-center gap-2 px-3 py-2 border-b bg-purple-700 text-white rounded-t-xl">
+        <span className="flex-1 text-sm font-semibold truncate">Asistente IA de OTs</span>
+        <button type="button" onClick={() => setAbierto(false)} title="Minimizar" className="p-1 hover:bg-white/10 rounded text-[11px] font-semibold">
+          Minimizar
+        </button>
+      </div>
+      )}
+      <div className="flex-1 flex flex-col min-h-0 px-3 py-2">
+          <div className="flex-1 overflow-y-auto space-y-2 mb-2 pr-1">
             {mensajes.map((m, i) => (
               <div key={i} className={`flex ${m.rol === "yo" ? "justify-end" : "justify-start"}`}>
                 <div className={`max-w-[85%] whitespace-pre-wrap text-[12px] rounded-lg px-3 py-2 ${m.rol === "yo" ? "bg-purple-600 text-white" : "bg-slate-100 text-slate-700"}`}>
@@ -2408,7 +2499,6 @@ function ChatOT({ fichas }) {
             </button>
           </div>
         </div>
-      )}
       {borradorCorreo && (
         <ModalCorreoResponsableOT
           borrador={borradorCorreo}
@@ -2419,6 +2509,43 @@ function ChatOT({ fichas }) {
           }}
         />
       )}
+    </div>
+  );
+}
+
+function AsistenteUnico({ seccion, fichas }) {
+  const [abierto, setAbierto] = useState(false);
+  const [modo, setModo] = useState("general");
+  if (!abierto && seccion === "ia") return null;
+  if (!abierto) {
+    return (
+      <button
+        type="button"
+        onClick={() => setAbierto(true)}
+        className={`fixed ${seccion === "recepcion" ? "bottom-20" : "bottom-5"} right-5 z-50 flex items-center gap-2 rounded-full bg-blue-700 hover:bg-blue-800 text-white shadow-lg px-4 py-3`}
+        title="Abrir el asistente"
+      >
+        <Bot size={20} /> <span className="text-sm font-medium">IA</span>
+      </button>
+    );
+  }
+  return (
+    <div className="fixed bottom-5 right-5 z-50 w-[440px] max-w-[calc(100vw-2rem)] h-[72vh] flex flex-col rounded-xl shadow-2xl border border-slate-200 bg-white">
+      <div className="flex items-center gap-2 px-3 py-2 border-b bg-blue-700 text-white rounded-t-xl">
+        <Bot size={18} />
+        <div className="flex rounded-md bg-blue-900/40 p-0.5 text-[12px]">
+          <button type="button" onClick={() => setModo("general")} className={`px-2.5 py-1 rounded ${modo === "general" ? "bg-white text-blue-800 font-semibold" : "text-white"}`}>Pantalla</button>
+          <button type="button" onClick={() => setModo("ots")} className={`px-2.5 py-1 rounded ${modo === "ots" ? "bg-white text-blue-800 font-semibold" : "text-white"}`}>OTs</button>
+        </div>
+        <span className="flex-1" />
+        <button type="button" onClick={() => setAbierto(false)} title="Minimizar" className="p-1 hover:bg-white/10 rounded"><Minimize2 size={16} /></button>
+      </div>
+      <div className={modo === "general" ? "flex-1 min-h-0 flex flex-col" : "hidden"}>
+        <IAFlotante seccion={seccion} incrustado />
+      </div>
+      <div className={modo === "ots" ? "flex-1 min-h-0 flex flex-col" : "hidden"}>
+        <ChatOT fichas={fichas} incrustado />
+      </div>
     </div>
   );
 }
@@ -3138,6 +3265,102 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
   );
 }
 
+const HEX_ESTADO_APP = {
+  FACTURAT: "#059669",
+  ENTREGAT: "#0d9488",
+  ACCEPTAT: "#0284c7",
+  PROCES: "#2563eb",
+  PENDENT: "#d97706",
+  GARANTIA: "#7c3aed",
+  ARCHIVADA: "#64748b",
+  "NO ACEPTAD": "#dc2626",
+};
+const PALETA_ESTADO = ["#d97706", "#2563eb", "#059669", "#7c3aed", "#0d9488", "#dc2626", "#64748b", "#0284c7", "#c026d3", "#ea580c", "#0891b2", "#4f46e5"];
+
+/** Año de la OT, el que va en el número (AC015138/2026 → 2026). */
+function anioDeOT(ficha) {
+  const no = ficha?.numeroOTOrigenes?.listadoOTs || ficha?.numeroOTOrigenes?.listado || ficha?.numeroOTOrigenes?.lineasVenta || ficha?.numeroOTOrigenes?.lineasCompra || "";
+  const m = String(no).match(/\/(\d{4})$/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/** El rango desde/hasta se compara con el año completo de la OT. */
+function otEnRangoFecha(ficha, desde, hasta) {
+  if (!desde && !hasta) return true;
+  const anio = anioDeOT(ficha);
+  if (!anio) return false;
+  const ini = `${anio}-01-01`;
+  const fin = `${anio}-12-31`;
+  if (desde && fin < desde) return false;
+  if (hasta && ini > hasta) return false;
+  return true;
+}
+
+/** OT con compra real: «no_anadido» si alguna línea comprada no está en la venta. */
+function claseMaterialComprado(ficha) {
+  const compradas = ficha?.compra?.comprasReales?.lineas || [];
+  if (!compradas.length) return "sin_compra";
+  const dif = compararMaterialOT(ficha?.venta?.materiales?.lineas || [], compradas);
+  return (dif.items || []).some((it) => it.estado === "falta_cobrar") ? "no_anadido" : "anadido";
+}
+
+function Quesito({ titulo, nota, partes }) {
+  const visibles = partes.filter((p) => p.valor > 0);
+  const total = visibles.reduce((s, p) => s + p.valor, 0);
+  const r = 36;
+  const circ = 2 * Math.PI * r;
+  let recorrido = 0;
+  const cortes = visibles.map((p) => {
+    const frac = total ? p.valor / total : 0;
+    const corte = { ...p, dash: frac * circ, hueco: circ - frac * circ, despl: -recorrido, pct: total ? Math.round((frac * 1000)) / 10 : 0 };
+    recorrido += frac * circ;
+    return corte;
+  });
+  return (
+    <div className="flex-1 min-w-[300px] bg-white border border-slate-200 rounded-lg p-3">
+      <div className="text-xs font-bold text-slate-800">{titulo}</div>
+      {nota && <div className="text-[11px] text-slate-500 mt-0.5 mb-2">{nota}</div>}
+      <div className="flex items-center gap-3">
+        <svg viewBox="0 0 100 100" className="w-32 h-32 shrink-0" role="img" aria-label={titulo}>
+          {total === 0 ? (
+            <circle cx="50" cy="50" r={r} fill="#e2e8f0" />
+          ) : cortes.length === 1 ? (
+            <circle cx="50" cy="50" r={r} fill="none" stroke={cortes[0].color} strokeWidth="22" />
+          ) : (
+            cortes.map((p) => (
+              <circle
+                key={p.etiqueta}
+                cx="50"
+                cy="50"
+                r={r}
+                fill="none"
+                stroke={p.color}
+                strokeWidth="22"
+                strokeDasharray={`${p.dash} ${p.hueco}`}
+                strokeDashoffset={p.despl}
+                transform="rotate(-90 50 50)"
+              />
+            ))
+          )}
+          <circle cx="50" cy="50" r="24" fill="white" />
+          <text x="50" y="48" textAnchor="middle" fontSize="12" fontWeight="700" fill="#1e293b">{total.toLocaleString("es-ES")}</text>
+          <text x="50" y="59" textAnchor="middle" fontSize="7" fill="#64748b">OTs</text>
+        </svg>
+        <ul className="text-[11px] space-y-1 min-w-0 flex-1 max-h-36 overflow-y-auto">
+          {cortes.map((p) => (
+            <li key={p.etiqueta} className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: p.color }} />
+              <span className="truncate text-slate-700" title={p.etiqueta}>{p.etiqueta}</span>
+              <span className="ml-auto pl-2 font-semibold text-slate-800 whitespace-nowrap">{p.valor.toLocaleString("es-ES")} · {String(p.pct).replace(".", ",")}%</span>
+            </li>
+          ))}
+          {total === 0 && <li className="text-slate-400">Sin datos con estos filtros</li>}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
 function PantallaOTs({ incrustada = false }) {
   const [fichas, setFichas] = useState(null);
   const [cargando, setCargando] = useState(true);
@@ -3150,6 +3373,8 @@ function PantallaOTs({ incrustada = false }) {
   const [fDepartament, setFDepartament] = useState("");
   const [fEstat, setFEstat] = useState("");
   const [fTipus, setFTipus] = useState("");
+  const [fDesde, setFDesde] = useState("");
+  const [fHasta, setFHasta] = useState("");
   const [pagina, setPagina] = useState(0);
   const POR_PAGINA = 100;
 
@@ -3192,9 +3417,59 @@ function PantallaOTs({ incrustada = false }) {
     if (fDepartament) arr = arr.filter((f) => f.general.departamento === fDepartament);
     if (fEstat) arr = arr.filter((f) => f.general.estadoApp === fEstat);
     if (fTipus) arr = arr.filter((f) => f.general.tipoTrabajo === fTipus);
+    if (fDesde || fHasta) arr = arr.filter((f) => otEnRangoFecha(f, fDesde, fHasta));
     arr.sort((a, b) => (parseInt(b.numeroOT) || 0) - (parseInt(a.numeroOT) || 0));
     return arr;
-  }, [fichas, fCliente, fTexto, fDepartament, fEstat, fTipus]);
+  }, [fichas, fCliente, fTexto, fDepartament, fEstat, fTipus, fDesde, fHasta]);
+
+  const clasePorOT = useMemo(() => {
+    if (!fichas) return new Map();
+    const m = new Map();
+    for (const f of fichas.values()) m.set(f.numeroOT, claseMaterialComprado(f));
+    return m;
+  }, [fichas]);
+
+  const paraGraficos = useMemo(() => {
+    if (!fichas) return [];
+    const qC = fCliente.trim().toLowerCase();
+    const qT = fTexto.trim().toLowerCase();
+    let arr = [...fichas.values()];
+    if (qC) arr = arr.filter((f) => (f.general.cliente || "").toLowerCase().includes(qC));
+    if (qT) arr = arr.filter((f) => f.numeroOT.toLowerCase().includes(qT) || (f.general.descripcion || "").toLowerCase().includes(qT));
+    if (fDepartament) arr = arr.filter((f) => f.general.departamento === fDepartament);
+    if (fTipus) arr = arr.filter((f) => f.general.tipoTrabajo === fTipus);
+    if (fDesde || fHasta) arr = arr.filter((f) => otEnRangoFecha(f, fDesde, fHasta));
+    return arr;
+  }, [fichas, fCliente, fTexto, fDepartament, fTipus, fDesde, fHasta]);
+
+  const partesEstado = useMemo(() => {
+    const cuenta = new Map();
+    for (const f of paraGraficos) {
+      const est = f.general.estadoApp || "(sin estado)";
+      cuenta.set(est, (cuenta.get(est) || 0) + 1);
+    }
+    return [...cuenta.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([etiqueta, valor], i) => ({
+        etiqueta,
+        valor,
+        color: HEX_ESTADO_APP[etiqueta] || PALETA_ESTADO[i % PALETA_ESTADO.length],
+      }));
+  }, [paraGraficos]);
+
+  const partesMaterial = useMemo(() => {
+    let noAnadido = 0;
+    let anadido = 0;
+    for (const f of paraGraficos) {
+      const clase = clasePorOT.get(f.numeroOT);
+      if (clase === "no_anadido") noAnadido++;
+      else if (clase === "anadido") anadido++;
+    }
+    return [
+      { etiqueta: "Comprado y no añadido", valor: noAnadido, color: "#dc2626" },
+      { etiqueta: "Comprado y añadido", valor: anadido, color: "#059669" },
+    ];
+  }, [paraGraficos, clasePorOT]);
 
   const totalPaginas = Math.max(1, Math.ceil(filtradas.length / POR_PAGINA));
   const visibles = filtradas.slice(pagina * POR_PAGINA, (pagina + 1) * POR_PAGINA);
@@ -3203,17 +3478,22 @@ function PantallaOTs({ incrustada = false }) {
     const ficha = fichas.get(seleccionada);
     if (ficha) {
       const detalle = <DetalleOT ficha={ficha} fichas={fichas} onVolver={() => setSeleccionada(null)} />;
-      return incrustada ? (
-        detalle
-      ) : (
+      const vista = incrustada ? detalle : (
         <div className="min-h-screen bg-slate-100 p-6">
           <div className="max-w-6xl mx-auto">{detalle}</div>
         </div>
+      );
+      return (
+        <>
+          {vista}
+          {!incrustada && <ChatOT fichas={fichas} />}
+        </>
       );
     }
   }
 
   return (
+    <>
     <div className={incrustada ? "" : "min-h-screen bg-slate-100 p-6"}>
       <div className={incrustada ? "" : "max-w-[1400px] mx-auto"}>
         <div className="flex items-center gap-3 mb-4">
@@ -3237,7 +3517,18 @@ function PantallaOTs({ incrustada = false }) {
 
         {fichas && (
           <>
-            <ChatOT fichas={fichas} />
+            <div className="flex gap-3 mb-3 flex-wrap">
+              <Quesito
+                titulo="OTs por estado"
+                nota="Cantidad de OTs en cada Estat App."
+                partes={partesEstado}
+              />
+              <Quesito
+                titulo="Material comprado"
+                nota="Solo OTs con compra. «No añadido» = alguna línea comprada que no está en la venta."
+                partes={partesMaterial}
+              />
+            </div>
             {/* Filtros */}
             <div className="flex gap-2 mb-3 flex-wrap">
               <input value={fCliente} onChange={(e) => { setFCliente(e.target.value); setPagina(0); }} placeholder="Filtrar client.."
@@ -3259,8 +3550,19 @@ function PantallaOTs({ incrustada = false }) {
                 <option value="">Tipus de feina...</option>
                 {opciones.tipus.map((d) => <option key={d} value={d}>{d}</option>)}
               </select>
-              {(fCliente || fTexto || fDepartament || fEstat || fTipus) && (
-                <button onClick={() => { setFCliente(""); setFTexto(""); setFDepartament(""); setFEstat(""); setFTipus(""); setPagina(0); }}
+              <label className="flex items-center gap-1 text-[11px] text-slate-500" title="Año de la OT, el que va en el número (p. ej. /2026)">
+                Desde
+                <input type="date" value={fDesde} onChange={(e) => { setFDesde(e.target.value); setPagina(0); }}
+                  className="text-sm border border-slate-300 rounded-md px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
+              </label>
+              <label className="flex items-center gap-1 text-[11px] text-slate-500" title="Año de la OT, el que va en el número (p. ej. /2026)">
+                Hasta
+                <input type="date" value={fHasta} onChange={(e) => { setFHasta(e.target.value); setPagina(0); }}
+                  className="text-sm border border-slate-300 rounded-md px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
+              </label>
+              <span className="self-center text-[10px] text-slate-400" title="La fecha de la OT es el año de su número, por ejemplo AC015138/2026">año de la OT</span>
+              {(fCliente || fTexto || fDepartament || fEstat || fTipus || fDesde || fHasta) && (
+                <button onClick={() => { setFCliente(""); setFTexto(""); setFDepartament(""); setFEstat(""); setFTipus(""); setFDesde(""); setFHasta(""); setPagina(0); }}
                   className="text-sm text-slate-500 border border-slate-300 rounded-md px-3 py-1.5 bg-white hover:bg-slate-50">
                   Restablir
                 </button>
@@ -3340,6 +3642,8 @@ function PantallaOTs({ incrustada = false }) {
         )}
       </div>
     </div>
+    {!incrustada && fichas && <ChatOT fichas={fichas} />}
+    </>
   );
 }
 
@@ -3416,8 +3720,6 @@ function DetalleOT({ ficha, fichas, onVolver }) {
   const [uds, setUds] = useState({}); // unidades editables del material propuesto
   const [bloqueados, setBloqueados] = useState([]); // [{tipoTrabajo, clave, descripcion, fecha}]
   const [historial, setHistorial] = useState(null); // {tipo:'compra'|'venta', codigo, descripcion}
-  const [avisoCorreo, setAvisoCorreo] = useState(null); // avís "taula copiada" del correu de revisió
-
   const noBC =
     ficha.numeroOTOrigenes?.listado || ficha.numeroOTOrigenes?.lineasVenta || ficha.numeroOTOrigenes?.lineasCompra || ficha.numeroOT;
 
@@ -4072,34 +4374,14 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         <div className="flex items-center justify-between mb-2">
           <div className="text-xs font-bold text-slate-800">⚖️ Diferencias comprado ↔ vendido</div>
           {(dif.nFaltaCobrar > 0 || dif.nSinCoste > 0) && (
-            <div className="flex items-center gap-2">
-              {avisoCorreo && <span className="text-[11px] text-emerald-700 font-semibold">{avisoCorreo}</span>}
-              <button
-                onClick={async () => {
-                  const { para, asunto } = destinatariosRevisio(ficha);
-                  const html = construirHtmlRevisio(ficha, dif);
-                  try {
-                    // Copia la versió VISUAL (taula amb colors) al porta-retalls
-                    await navigator.clipboard.write([
-                      new ClipboardItem({
-                        "text/html": new Blob([html], { type: "text/html" }),
-                        "text/plain": new Blob(["(Enganxa amb Ctrl+V per veure la taula de revisió de material)"], { type: "text/plain" }),
-                      }),
-                    ]);
-                    setAvisoCorreo("Taula copiada — enganxa-la (Ctrl+V) al cos del correu");
-                    window.location.href = `mailto:${para}?subject=${encodeURIComponent(asunto)}`;
-                  } catch {
-                    // Respaldo: correu amb el cos en text pla de sempre
-                    setAvisoCorreo(null);
-                    window.location.href = mailtoDiferencias(ficha, dif);
-                  }
-                }}
-                title="Copia la taula de revisió (amb colors) i obre el correu al responsable: enganxa-la al cos amb Ctrl+V"
-                className="flex items-center gap-1.5 text-[11px] font-semibold text-blue-700 bg-white border border-blue-300 rounded-md px-2.5 py-1 hover:bg-blue-50"
-              >
-                <Mail size={12} /> Revisió material
-              </button>
-            </div>
+            <BotonCorreoFacturacion
+              ficha={ficha}
+              dif={dif}
+              title="Abre el correo al responsable con la revisión de material y el borrador de factura en PDF"
+              className="flex items-center gap-1.5 text-[11px] font-semibold text-blue-700 bg-white border border-blue-300 rounded-md px-2.5 py-1 hover:bg-blue-50"
+            >
+              <Mail size={12} /> Revisió material
+            </BotonCorreoFacturacion>
           )}
         </div>
         {dif.items.length === 0 && <div className="text-[11px] text-slate-400">Sin líneas de material para comparar. Usa «Cargar líneas desde BC» o sube las facturas PDF de esta OT.</div>}
@@ -5478,6 +5760,11 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
   }, [data]);
 
   const [seccion, setSeccion] = useState("cargar"); // cargar | memoria | explorador | recepcion
+  const [vistas, setVistas] = useState(() => new Set(["cargar"]));
+  const abrirSeccion = (id) => {
+    setVistas((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
+    setSeccion(id);
+  };
   const [actualizandoRecep, setActualizandoRecep] = useState(false);
   const [actualizandoFacVenta, setActualizandoFacVenta] = useState(false);
   const [tareaPendiente, setTareaPendiente] = useState(null); // tarea creada desde Correo
@@ -5485,7 +5772,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
   // El Correo llama a esto para crear una tarea; cambia a la pantalla Tareas.
   const crearTareaDesdeCorreo = (tarea) => {
     setTareaPendiente({ ...tarea, _extId: tarea._extId || ("mail-" + Date.now()) });
-    setSeccion("tareas");
+    abrirSeccion("tareas");
   };
 
   // Refresca desde BC las dos fuentes que alimentan Recepción: líneas de
@@ -5546,11 +5833,17 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
   const navItem = (id, label, Icon) => (
     <div
       key={id}
-      onClick={() => setSeccion(id)}
+      onClick={() => abrirSeccion(id)}
       className={`bc-nav-item${seccion === id ? " activa" : ""}`}
     >
       {Icon && <Icon className="bc-nav-icon" size={16} strokeWidth={1.5} aria-hidden />}
       <span>{label}</span>
+    </div>
+  );
+
+  const panel = (id, nodo) => (
+    <div key={id} className={seccion === id ? undefined : "hidden"}>
+      {vistas.has(id) ? nodo : null}
     </div>
   );
 
@@ -5628,45 +5921,44 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
 
         {/* Main */}
         <main className="bc-main">
-          {seccion === "explorador" ? (
-            <PantallaOTs incrustada />
-          ) : seccion === "recepcion" ? (
+          {panel("explorador", <PantallaOTs incrustada />)}
+          {panel("recepcion", (
             <Recepcion
               pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
               lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
               onActualizarBC={actualizarRecepcionBC}
               actualizando={actualizandoRecep}
             />
-          ) : seccion === "facturascompra" ? (
+          ))}
+          {panel("facturascompra", (
             <FacturasCompra
               pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
               usuario={usuario}
             />
-          ) : seccion === "precios" ? (
+          ))}
+          {panel("precios", (
             <Precios
               lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
               pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
             />
-          ) : seccion === "pedidosventa" ? (
+          ))}
+          {panel("pedidosventa", (
             <PedidosVentaPendientes pedidosVenta={data["pedidos_venta"]?.rows || []} lineasPedidoVenta={data["lineas_pedido_venta"]?.rows || []} />
-          ) : seccion === "facturasventa" ? (
+          ))}
+          {panel("facturasventa", (
             <FacturasVenta
               facturas={data["facturas_venta"]?.rows || []}
               lineas={data["lineas_venta_reg"]?.rows || []}
               onActualizar={actualizarFacturasVenta}
               actualizando={actualizandoFacVenta}
             />
-          ) : seccion === "correo" ? (
-            <Correo onCrearTarea={crearTareaDesdeCorreo} usuario={usuario} />
-          ) : seccion === "tareas" ? (
-            <Tareas pendienteAlta={tareaPendiente} />
-          ) : seccion === "ia" ? (
-            <ChatIA />
-          ) : seccion === "ratios" ? (
-            <Ratios />
-          ) : seccion === "horas" ? (
-            <ControlHoras />
-          ) : seccion === "memoria" ? (
+          ))}
+          {panel("correo", <Correo onCrearTarea={crearTareaDesdeCorreo} usuario={usuario} />)}
+          {panel("tareas", <Tareas pendienteAlta={tareaPendiente} />)}
+          {panel("ia", <ChatIA />)}
+          {panel("ratios", <Ratios />)}
+          {panel("horas", <ControlHoras />)}
+          {panel("memoria", (
             <>
               <div className="flex items-center gap-2">
                 <Sparkles size={22} className="text-purple-600" />
@@ -5681,14 +5973,14 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
                 <IntelligentAgentCard bcData={data} estadoInicial={estadoInicial} />
               </section>
             </>
-          ) : (
+          ))}
+          {panel("cargar", (
             <>
               <h1 className="bc-page-title">Cargar datos</h1>
               <p className="bc-page-sub">
                 Conecta con Business Central para traer los datos del departamento de ventas. Se guardan en caché por rango de fechas.
               </p>
 
-              {/* Cue tiles estilo Role Center BC */}
               <div className="bc-cue-row">
                 <div className="bc-cue">
                   <div className="bc-cue-valor">
@@ -5709,7 +6001,6 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
                 </div>
               </div>
 
-              {/* Tarjetas de fuentes */}
               <div className="grid grid-cols-3 gap-4 mt-5">
                 {SOURCES.map((s) => (
                   <SourceCard
@@ -5723,18 +6014,17 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
                 ))}
               </div>
 
-              {/* Acceso directo a la memoria */}
               <button
-                onClick={() => setSeccion("memoria")}
+                onClick={() => abrirSeccion("memoria")}
                 className="mt-6 w-full flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold rounded py-2.5 transition-colors"
               >
                 <Sparkles size={16} /> Ir a Memoria histórica → construir y consultar
               </button>
             </>
-          )}
+          ))}
         </main>
       </div>
-      <IAFlotante seccion={seccion} />
+      <AsistenteUnico seccion={seccion} fichas={estadoInicial?.fichas?.length ? new Map(estadoInicial.fichas) : null} />
     </div>
   );
 }

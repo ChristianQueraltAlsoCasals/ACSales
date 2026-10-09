@@ -23,6 +23,197 @@ const sello = () => new Date().toLocaleString("es-ES", { day: "2-digit", month: 
 const PRIO = { alta: { l: "Alta", c: "bg-red-100 text-red-700 border-red-200" }, media: { l: "Media", c: "bg-amber-100 text-amber-700 border-amber-200" }, baja: { l: "Baja", c: "bg-slate-100 text-slate-500 border-slate-200" } };
 const RANK = { alta: 3, media: 2, baja: 1 };
 
+const euros = (n) => Number(n || 0).toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function VistaPrevia({ acciones, esperando }) {
+  const [docs, setDocs] = useState([]);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState(null);
+  const clave = (acciones || []).map((a) => [a.tipo, a.factura, a.cliente].join("~")).join("|");
+
+  useEffect(() => {
+    if (!acciones?.length) { setDocs([]); setError(null); setCargando(false); return; }
+    let vivo = true;
+    setCargando(true); setError(null);
+    fetch("/api/correo/vista-previa", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ acciones }),
+    })
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        if (!vivo) return;
+        if (!ok) setError(d.error || "No he pogut preparar la vista prèvia.");
+        else setDocs(d.documentos || []);
+      })
+      .catch(() => { if (vivo) setError("No he pogut connectar amb el servidor."); })
+      .finally(() => { if (vivo) setCargando(false); });
+    return () => { vivo = false; };
+  }, [clave]);
+
+  return (
+    <div className="space-y-3">
+      <div className="text-[11px] font-bold text-slate-400 uppercase">Vista prèvia</div>
+      {(esperando || cargando) && <div className="text-[13px] text-slate-400">Preparant la vista prèvia…</div>}
+      {error && <div className="text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-md p-2">{error}</div>}
+      {!esperando && !cargando && !docs.length && !error && (
+        <div className="text-[13px] text-slate-400">Aquest correu no demana cap abonament ni factura.</div>
+      )}
+      {docs.map((d, i) => (
+        <div key={i} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className={"px-4 py-2 text-[12px] font-bold text-white " + (d.tipo === "abono" ? "bg-slate-700" : "bg-blue-700")}>
+            {d.titulo}{d.origen ? " · còpia de " + d.origen : ""}
+          </div>
+          <div className="p-4">
+            <div className="text-[11px] text-slate-400 uppercase">Client</div>
+            <div className="text-[13px] font-semibold text-slate-800">{d.cliente || "—"}{d.clienteNumero ? " · " + d.clienteNumero : ""}</div>
+            {d.aviso && <div className="mt-2 text-[12px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">{d.aviso}</div>}
+            {d.lineas?.length > 0 && (
+              <table className="w-full mt-3 text-[12px]">
+                <thead>
+                  <tr className="text-left text-slate-400 border-b border-slate-100">
+                    <th className="font-semibold py-1">Descripció</th>
+                    <th className="font-semibold py-1 text-right">Cant.</th>
+                    <th className="font-semibold py-1 text-right">Import</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {d.lineas.map((l, j) => (
+                    <tr key={j} className="border-b border-slate-50">
+                      <td className="py-1 pr-2 text-slate-700">{l.descripcion}</td>
+                      <td className="py-1 text-right text-slate-500 whitespace-nowrap">{l.comentario ? "" : euros(l.cantidad)}</td>
+                      <td className="py-1 text-right text-slate-800 whitespace-nowrap">{l.comentario ? "" : euros(l.importe) + " €"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div className="mt-2 text-right text-[13px] font-bold text-slate-800">Total {euros(d.total)} €</div>
+            <div className="mt-2 text-[11px] text-slate-400">Encara no està creat. El botó de sota el prepara i l'obre a BC.</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function FeinaCorreu({ correo, onRec }) {
+  const [rec, setRec] = useState(null);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState(null);
+  const [ocupada, setOcupada] = useState("");
+  const [aviso, setAviso] = useState(null);
+
+  useEffect(() => {
+    if (!correo?.id && !correo?.cuerpo) return;
+    let vivo = true;
+    setCargando(true); setError(null); setRec(null); setAviso(null);
+    fetch("/api/correo/recomendacion", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: correo.id || "",
+        de: correo.de || "",
+        deNombre: correo.deNombre || "",
+        asunto: correo.asunto || "",
+        cuerpo: correo.cuerpo || "",
+        tipoCuerpo: correo.tipoCuerpo || "text",
+      }),
+    })
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        if (!vivo) return;
+        if (!ok) { setError(d.error || "No he pogut preparar la feina."); if (onRec) onRec(null); }
+        else { setRec(d); if (onRec) onRec(d); }
+      })
+      .catch(() => { if (vivo) setError("No he pogut connectar amb el servidor."); })
+      .finally(() => { if (vivo) setCargando(false); });
+    return () => { vivo = false; };
+  }, [correo?.id]);
+
+  const preparar = async (accion, clave) => {
+    setOcupada(clave); setError(null);
+    try {
+      const r = await fetch("/api/correo/accion-bc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tipo: accion.tipo, factura: accion.factura || "", cliente: accion.cliente || "" }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(d.error || "No he pogut preparar el document."); return; }
+      const que = accion.tipo === "abono" ? "Abonament" : "Factura";
+      const extra = (d.avisos || []).length ? " Revisa les línies: " + d.avisos[0] : " El registres tu a BC.";
+      setAviso(que + (d.numero ? " " + d.numero : "") + " preparat." + extra);
+      if (d.enlace) window.open(d.enlace, "_blank", "noopener");
+    } catch {
+      setError("No he pogut connectar amb el servidor.");
+    } finally {
+      setOcupada("");
+    }
+  };
+
+  if (cargando) return <div className="mt-4 text-[13px] text-slate-400">Mirant què cal fer…</div>;
+  if (!rec?.queHacer && !(rec?.acciones || []).length && !error) return null;
+  return (
+    <div className="mt-4 bg-amber-50 border border-amber-200 rounded-lg p-4 space-y-2">
+      <div className="text-[11px] font-bold text-amber-800 uppercase">Què has de fer</div>
+      {rec?.queHacer && <p className="text-[13px] text-slate-800 leading-relaxed">{rec.queHacer}</p>}
+      {(rec?.acciones || []).map((a, i) => {
+        const clave = a.tipo + "|" + (a.factura || "") + "|" + (a.cliente || "");
+        const texto = a.tipo === "abono"
+          ? "Vols obrir a BC l'abonament de venda" + (a.factura ? " " + a.factura : "") + "?"
+          : "Vols obrir a BC la factura de venda" + (a.cliente ? " per a " + a.cliente : "") + "?";
+        return (
+          <button
+            key={clave + i}
+            type="button"
+            disabled={ocupada === clave}
+            onClick={() => preparar(a, clave)}
+            className="block w-full text-left text-[13px] font-semibold text-white bg-slate-800 hover:bg-slate-900 disabled:opacity-60 rounded-md px-3 py-2"
+          >
+            {ocupada === clave ? "Preparant el document…" : texto}
+          </button>
+        );
+      })}
+      {aviso && <div className="text-[12px] text-green-800">{aviso}</div>}
+      {error && <div className="text-[12px] text-red-700">{error}</div>}
+    </div>
+  );
+}
+
+function CuerpoCorreo({ correo }) {
+  const [html, setHtml] = useState(String(correo?.tipoCuerpo || "").toLowerCase() === "html" ? (correo?.cuerpo || "") : "");
+  const [texto, setTexto] = useState(String(correo?.tipoCuerpo || "").toLowerCase() === "html" ? "" : (correo?.cuerpo || ""));
+  const [cargando, setCargando] = useState(Boolean(correo?.id));
+
+  useEffect(() => {
+    if (!correo?.id) return;
+    let vivo = true;
+    setCargando(true);
+    fetch("/api/buzon/mensaje/" + encodeURIComponent(correo.id))
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        if (!vivo || !ok) return;
+        if (String(d.tipoCuerpo || "").toLowerCase() === "html") {
+          setHtml(d.cuerpo || "");
+          setTexto("");
+        } else {
+          setHtml("");
+          setTexto(d.cuerpo || "");
+        }
+      })
+      .catch(() => {})
+      .finally(() => { if (vivo) setCargando(false); });
+    return () => { vivo = false; };
+  }, [correo?.id]);
+
+  if (cargando && !html) return <div className="text-[13px] text-slate-400 mt-2">Obrint el correu…</div>;
+  if (html) {
+    return <div className="text-[14px] leading-relaxed text-slate-700 mt-3 max-h-[32rem] overflow-y-auto" dangerouslySetInnerHTML={{ __html: html }} />;
+  }
+  return <div className="text-[13px] text-slate-600 mt-2 whitespace-pre-wrap max-h-[32rem] overflow-y-auto">{texto}</div>;
+}
+
 export default function Tareas({ pendienteAlta }) {
   const [tareas, setTareas] = useState(cargar);
   const [titulo, setTitulo] = useState("");
@@ -31,10 +222,12 @@ export default function Tareas({ pendienteAlta }) {
   const [notas, setNotas] = useState("");
   const [verHechas, setVerHechas] = useState(false);
   const [abiertaId, setAbiertaId] = useState(null); // ficha de tarea
+  const [feina, setFeina] = useState(null);
   const [nuevaNota, setNuevaNota] = useState("");
   const [nuevoHist, setNuevoHist] = useState("");
 
   useEffect(() => { guardar(tareas); }, [tareas]);
+  useEffect(() => { setFeina(null); }, [abiertaId]);
 
   // Si llega una tarea pendiente desde el Correo (por prop), la añade una vez
   useEffect(() => {
@@ -108,7 +301,8 @@ export default function Tareas({ pendienteAlta }) {
         <button onClick={() => setAbiertaId(null)} className="flex items-center gap-1 text-sm text-blue-700 hover:underline mb-4">
           <ArrowLeft size={15} /> Tornar a les tasques
         </button>
-        <div className="max-w-3xl">
+        <div className="flex flex-col xl:flex-row gap-5 items-start">
+        <div className="flex-1 min-w-0 max-w-3xl">
           <div className="flex items-start gap-3">
             <button onClick={() => toggle(abierta.id)} className="mt-1 shrink-0">
               {abierta.hecha ? <Check size={20} className="text-emerald-600" /> : <Circle size={20} className="text-slate-300 hover:text-blue-500" />}
@@ -131,8 +325,13 @@ export default function Tareas({ pendienteAlta }) {
             <div className="mt-5 bg-slate-50 border border-slate-200 rounded-lg p-4">
               <div className="text-[11px] font-bold text-slate-400 uppercase flex items-center gap-1.5 mb-2"><Mail size={13} /> Correu original</div>
               <div className="text-[13px] font-semibold text-slate-700">{abierta.correo.asunto}</div>
-              <div className="text-[12px] text-slate-500">De: {abierta.correo.deNombre || abierta.correo.de} · {abierta.correo.fecha ? new Date(abierta.correo.fecha).toLocaleString("es-ES") : ""}</div>
-              <div className="text-[13px] text-slate-600 mt-2 whitespace-pre-wrap max-h-64 overflow-y-auto">{abierta.correo.cuerpo}</div>
+              <div className="text-[12px] text-slate-500">
+                <span className="font-medium text-slate-700">{abierta.correo.deNombre || abierta.correo.de}</span>
+                {abierta.correo.deNombre && abierta.correo.de ? <span className="text-slate-400"> · {abierta.correo.de}</span> : null}
+                {abierta.correo.fecha ? <span> · {new Date(abierta.correo.fecha).toLocaleString("es-ES")}</span> : null}
+              </div>
+              <CuerpoCorreo correo={abierta.correo} />
+              <FeinaCorreu correo={abierta.correo} onRec={setFeina} />
             </div>
           )}
 
@@ -169,6 +368,10 @@ export default function Tareas({ pendienteAlta }) {
               ))}
             </div>
           </div>
+        </div>
+        <aside className="w-full xl:w-[440px] shrink-0 xl:sticky xl:top-4">
+          <VistaPrevia acciones={feina?.acciones || []} esperando={Boolean(abierta.correo) && !feina} />
+        </aside>
         </div>
       </div>
     );

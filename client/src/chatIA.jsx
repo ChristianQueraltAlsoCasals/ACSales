@@ -12,7 +12,230 @@
  * (backend/data/chats_ia/) y se pueden volver a abrir desde «Chats guardados».
  */
 import React, { useState, useEffect, useRef } from "react";
-import { Send, CheckCircle2, X, RefreshCw, Trash2, History, Bot, Paperclip, Eye, ExternalLink, Pin, Pencil, MessageSquare, Plus } from "lucide-react";
+import { Send, CheckCircle2, X, RefreshCw, Trash2, History, Bot, Paperclip, Eye, ExternalLink, Pin, Pencil, MessageSquare, Plus, ClipboardCopy } from "lucide-react";
+
+function esSeparadorTabla(linea) {
+  return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(linea);
+}
+
+function celdasMarkdown(linea) {
+  let s = String(linea || "").trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.trim());
+}
+
+function trozosMensaje(texto) {
+  const lineas = String(texto || "").split(/\r?\n/);
+  const bloques = [];
+  let buf = [];
+  const volcar = () => {
+    if (!buf.length) return;
+    bloques.push({ tipo: "texto", valor: buf.join("\n") });
+    buf = [];
+  };
+  for (let i = 0; i < lineas.length; i++) {
+    const sig = lineas[i + 1] || "";
+    if (lineas[i].includes("|") && esSeparadorTabla(sig)) {
+      volcar();
+      const cabecera = celdasMarkdown(lineas[i]);
+      const filas = [];
+      i += 2;
+      while (i < lineas.length && lineas[i].includes("|") && lineas[i].trim()) {
+        filas.push(celdasMarkdown(lineas[i]));
+        i++;
+      }
+      i--;
+      bloques.push({ tipo: "tabla", cabecera, filas });
+    } else {
+      buf.push(lineas[i]);
+    }
+  }
+  volcar();
+  return bloques;
+}
+
+function TextoConNegrita({ texto }) {
+  const partes = String(texto ?? "").split(/(\*\*[^*]+\*\*)/g);
+  return partes.map((p, i) =>
+    p.startsWith("**") && p.endsWith("**") && p.length > 4
+      ? <strong key={i} className="font-semibold">{p.slice(2, -2)}</strong>
+      : <span key={i}>{p}</span>
+  );
+}
+
+function celdaNumerica(cab, valor) {
+  if (/precio|coste|importe|cantidad|uds|margen|%/i.test(cab || "")) return true;
+  return /^[\d.,\s€%+-]+$/.test(String(valor || "").replace(/\*/g, ""));
+}
+
+function parseImporte(s) {
+  let t = String(s || "").replace(/\*/g, "").replace(/€/g, "").replace(/\s/g, "").trim();
+  if (!t || t === "—" || t === "–" || t === "-") return null;
+  if (t.includes(",") && t.includes(".")) t = t.replace(/\./g, "").replace(",", ".");
+  else if (t.includes(",")) t = t.replace(",", ".");
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Columna de precio a aplicar: el sugerido, si la tabla lo trae. */
+function indicePrecioPedido(cab) {
+  const sugerido = cab.findIndex((c) => /sugerid|propuest/i.test(c));
+  if (sugerido >= 0) return sugerido;
+  let idx = -1;
+  cab.forEach((c, i) => {
+    if (/precio|pvp/i.test(c) && !/coste|cost|actual/i.test(c)) idx = i;
+  });
+  if (idx >= 0) return idx;
+  return cab.findIndex((c) => /precio|pvp/i.test(c) && !/coste|cost/i.test(c));
+}
+
+/** Artículos con precio de venta que se pueden pegar en el pedido de BC. */
+function filasParaPedido(bloques) {
+  const out = [];
+  const vistos = new Set();
+  for (const b of bloques) {
+    if (b.tipo !== "tabla") continue;
+    const cab = b.cabecera.map((c) => String(c || ""));
+    const iNo = cab.findIndex((c) => /art[ií]culo|referencia|^n[ºo.°]|^c[oó]d/i.test(c) && !/descri|almac|negocio|empleado|iva|unid|ot\b/i.test(c));
+    const iDesc = cab.findIndex((c) => /descripci/i.test(c));
+    const iPrecio = indicePrecioPedido(cab);
+    const iCant = cab.findIndex((c) => /cantidad|^uds|^cant/i.test(c));
+    for (const celdas of b.filas) {
+      let no = iNo >= 0 ? String(celdas[iNo] || "").replace(/\*/g, "").trim() : "";
+      if (!/^PR\d{5,}/i.test(no)) {
+        const hit = celdas.find((c) => /^PR\d{5,}/i.test(String(c || "").replace(/\*/g, "").trim()));
+        no = hit ? String(hit).replace(/\*/g, "").trim() : "";
+      }
+      if (!no) continue;
+      const precio = iPrecio >= 0 ? parseImporte(celdas[iPrecio]) : null;
+      if (precio == null) continue;
+      const clave = no.toUpperCase();
+      if (vistos.has(clave)) continue;
+      vistos.add(clave);
+      out.push({
+        no: clave,
+        descripcion: iDesc >= 0 ? String(celdas[iDesc] || "").replace(/\*/g, "").trim() : "",
+        precio,
+        cantidad: iCant >= 0 ? parseImporte(celdas[iCant]) : null,
+      });
+    }
+  }
+  return out;
+}
+
+function copiarAlPortapapeles(tsv, html) {
+  const plano = () => {
+    const ta = document.createElement("textarea");
+    ta.value = tsv;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    ta.remove();
+    return ok;
+  };
+  if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+    return navigator.clipboard.write([
+      new ClipboardItem({
+        "text/plain": new Blob([tsv], { type: "text/plain" }),
+        "text/html": new Blob([html], { type: "text/html" }),
+      }),
+    ]).then(() => true).catch(() => plano());
+  }
+  if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(tsv).then(() => true).catch(() => plano());
+  return Promise.resolve(plano());
+}
+
+function BotonPegarPedido({ filas, texto, empresaId }) {
+  const [estado, setEstado] = useState("listo");
+  const [msg, setMsg] = useState("");
+  const copiar = async () => {
+    setEstado("cargando");
+    setMsg("");
+    const ot = (String(texto || "").match(/\b(?:AC|FCA)\d{4,7}\/\d{4}\b/) || [])[0] || "";
+    const documento = (String(texto || "").match(/\bP[VF]\d{2}-\d{3,}\b/i) || [])[0] || "";
+    try {
+      const r = await fetch("/api/ia-bc/copiar-pedido", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ empresa: empresaId, articulos: filas, ot, documento }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "No he podido preparar el pedido");
+      const ok = await copiarAlPortapapeles(j.tsv || "", j.html || "");
+      if (!ok) throw new Error("El navegador no ha dejado copiar. Prueba de nuevo.");
+      setEstado("ok");
+      setMsg(j.mensaje || "Copiado. En el pedido de BC, selecciona las líneas y pulsa Ctrl+V.");
+    } catch (e) {
+      setEstado("error");
+      setMsg(e.message || "No he podido copiar");
+    }
+  };
+  const titulo = estado === "ok"
+    ? (msg || "Copiado. En el pedido, selecciona las líneas y pulsa Ctrl+V.")
+    : estado === "error"
+      ? (msg || "No he podido copiar")
+      : "Copiar todos los precios para pegar en el pedido";
+  return (
+    <button
+      type="button"
+      onClick={copiar}
+      disabled={estado === "cargando"}
+      title={titulo}
+      className={`inline-flex items-center justify-center w-5 h-5 rounded shrink-0 ${estado === "ok" ? "bg-emerald-500 text-white" : estado === "error" ? "bg-red-500 text-white" : "bg-white/20 hover:bg-white/35 text-white"} disabled:opacity-60`}
+    >
+      {estado === "cargando" ? <RefreshCw size={11} className="animate-spin" /> : estado === "ok" ? <CheckCircle2 size={11} /> : <ClipboardCopy size={11} />}
+    </button>
+  );
+}
+
+/** Pinta el texto de la IA y convierte las tablas markdown en una tabla. */
+export function MensajeConTablas({ texto, empresaId }) {
+  const bloques = trozosMensaje(texto);
+  const propuesta = filasParaPedido(bloques);
+  return (
+    <div className="space-y-2">
+      {bloques.map((b, i) => b.tipo === "texto" ? (
+        <div key={i} className="whitespace-pre-wrap"><TextoConNegrita texto={b.valor} /></div>
+      ) : (
+        <div key={i} className="space-y-2">
+        <div className="overflow-x-auto rounded-md border border-slate-200 bg-white">
+          <table className="w-full text-[12px] border-collapse">
+            <thead>
+              <tr className="bg-slate-800 text-white">
+                {b.cabecera.map((c, j) => (
+                  <th key={j} className={`px-2 py-1.5 font-semibold whitespace-nowrap ${celdaNumerica(c, "") ? "text-right" : "text-left"}`}>
+                    <span className={`inline-flex items-center gap-1 ${celdaNumerica(c, "") ? "justify-end w-full" : ""}`}>
+                      <TextoConNegrita texto={c} />
+                      {propuesta.length > 0 && i === bloques.findIndex((x) => x.tipo === "tabla") && j === indicePrecioPedido(b.cabecera) && (
+                        <BotonPegarPedido filas={propuesta} texto={texto} empresaId={empresaId} />
+                      )}
+                    </span>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {b.filas.map((fila, r) => (
+                <tr key={r} className={r % 2 ? "bg-slate-50" : "bg-white"}>
+                  {b.cabecera.map((cab, j) => (
+                    <td key={j} className={`px-2 py-1 border-t border-slate-100 align-top text-slate-800 ${celdaNumerica(cab, fila[j]) ? "text-right tabular-nums whitespace-nowrap" : "text-left"} ${j === 0 ? "font-mono text-[11px] text-slate-600" : ""}`}>
+                      <TextoConNegrita texto={fila[j] || ""} />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 // Una conversación SEPARADA por empresa (24/09/2026)
 const LS_CHAT = "agente_ventas_chat_ia_v1";
@@ -123,8 +346,12 @@ export function TarjetaCambio({ cambio, onAplicado, empresaId }) {
     setTrabajando(true); setError(null);
     try {
       const r = await fetch("/api/ia-bc/aplicar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: cambio.id, empresa: empresaId }) });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — ") || `Error ${r.status}`);
+      const texto = await r.text();
+      let j = {};
+      try { j = texto ? JSON.parse(texto) : {}; }
+      catch { j = { error: texto.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500) }; }
+      const plano = (v) => (v && typeof v === "object" ? (v.message || JSON.stringify(v)) : v);
+      if (!r.ok) throw new Error(plano(j.error) || plano(j.detalle) || `Error ${r.status}`);
       setEstado("aplicado");
       onAplicado?.(cambio, true, j.cambio?.resultado);
       cargarInfo(); // para tener ya el enlace «Abrir en BC»
@@ -210,7 +437,7 @@ export function TarjetaCambio({ cambio, onAplicado, empresaId }) {
         </div>
       )}
       {estado === "descartado" && <div className="text-slate-500">Descartado — no se ha tocado BC</div>}
-      {estado === "error" && <div className="text-red-700">✗ {error || "BC rechazó el cambio"}</div>}
+      {estado === "error" && <div className="text-red-700 break-words">✗ {error || "BC rechazó el cambio"}</div>}
     </div>
   );
 }
@@ -531,8 +758,8 @@ export default function ChatIA() {
                     {m.miniaturas.map((src, k) => <img key={k} src={src} alt="" className="h-20 rounded border border-slate-200" />)}
                   </div>
                 )}
-                <div className={`whitespace-pre-wrap text-[13px] rounded-lg px-3 py-2 ${m.rol === "yo" ? "bg-blue-600 text-white" : m.error ? "bg-red-50 text-red-700 border border-red-200" : "bg-slate-100 text-slate-800"}`}>
-                  {m.texto}
+                <div className={`text-[13px] rounded-lg px-3 py-2 ${m.rol === "yo" ? "bg-blue-600 text-white whitespace-pre-wrap" : m.error ? "bg-red-50 text-red-700 border border-red-200" : "bg-slate-100 text-slate-800"}`}>
+                  {m.rol === "yo" ? m.texto : <MensajeConTablas texto={m.texto} empresaId={empresa?.id || empresaId} />}
                 </div>
                 {(m.pasos || []).filter((p) => p.herramienta === "guardar_regla" && p.ok).map((p, k) => (
                   <div key={`r${k}`} className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">

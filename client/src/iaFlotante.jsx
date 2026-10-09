@@ -1,20 +1,11 @@
 /**
- * iaFlotante.jsx — Botón flotante 🤖 con la IA en TODAS las pantallas del
- * Agente de Ventas (24/09/2026).
- *
- * Usa el mismo motor que la pantalla «Asistente IA» (backend/iaBC.cjs):
- * consulta BC, prepara altas/modificaciones que solo se aplican al pulsar
- * «Aplicar en BC», aprende reglas y trabaja SOLO en la empresa seleccionada
- * en el panel de la izquierda. Además envía a la IA la pantalla en la que
- * estás y el texto que tienes a la vista, para que entienda «este pedido»,
- * «esta OT», «estos datos»…
- *
- * Cada pantalla tiene su propia conversación mientras la app está abierta;
- * las conversaciones se guardan también en «Chats guardados» del Asistente IA.
+ * iaFlotante.jsx — Botón flotante con la IA en todas las pantallas.
+ * Cuando va incrustado, solo pinta la conversación: el botón lo pone
+ * el asistente único.
  */
 import React, { useEffect, useRef, useState } from "react";
 import { Bot, Send, X, Paperclip, Plus, Minimize2 } from "lucide-react";
-import { TarjetaCambio, cargarImagen } from "./chatIA.jsx";
+import { TarjetaCambio, cargarImagen, MensajeConTablas } from "./chatIA.jsx";
 import { empresaGuardada } from "./empresa.jsx";
 
 const NOMBRES = {
@@ -32,7 +23,6 @@ const NOMBRES = {
   horas: "Control de horas",
 };
 
-// Preguntas rápidas según la pantalla
 const SUGERENCIAS = {
   cargar: ["¿Qué datos tengo cargados y de qué fecha?", "¿Qué me falta por actualizar?"],
   memoria: ["¿Qué suele cobrarse en trabajos parecidos?", "Resume lo que ves"],
@@ -48,23 +38,22 @@ const SUGERENCIAS = {
   horas: ["¿Quién tiene más días sin imputar?", "¿Quién acumula más horas extra?"],
 };
 
-// Texto visible de la pantalla (lo que Maria tiene delante), recortado
 function textoPantalla() {
   const main = document.querySelector("main");
   if (!main) return "";
   return (main.innerText || "").replace(/\n{3,}/g, "\n\n").slice(0, 9000);
 }
 
-export default function IAFlotante({ seccion }) {
+export default function IAFlotante({ seccion, incrustado = false }) {
   const [abierto, setAbierto] = useState(false);
-  const [conv, setConv] = useState({}); // seccion -> { mensajes, historial, chatId }
+  const [conv, setConv] = useState({});
   const [entrada, setEntrada] = useState("");
   const [imagenes, setImagenes] = useState([]);
   const [ocupado, setOcupado] = useState(false);
   const [usarPantalla, setUsarPantalla] = useState(true);
   const finRef = useRef(null);
   const inputImgRef = useRef(null);
-  const chatIds = useRef({}); // seccion -> id del chat guardado
+  const chatIds = useRef({});
 
   const empresa = empresaGuardada();
   const empresaId = empresa?.id || "Also";
@@ -75,7 +64,6 @@ export default function IAFlotante({ seccion }) {
 
   useEffect(() => { finRef.current?.scrollIntoView({ block: "nearest" }); }, [actual.mensajes.length, ocupado, abierto]);
 
-  // Guardar la conversación en «Chats guardados» del Asistente IA
   const guardar = async (sec, datos) => {
     if (!datos.mensajes.some((m) => m.rol === "yo")) return;
     try {
@@ -145,9 +133,84 @@ export default function IAFlotante({ seccion }) {
     const fich = [...(e.clipboardData?.items || [])].filter((it) => it.kind === "file" && /^image\//.test(it.type)).map((it) => it.getAsFile());
     if (fich.length) { e.preventDefault(); añadirImagenes(fich); }
   };
+  const nueva = () => {
+    delete chatIds.current[seccion];
+    setConv((c) => ({ ...c, [seccion]: { mensajes: [], historial: [], chatId: "" } }));
+  };
 
-  if (seccion === "ia") return null; // la pantalla «Asistente IA» ya es el chat completo
+  const cuerpo = (
+    <>
+      <div className="flex-1 overflow-y-auto p-3 space-y-2 text-sm">
+        {actual.mensajes.length === 0 && (
+          <div className="text-slate-500">
+            <p>Hola. Estoy viendo la pantalla <b>{pantalla}</b>. Pregúntame lo que quieras sobre lo que tienes delante o sobre BC.</p>
+            <div className="flex flex-wrap gap-1.5 mt-3">
+              {[...(SUGERENCIAS[seccion] || []), "Resume lo que veo en pantalla"].map((s) => (
+                <button key={s} onClick={() => enviar(s, true, [])} className="text-[12px] px-2 py-1 rounded-full border border-blue-200 text-blue-700 hover:bg-blue-50">{s}</button>
+              ))}
+            </div>
+          </div>
+        )}
+        {actual.mensajes.map((m, k) => (
+          <div key={k} className={m.rol === "yo" ? "flex justify-end" : ""}>
+            {m.rol === "sistema" ? (
+              <div className="text-[11px] text-center text-slate-500">{m.texto}</div>
+            ) : (
+              <div className={`max-w-[92%] rounded-lg px-3 py-2 ${m.rol === "yo" ? "bg-blue-700 text-white whitespace-pre-wrap" : m.error ? "bg-red-50 text-red-700 border border-red-200" : "bg-slate-100 text-slate-800"}`}>
+                {m.miniaturas?.length > 0 && (
+                  <div className="flex gap-1 mb-1">{m.miniaturas.map((src, i) => <img key={i} src={src} alt="" className="h-12 rounded" />)}</div>
+                )}
+                {m.rol === "yo" ? m.texto : <MensajeConTablas texto={m.texto} empresaId={empresaId} />}
+                {(m.pasos || []).filter((p) => p.herramienta === "guardar_regla" && p.ok).map((p, i) => (
+                  <div key={i} className="mt-1 text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">Regla guardada: {p.entrada?.texto}</div>
+                ))}
+                {(m.pasos || []).length > 0 && <div className="mt-1 text-[10px] text-slate-400">{m.pasos.length} consulta(s) a BC</div>}
+                {(m.cambios || []).map((c) => (
+                  <div key={c.id} className="mt-2 whitespace-normal"><TarjetaCambio cambio={c} onAplicado={onAplicado} empresaId={empresa?.id} /></div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+        {ocupado && <div className="text-slate-400 text-xs">Pensando…</div>}
+        <div ref={finRef} />
+      </div>
 
+      <div className="border-t p-2">
+        {imagenes.length > 0 && (
+          <div className="flex gap-1 mb-1">
+            {imagenes.map((im, i) => (
+              <div key={i} className="relative">
+                <img src={im.miniatura} alt="" className="h-10 rounded border" />
+                <button onClick={() => setImagenes((p) => p.filter((_, j) => j !== i))} className="absolute -top-1 -right-1 bg-white rounded-full border"><X size={10} /></button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex items-end gap-1">
+          {incrustado && <button onClick={nueva} title="Nueva conversación" className="p-2 text-slate-500 hover:text-slate-700"><Plus size={16} /></button>}
+          <button onClick={() => inputImgRef.current?.click()} className="p-2 text-slate-500 hover:text-slate-700" title="Adjuntar imagen (también puedes pegarla con Ctrl+V)"><Paperclip size={16} /></button>
+          <input ref={inputImgRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => { añadirImagenes(e.target.files); e.target.value = ""; }} />
+          <textarea
+            value={entrada}
+            onChange={(e) => setEntrada(e.target.value)}
+            onPaste={onPegar}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } }}
+            rows={2}
+            placeholder="Pregunta sobre esta pantalla… (Enter para enviar)"
+            className="flex-1 resize-none border rounded-md px-2 py-1 text-sm"
+          />
+          <button onClick={() => enviar()} disabled={ocupado || (!entrada.trim() && !imagenes.length)} className="p-2 rounded-md bg-blue-700 text-white disabled:opacity-40"><Send size={16} /></button>
+        </div>
+        <label className="flex items-center gap-1 mt-1 text-[10px] text-slate-400">
+          <input type="checkbox" checked={usarPantalla} onChange={(e) => setUsarPantalla(e.target.checked)} /> Enviar a la IA lo que se ve en pantalla
+        </label>
+      </div>
+    </>
+  );
+
+  if (incrustado) return <div className="flex flex-col h-full min-h-0">{cuerpo}</div>;
+  if (seccion === "ia") return null;
   if (!abierto) {
     return (
       <button
@@ -169,75 +232,10 @@ export default function IAFlotante({ seccion }) {
           <div className="text-sm font-semibold truncate">IA · {pantalla}</div>
           <div className="text-[10px] text-blue-100 truncate">Trabajando en {empresaNombre} · los cambios solo se aplican con «Aplicar en BC»</div>
         </div>
-        <button onClick={() => { delete chatIds.current[seccion]; setConv((c) => ({ ...c, [seccion]: { mensajes: [], historial: [], chatId: "" } })); }} title="Nueva conversación" className="p-1 hover:bg-white/10 rounded"><Plus size={16} /></button>
+        <button onClick={nueva} title="Nueva conversación" className="p-1 hover:bg-white/10 rounded"><Plus size={16} /></button>
         <button onClick={() => setAbierto(false)} title="Minimizar" className="p-1 hover:bg-white/10 rounded"><Minimize2 size={16} /></button>
       </div>
-
-      <div className="flex-1 overflow-y-auto p-3 space-y-2 text-sm">
-        {actual.mensajes.length === 0 && (
-          <div className="text-slate-500">
-            <p>Hola 👋 Estoy viendo la pantalla <b>{pantalla}</b>. Pregúntame lo que quieras sobre lo que tienes delante o sobre BC.</p>
-            <div className="flex flex-wrap gap-1.5 mt-3">
-              {[...(SUGERENCIAS[seccion] || []), "Resume lo que veo en pantalla"].map((s) => (
-                <button key={s} onClick={() => enviar(s, true, [])} className="text-[12px] px-2 py-1 rounded-full border border-blue-200 text-blue-700 hover:bg-blue-50">{s}</button>
-              ))}
-            </div>
-          </div>
-        )}
-        {actual.mensajes.map((m, k) => (
-          <div key={k} className={m.rol === "yo" ? "flex justify-end" : ""}>
-            {m.rol === "sistema" ? (
-              <div className="text-[11px] text-center text-slate-500">{m.texto}</div>
-            ) : (
-              <div className={`max-w-[92%] rounded-lg px-3 py-2 whitespace-pre-wrap ${m.rol === "yo" ? "bg-blue-700 text-white" : m.error ? "bg-red-50 text-red-700 border border-red-200" : "bg-slate-100 text-slate-800"}`}>
-                {m.miniaturas?.length > 0 && (
-                  <div className="flex gap-1 mb-1">{m.miniaturas.map((src, i) => <img key={i} src={src} alt="" className="h-12 rounded" />)}</div>
-                )}
-                {m.texto}
-                {(m.pasos || []).filter((p) => p.herramienta === "guardar_regla" && p.ok).map((p, i) => (
-                  <div key={i} className="mt-1 text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">📌 Regla guardada: {p.entrada?.texto}</div>
-                ))}
-                {(m.pasos || []).length > 0 && <div className="mt-1 text-[10px] text-slate-400">{m.pasos.length} consulta(s) a BC</div>}
-                {(m.cambios || []).map((c) => (
-                  <div key={c.id} className="mt-2 whitespace-normal"><TarjetaCambio cambio={c} onAplicado={onAplicado} empresaId={empresa?.id} /></div>
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
-        {ocupado && <div className="text-slate-400 text-xs">🤖 Pensando…</div>}
-        <div ref={finRef} />
-      </div>
-
-      <div className="border-t p-2">
-        {imagenes.length > 0 && (
-          <div className="flex gap-1 mb-1">
-            {imagenes.map((im, i) => (
-              <div key={i} className="relative">
-                <img src={im.miniatura} alt="" className="h-10 rounded border" />
-                <button onClick={() => setImagenes((p) => p.filter((_, j) => j !== i))} className="absolute -top-1 -right-1 bg-white rounded-full border"><X size={10} /></button>
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="flex items-end gap-1">
-          <button onClick={() => inputImgRef.current?.click()} className="p-2 text-slate-500 hover:text-slate-700" title="Adjuntar imagen (también puedes pegarla con Ctrl+V)"><Paperclip size={16} /></button>
-          <input ref={inputImgRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => { añadirImagenes(e.target.files); e.target.value = ""; }} />
-          <textarea
-            value={entrada}
-            onChange={(e) => setEntrada(e.target.value)}
-            onPaste={onPegar}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } }}
-            rows={2}
-            placeholder="Pregunta sobre esta pantalla… (Enter para enviar)"
-            className="flex-1 resize-none border rounded-md px-2 py-1 text-sm"
-          />
-          <button onClick={() => enviar()} disabled={ocupado || (!entrada.trim() && !imagenes.length)} className="p-2 rounded-md bg-blue-700 text-white disabled:opacity-40"><Send size={16} /></button>
-        </div>
-        <label className="flex items-center gap-1 mt-1 text-[10px] text-slate-400">
-          <input type="checkbox" checked={usarPantalla} onChange={(e) => setUsarPantalla(e.target.checked)} /> Enviar a la IA lo que se ve en pantalla
-        </label>
-      </div>
+      {cuerpo}
     </div>
   );
 }

@@ -42,7 +42,11 @@ try {
 const app = express();
 app.use(express.json({ limit: "500mb" })); // fichas + líneas con TODAS las columnas: el estado puede ser grande
 app.use(cookieParser());
-app.use(express.static(path.join(__dirname, "public"))); // frontend compilado (build)
+app.use(express.static(path.join(__dirname, "public"), {
+  setHeaders(res, filePath) {
+    if (filePath.endsWith("index.html")) res.setHeader("Cache-Control", "no-cache");
+  },
+})); // frontend compilado (build)
 
 const PORT = process.env.PORT || 3000;
 
@@ -712,13 +716,13 @@ ${instrucciones ? `Indicacions de la Maria sobre què vol dir: ${instrucciones}`
 CORREU ORIGINAL:
 ${original || "(sense contingut)"}
 
-Retorna NOMÉS el text del correu de resposta (sense assumpte, sense explicacions, sense cometes). Signa com a Maria Rufí.`;
+Retorna NOMÉS el text del correu de resposta (sense assumpte, sense explicacions, sense cometes). No afegeixis salutació final, nom ni avís legal: la signatura oficial s'afegeix sola.`;
     } else {
       prompt = `Ets l'assistent de redacció de correus de Maria Rufí, de l'empresa ALSO CASALS INSTAL·LACIONS.
 Redacta un correu NOU. Escriu en ${idiomaTxt}. To: ${tonoTxt}.
 Indicacions de la Maria sobre què vol dir: ${instrucciones || "(cap indicació concreta)"}
 
-Retorna NOMÉS el text del correu (sense assumpte tret que sigui imprescindible, sense explicacions, sense cometes). Signa com a Maria Rufí.`;
+Retorna NOMÉS el text del correu (sense assumpte tret que sigui imprescindible, sense explicacions, sense cometes). No afegeixis salutació final, nom ni avís legal: la signatura oficial s'afegeix sola.`;
     }
 
     const r = await fetchConReintento("https://api.anthropic.com/v1/messages", {
@@ -741,6 +745,387 @@ Retorna NOMÉS el text del correu (sense assumpte tret que sigui imprescindible,
   } catch (err) {
     console.error("Error redactando con Claude:", err);
     res.status(500).json({ error: "Error redactant el correu.", detalle: String(err.message || err) });
+  }
+});
+
+// Recomendación de respuesta al abrir un correo. Usa las fichas de OT de la
+// app y, si responde a tiempo, la ficha de cliente o proveedor en BC.
+let cacheFichasCorreo = { ts: 0, lista: [] };
+function pistasDeCorreo(texto) {
+  const t = String(texto || "");
+  const unicos = (arr) => [...new Set(arr)];
+  return {
+    ots: unicos([...t.matchAll(/\b(?:AC|FCA)\d{4,7}\/\d{4}\b/gi)].map((m) => m[0].toUpperCase())),
+    otsCortas: unicos([...t.matchAll(/\bOT\s*0*(\d{3,6})\b/gi)].map((m) => String(parseInt(m[1], 10)))),
+    docs: unicos([...t.matchAll(/\b(?:PV|PC|PFV|OC|FV)\d{2}-\d{3,}\b/gi)].map((m) => m[0].toUpperCase())),
+    arts: unicos([...t.matchAll(/\bPR\d{6,}\b/gi)].map((m) => m[0].toUpperCase())).slice(0, 12),
+  };
+}
+function textoPlanoCorreo(cuerpo, tipo) {
+  const s = tipo === "html" ? String(cuerpo || "").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ") : String(cuerpo || "");
+  return s.replace(/\s+/g, " ").trim().slice(0, 6000);
+}
+function resumenFichaCorreo(f) {
+  const origen = f?.numeroOTOrigenes || {};
+  const linea = (l) => ({
+    codigo: l?.numero || l?.codigo || "",
+    descripcion: String(l?.descripcion || "").slice(0, 80),
+    cantidad: l?.cantidad ?? null,
+    importe: l?.importe ?? null,
+  });
+  return {
+    ot: origen.listadoOTs || origen.listado || f?.numeroOT || "",
+    numero: f?.numeroOT || "",
+    cliente: f?.general?.cliente || "",
+    descripcion: f?.general?.descripcion || "",
+    departamento: f?.general?.departamento || "",
+    estado: f?.general?.estadoApp || f?.general?.estado || "",
+    venta: f?.resumenOT?.pVenta ?? f?.venta?.importeTotalFacturado ?? null,
+    coste: f?.resumenOT?.pDespesa ?? f?.compra?.costeRealOT ?? null,
+    horas: f?.resumenOT?.numeroHoras ?? null,
+    materiales: (f?.venta?.materiales?.lineas || []).slice(0, 6).map(linea),
+    compras: (f?.compra?.comprasReales?.lineas || []).slice(0, 6).map(linea),
+  };
+}
+async function fichasParaCorreo() {
+  if (Date.now() - cacheFichasCorreo.ts < 120000) return cacheFichasCorreo.lista;
+  const raw = await db.getDoc("estado.fichas", []);
+  const lista = (Array.isArray(raw) ? raw : []).map((par) => (Array.isArray(par) ? par[1] : par)).filter(Boolean);
+  cacheFichasCorreo = { ts: Date.now(), lista };
+  return lista;
+}
+async function bcPorEmail(email) {
+  const limpio = String(email || "").trim();
+  if (!/^[^@\s]+@[^@\s]+$/.test(limpio)) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const token = await obtenerTokenBC();
+    const esc = limpio.replace(/'/g, "''");
+    const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const pedir = async (entidad) => {
+      const r = await fetch(`${raiz}/${entidad}?$select=number,displayName,email,city,phoneNumber&$filter=${encodeURIComponent(`email eq '${esc}'`)}&$top=1`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: ctrl.signal,
+      });
+      if (!r.ok) return null;
+      return ((await r.json()).value || [])[0] || null;
+    };
+    const cliente = await pedir("customers");
+    if (cliente) return { tipo: "cliente", numero: cliente.number, nombre: cliente.displayName, email: cliente.email, ciudad: cliente.city || "", telefono: cliente.phoneNumber || "" };
+    const proveedor = await pedir("vendors");
+    if (proveedor) return { tipo: "proveedor", numero: proveedor.number, nombre: proveedor.displayName, email: proveedor.email, ciudad: proveedor.city || "", telefono: proveedor.phoneNumber || "" };
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function claveRecomendaciones(req) {
+  const quien = String(req.usuario?.id || req.usuario?.username || "anon").replace(/[^\w.-]/g, "_");
+  return "correo.recomendaciones." + quien;
+}
+async function recomendacionGuardada(req, idMsg) {
+  if (!idMsg) return null;
+  const mapa = await db.getDoc(claveRecomendaciones(req), {});
+  const item = mapa && typeof mapa === "object" ? mapa[idMsg] : null;
+  return item && item.recomendacion ? item : null;
+}
+async function guardarRecomendacion(req, idMsg, item) {
+  if (!idMsg) return;
+  const mapa = await db.getDoc(claveRecomendaciones(req), {});
+  const base = mapa && typeof mapa === "object" && !Array.isArray(mapa) ? mapa : {};
+  base[idMsg] = { ...item, ts: Date.now() };
+  const claves = Object.keys(base).sort((a, b) => (base[a]?.ts || 0) - (base[b]?.ts || 0));
+  while (claves.length > 200) delete base[claves.shift()];
+  await db.setDoc(claveRecomendaciones(req), base);
+}
+app.post("/api/correo/recomendacion", async (req, res) => {
+  const cuerpo = req.body || {};
+  const idMsg = String(cuerpo.id || "").slice(0, 400);
+  try {
+    const previa = await recomendacionGuardada(req, idMsg);
+    if (previa && typeof previa.queHacer === "string") return res.json(previa);
+  } catch (err) {
+    console.error("Error leyendo recomendación guardada:", err);
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: "Falta ANTHROPIC_API_KEY en .env." });
+  }
+  const plano = textoPlanoCorreo(cuerpo.cuerpo, cuerpo.tipoCuerpo);
+  const pistas = pistasDeCorreo(`${cuerpo.asunto || ""}\n${plano}\n${cuerpo.deNombre || ""} ${cuerpo.de || ""}`);
+  try {
+    const fichas = await fichasParaCorreo();
+    const deNombre = String(cuerpo.deNombre || "").toLowerCase();
+    const coinciden = [];
+    for (const f of fichas) {
+      if (coinciden.length >= 4) break;
+      const otTxt = String(f?.numeroOTOrigenes?.listadoOTs || f?.numeroOTOrigenes?.listado || f?.numeroOT || "").toUpperCase();
+      const num = String(f?.numeroOT || "");
+      const cli = String(f?.general?.cliente || "").toLowerCase();
+      const porOt = pistas.ots.some((x) => otTxt.includes(x)) || pistas.otsCortas.some((n) => num === n || otTxt.includes(`/${n}`) || otTxt.includes(n));
+      const porCliente = cli.length > 5 && deNombre.includes(cli.slice(0, Math.min(cli.length, 18)));
+      if (porOt || porCliente) coinciden.push(resumenFichaCorreo(f));
+    }
+    const fichaBc = await bcPorEmail(cuerpo.de);
+    let reglas = [];
+    try {
+      const lista = await db.getDoc("reglas_ia", []);
+      reglas = (Array.isArray(lista) ? lista : []).slice(-8).map((r) => String(r.texto || "").slice(0, 240)).filter(Boolean);
+    } catch { /* las reglas son un extra */ }
+    const nombre = req.usuario?.nom_treballador || req.usuario?.nombre || "Maria Rufí";
+    const contexto = {
+      remitente: { nombre: cuerpo.deNombre || "", email: cuerpo.de || "" },
+      fichaBC: fichaBc,
+      otsEnLaApp: coinciden,
+      referenciasEnElCorreo: pistas,
+      reglasAprendidas: reglas,
+    };
+    const prompt = `Ets l'assistent de correu d'ALSO CASALS. La ${nombre} ha obert un correu i necessita una recomanació per respondre'l.
+Fes servir NOMÉS les dades del context. No inventis preus, dates, estats ni números que no hi surtin. Si falta una dada, digues-ho i proposa preguntar-la.
+Respon en l'idioma del correu original.
+
+CORREU
+De: ${cuerpo.deNombre || ""} <${cuerpo.de || ""}>
+Assumpte: ${cuerpo.asunto || ""}
+${plano || "(sense text)"}
+
+CONTEXT DE L'APP (JSON):
+${JSON.stringify(contexto).slice(0, 12000)}
+
+A més, descriu la FEINA a fer a Business Central, només si el correu ho demana amb claredat.
+queHacer: 2 a 4 frases, en l'idioma del correu, del que ha de fer. Cita el número de factura i el client si surten.
+acciones: una entrada per document.
+- tipo "abono": cal abonar una factura de venda ja emesa. factura = el número que surt al correu. cliente buit.
+- tipo "factura": cal fer una factura de venda nova. Si s'ha de copiar una factura existent, posa el seu número a factura. Si el client és un altre, posa el nom a cliente.
+Si no cal cap document, acciones és []. No inventis números ni clients.
+
+Retorna NOMÉS un JSON amb aquesta forma, sense markdown:
+{"recomendacion":"2 o 3 frases: què ha de contestar i per què","apoyos":["dada concreta 1"],"queHacer":"què ha de fer a Business Central","acciones":[{"tipo":"abono","factura":"P26001450","cliente":""}],"borrador":"text del correu, sense salutació final, sense nom i sense avís legal: la signatura de ${nombre} s'afegeix sola"}`;
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
+        max_tokens: 2000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) throw new Error(`API Claude respondió ${r.status}`);
+    const data = await r.json();
+    let texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    texto = texto.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    let parsed;
+    try { parsed = JSON.parse(texto); }
+    catch {
+      const i = texto.indexOf("{");
+      const j = texto.lastIndexOf("}");
+      try { parsed = i >= 0 && j > i ? JSON.parse(texto.slice(i, j + 1)) : null; }
+      catch { parsed = null; }
+      if (!parsed) parsed = { recomendacion: texto, apoyos: [], borrador: "", queHacer: "", acciones: [] };
+    }
+    const acciones = (Array.isArray(parsed.acciones) ? parsed.acciones : []).map((a) => ({
+      tipo: a?.tipo === "factura" ? "factura" : a?.tipo === "abono" ? "abono" : "",
+      factura: String(a?.factura || "").trim().slice(0, 30),
+      cliente: String(a?.cliente || "").trim().slice(0, 120),
+    })).filter((a) => a.tipo && (a.factura || a.cliente)).slice(0, 6);
+    const salida = {
+      recomendacion: String(parsed.recomendacion || "").trim(),
+      apoyos: Array.isArray(parsed.apoyos) ? parsed.apoyos.map((x) => String(x)).slice(0, 6) : [],
+      queHacer: String(parsed.queHacer || "").trim(),
+      acciones,
+      borrador: String(parsed.borrador || "").trim(),
+      fichas: coinciden.length,
+      fichaBC: fichaBc ? `${fichaBc.tipo}: ${fichaBc.nombre}` : "",
+    };
+    try { await guardarRecomendacion(req, idMsg, salida); } catch (err) {
+      console.error("Error guardando recomendación:", err);
+    }
+    res.json(salida);
+  } catch (err) {
+    console.error("Error recomendando respuesta:", err);
+    res.status(500).json({ error: "No he podido preparar la recomendación.", detalle: String(err.message || err) });
+  }
+});
+
+// Prepara un borrador de abono o de factura de venta y devuelve el enlace
+// para abrirlo en BC. No lo registra: no se llama a Microsoft.NAV.post.
+function urlDocumentoBC(pagina, numero) {
+  const empresa = EMPRESA_NOMBRE();
+  const filtro = `'No.' IS '${String(numero).replace(/'/g, "''")}'`;
+  return `https://businesscentral.dynamics.com/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/?company=${encodeURIComponent(empresa)}&page=${pagina}&filter=${encodeURIComponent(filtro)}`;
+}
+async function bcPedir(url, token, method, body) {
+  const r = await fetchConReintento(url, {
+    method: method || "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  }, 1);
+  const texto = await r.text();
+  let json = null;
+  try { json = texto ? JSON.parse(texto) : null; } catch { json = null; }
+  return { ok: r.ok, status: r.status, json, texto };
+}
+function textoErrorBC(r) {
+  return r.json?.error?.message || String(r.texto || "").slice(0, 300) || `BC respondió ${r.status}`;
+}
+app.post("/api/correo/accion-bc", async (req, res) => {
+  const tipo = req.body?.tipo === "factura" ? "factura" : req.body?.tipo === "abono" ? "abono" : "";
+  const factura = String(req.body?.factura || "").trim();
+  const clienteNombre = String(req.body?.cliente || "").trim();
+  if (!tipo) return res.status(400).json({ error: "No sé si es un abono o una factura." });
+  if (factura && !/^[A-Za-z0-9][A-Za-z0-9./-]{2,24}$/.test(factura)) {
+    return res.status(400).json({ error: "El número de factura no es válido." });
+  }
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    let origen = null;
+    if (factura) {
+      const esc = factura.replace(/'/g, "''");
+      const busca = await bcPedir(`${base}/salesInvoices?$filter=${encodeURIComponent(`number eq '${esc}'`)}&$top=1`, token);
+      if (!busca.ok) return res.status(502).json({ error: "No he podido buscar la factura.", detalle: textoErrorBC(busca) });
+      origen = (busca.json?.value || [])[0] || null;
+      if (!origen) return res.status(404).json({ error: `No encuentro la factura ${factura} en ${EMPRESA_NOMBRE()}.` });
+    }
+    let customerNumber = origen?.customerNumber || "";
+    if (clienteNombre) {
+      const trozo = clienteNombre.replace(/'/g, "''").slice(0, 40);
+      const cli = await bcPedir(`${base}/customers?$filter=${encodeURIComponent(`contains(displayName,'${trozo}')`)}&$select=number,displayName&$top=8`, token);
+      if (!cli.ok) return res.status(502).json({ error: "No he podido buscar el cliente.", detalle: textoErrorBC(cli) });
+      const lista = cli.json?.value || [];
+      const exacto = lista.find((c) => String(c.displayName || "").toLowerCase() === clienteNombre.toLowerCase());
+      const elegido = exacto || (lista.length === 1 ? lista[0] : null);
+      if (!elegido) {
+        const nombres = lista.map((c) => c.displayName).filter(Boolean).slice(0, 5).join(", ");
+        return res.status(409).json({ error: nombres ? `Hay varios clientes parecidos a «${clienteNombre}»: ${nombres}.` : `No encuentro el cliente «${clienteNombre}» en ${EMPRESA_NOMBRE()}.` });
+      }
+      customerNumber = elegido.number;
+    }
+    if (!customerNumber) return res.status(400).json({ error: "Falta el cliente del documento." });
+
+    const coleccion = tipo === "abono" ? "salesCreditMemos" : "salesInvoices";
+    const alta = await bcPedir(`${base}/${coleccion}`, token, "POST", {
+      customerNumber,
+      ...(factura ? { externalDocumentNumber: factura } : {}),
+    });
+    if (!alta.ok) return res.status(502).json({ error: tipo === "abono" ? "No he podido crear el abono." : "No he podido crear la factura.", detalle: textoErrorBC(alta) });
+    const doc = alta.json || {};
+    const avisos = [];
+    if (origen?.id) {
+      const lin = await bcPedir(`${base}/salesInvoices(${origen.id})/salesInvoiceLines`, token);
+      const lineas = lin.ok ? (lin.json?.value || []) : [];
+      if (!lin.ok) avisos.push("No he podido leer las líneas de la factura original.");
+      const destino = tipo === "abono" ? "salesCreditMemoLines" : "salesInvoiceLines";
+      for (const l of lineas.slice(0, 40)) {
+        const tipoLinea = String(l.lineType || "");
+        if (!tipoLinea || tipoLinea === " ") continue;
+        const cuerpoLinea = { lineType: tipoLinea, description: String(l.description || "").slice(0, 100) };
+        if (tipoLinea !== "Comment") {
+          if (!l.lineObjectNumber) continue;
+          cuerpoLinea.lineObjectNumber = l.lineObjectNumber;
+          if (l.quantity) cuerpoLinea.quantity = l.quantity;
+          if (l.unitPrice != null) cuerpoLinea.unitPrice = l.unitPrice;
+          if (l.discountPercent) cuerpoLinea.discountPercent = l.discountPercent;
+        }
+        const creada = await bcPedir(`${base}/${coleccion}(${doc.id})/${destino}`, token, "POST", cuerpoLinea);
+        if (!creada.ok) avisos.push(`${l.lineObjectNumber || l.description || "línea"}: ${textoErrorBC(creada)}`);
+      }
+    }
+    const pagina = tipo === "abono" ? 44 : 43;
+    res.json({
+      ok: true,
+      tipo,
+      numero: doc.number || "",
+      enlace: doc.number ? urlDocumentoBC(pagina, doc.number) : "",
+      avisos: avisos.slice(0, 5),
+    });
+  } catch (err) {
+    console.error("Error preparando documento de venta:", err);
+    res.status(500).json({ error: "No he podido preparar el documento.", detalle: String(err.message || err) });
+  }
+});
+
+// Vista previa, solo lectura: no crea ni registra nada en BC.
+app.post("/api/correo/vista-previa", async (req, res) => {
+  const acciones = (Array.isArray(req.body?.acciones) ? req.body.acciones : []).slice(0, 6);
+  if (!acciones.length) return res.json({ documentos: [] });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const documentos = [];
+    for (const a of acciones) {
+      const tipo = a?.tipo === "factura" ? "factura" : a?.tipo === "abono" ? "abono" : "";
+      const factura = String(a?.factura || "").trim();
+      const clienteNombre = String(a?.cliente || "").trim();
+      if (!tipo) continue;
+      const doc = {
+        tipo,
+        titulo: tipo === "abono" ? "Abonament de venda" : "Factura de venda",
+        origen: factura,
+        cliente: clienteNombre,
+        clienteNumero: "",
+        lineas: [],
+        total: 0,
+        aviso: "",
+      };
+      if (factura && !/^[A-Za-z0-9][A-Za-z0-9./-]{2,24}$/.test(factura)) {
+        doc.aviso = "El número de factura no es válido.";
+        documentos.push(doc);
+        continue;
+      }
+      let origen = null;
+      if (factura) {
+        const esc = factura.replace(/'/g, "''");
+        const busca = await bcPedir(`${base}/salesInvoices?$filter=${encodeURIComponent(`number eq '${esc}'`)}&$select=id,number,customerNumber,customerName,totalAmountExcludingTax&$top=1`, token);
+        if (!busca.ok) { doc.aviso = "No he podido leer la factura."; documentos.push(doc); continue; }
+        origen = (busca.json?.value || [])[0] || null;
+        if (!origen) { doc.aviso = `No encuentro la factura ${factura} en ${EMPRESA_NOMBRE()}.`; documentos.push(doc); continue; }
+        if (!clienteNombre) { doc.cliente = origen.customerName || ""; doc.clienteNumero = origen.customerNumber || ""; }
+      }
+      if (clienteNombre) {
+        const trozo = clienteNombre.replace(/'/g, "''").slice(0, 40);
+        const cli = await bcPedir(`${base}/customers?$filter=${encodeURIComponent(`contains(displayName,'${trozo}')`)}&$select=number,displayName&$top=8`, token);
+        const lista = cli.ok ? (cli.json?.value || []) : [];
+        const exacto = lista.find((c) => String(c.displayName || "").toLowerCase() === clienteNombre.toLowerCase());
+        const elegido = exacto || (lista.length === 1 ? lista[0] : null);
+        if (elegido) { doc.cliente = elegido.displayName; doc.clienteNumero = elegido.number; }
+        else doc.aviso = lista.length ? `Hay varios clientes parecidos a «${clienteNombre}».` : `No encuentro el cliente «${clienteNombre}».`;
+      }
+      if (origen?.id) {
+        let lin = await bcPedir(`${base}/salesInvoices(${origen.id})/salesInvoiceLines?$select=lineType,description,quantity,unitPrice,netAmount`, token);
+        if (!lin.ok) lin = await bcPedir(`${base}/salesInvoices(${origen.id})/salesInvoiceLines`, token);
+        const lineas = lin.ok ? (lin.json?.value || []) : [];
+        doc.lineas = lineas.slice(0, 40).filter((l) => l.description || l.quantity).map((l) => {
+          const importe = Number(l.netAmount);
+          const cantidad = Number(l.quantity) || 0;
+          const precio = Number(l.unitPrice) || 0;
+          return {
+            descripcion: String(l.description || "").slice(0, 120),
+            cantidad,
+            precio,
+            importe: Number.isFinite(importe) && importe !== 0 ? importe : Math.round(cantidad * precio * 100) / 100,
+            comentario: String(l.lineType || "") === "Comment",
+          };
+        });
+        doc.total = Math.round(doc.lineas.reduce((s, l) => s + (l.comentario ? 0 : Number(l.importe) || 0), 0) * 100) / 100;
+      }
+      documentos.push(doc);
+    }
+    res.json({ documentos });
+  } catch (err) {
+    console.error("Error en la vista previa:", err);
+    res.status(500).json({ error: "No he podido preparar la vista previa.", detalle: String(err.message || err) });
   }
 });
 
@@ -785,24 +1170,39 @@ app.get("/api/buzon/mensajes", async (req, res) => {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   }
   const carpeta = req.query.carpeta === "enviados" ? "sentitems" : "inbox";
-  const top = Math.min(Number(req.query.top || 40), 100);
   const buscar = (req.query.q || "").toString().trim();
+  const desde = "2025-10-09T00:00:00Z";
   try {
     const buzon = await buzonDelUsuario(req, res);
     if (!buzon) return;
     const token = await obtenerTokenGraph();
     const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/${carpeta}/messages`;
     const sel = "$select=id,subject,from,toRecipients,receivedDateTime,sentDateTime,isRead,hasAttachments,bodyPreview";
-    let url = `${base}?${sel}&$top=${top}&$orderby=receivedDateTime desc`;
-    if (buscar) url = `${base}?${sel}&$top=${top}&$search="${encodeURIComponent(buscar)}"`;
-    const r = await fetchConReintento(url, {
-      headers: { Authorization: `Bearer ${token}`, ...(buscar ? { ConsistencyLevel: "eventual" } : {}) },
+    const filtro = encodeURIComponent(`receivedDateTime ge ${desde}`);
+    let url = `${base}?${sel}&$top=100&$orderby=receivedDateTime desc&$filter=${filtro}&$count=true`;
+    if (buscar) url = `${base}?${sel}&$top=50&$search="${encodeURIComponent(buscar)}"`;
+    const mensajes = [];
+    const vistos = new Set();
+    let hayMas = false;
+    while (url && mensajes.length < 4000 && !vistos.has(url)) {
+      vistos.add(url);
+      const r = await fetchConReintento(url, {
+        headers: { Authorization: `Bearer ${token}`, ConsistencyLevel: "eventual" },
+      });
+      if (!r.ok) throw new Error(`Graph respondió ${r.status}: ${(await r.text()).slice(0, 300)}`);
+      const data = await r.json();
+      mensajes.push(...(data.value || []));
+      url = data["@odata.nextLink"] || "";
+      if (url && mensajes.length >= 4000) hayMas = true;
+    }
+    const desdeMs = Date.parse(desde);
+    const visibles = mensajes.filter((m) => {
+      const t = Date.parse(m.receivedDateTime || m.sentDateTime || "");
+      return !Number.isNaN(t) && t >= desdeMs;
     });
-    if (!r.ok) throw new Error(`Graph respondió ${r.status}: ${await r.text()}`);
-    const mensajes = (await r.json()).value || [];
     res.json({
-      buzon, carpeta,
-      mensajes: mensajes.map((m) => ({
+      buzon, carpeta, desde: "2025-10-09", hayMas,
+      mensajes: visibles.map((m) => ({
         id: m.id,
         asunto: m.subject || "(sense assumpte)",
         de: m.from?.emailAddress?.address || "",
@@ -849,12 +1249,31 @@ app.get("/api/buzon/mensaje/:id", async (req, res) => {
   }
 });
 
+function adjuntoFirmaCorreo() {
+  try {
+    const bytes = require("fs").readFileSync(path.join(__dirname, "public", "firma-correo.png"));
+    return {
+      "@odata.type": "#microsoft.graph.fileAttachment",
+      name: "firma.png",
+      contentType: "image/png",
+      contentBytes: bytes.toString("base64"),
+      contentId: "firma-correo",
+      isInline: true,
+    };
+  } catch (err) {
+    console.warn("[correo/enviar] sin imagen de firma:", err.message);
+    return null;
+  }
+}
+
 // Envío REAL vía Graph como el usuario logueado (email_empresa AChuman).
+// respuestaA: id del mensaje original, para que la respuesta siga en el hilo.
+// incluirFirma: adjunta la imagen de firma y el HTML debe referenciar cid:firma-correo.
 app.post("/api/correo/enviar", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   }
-  const { para, asunto, cuerpoHtml, adjunto } = req.body || {};
+  const { para, asunto, cuerpoHtml, adjunto, incluirFirma, respuestaA } = req.body || {};
   const destinatarios = Array.isArray(para) ? para.filter(Boolean) : [];
   if (!destinatarios.length) return res.status(400).json({ error: "Falta al menos un destinatario en 'para'." });
   if (!asunto) return res.status(400).json({ error: "Falta 'asunto'." });
@@ -875,22 +1294,69 @@ app.post("/api/correo/enviar", async (req, res) => {
     const buzon = await buzonDelUsuario(req, res);
     if (!buzon) return;
     const token = await obtenerTokenGraph();
+    const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}`;
+    const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+    const graph = (url, method, body) => fetchConReintento(url, {
+      method,
+      headers: body === undefined ? { Authorization: `Bearer ${token}` } : headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, 1);
+    const firma = incluirFirma ? adjuntoFirmaCorreo() : null;
+
+    if (respuestaA) {
+      const creado = await graph(`${base}/messages/${encodeURIComponent(respuestaA)}/createReply`, "POST", {});
+      if (!creado.ok) throw new Error(`Graph respondió ${creado.status} al preparar la respuesta: ${(await creado.text()).slice(0, 300)}`);
+      const draft = await creado.json();
+      const citado = String(draft.body?.contentType || "").toLowerCase() === "html"
+        ? (draft.body?.content || "")
+        : `<pre>${String(draft.body?.content || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`;
+      const parche = await graph(`${base}/messages/${encodeURIComponent(draft.id)}`, "PATCH", {
+        subject: asunto,
+        body: { contentType: "HTML", content: (cuerpoHtml || "") + citado },
+        toRecipients: destinatarios.map((email) => ({ emailAddress: { address: email } })),
+      });
+      if (!parche.ok) throw new Error(`Graph respondió ${parche.status} al escribir la respuesta: ${(await parche.text()).slice(0, 300)}`);
+      if (firma) {
+        const af = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", firma);
+        if (!af.ok) console.warn("[correo/enviar] firma no adjuntada", af.status);
+      }
+      if (adjunto?.base64) {
+        const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", {
+          "@odata.type": "#microsoft.graph.fileAttachment",
+          name: adjunto.nombre || "adjunto.pdf",
+          contentType: adjunto.mime || mimeDeNombre(adjunto.nombre) || "application/pdf",
+          contentBytes: adjunto.base64,
+        });
+        if (!aa.ok) throw new Error(`Graph respondió ${aa.status} al adjuntar el fichero: ${(await aa.text()).slice(0, 200)}`);
+      }
+      const env = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/send`, "POST");
+      if (!env.ok) {
+        const pista = env.status === 403
+          ? " — falta el permiso de aplicación Mail.Send en Azure, con consentimiento de administrador."
+          : "";
+        throw new Error(`Graph respondió ${env.status} enviando la respuesta${pista}: ${(await env.text()).slice(0, 300)}`);
+      }
+      console.log(`[correo/enviar] respuesta de=${buzon} "${asunto}" → ${destinatarios.join(", ")}`);
+      return res.json({ ok: true, de: buzon, para: destinatarios });
+    }
+
     const mensaje = {
       subject: asunto,
       body: { contentType: "HTML", content: cuerpoHtml || "" },
       toRecipients: destinatarios.map((email) => ({ emailAddress: { address: email } })),
     };
+    const adjuntos = [];
+    if (firma) adjuntos.push(firma);
     if (adjunto?.base64) {
-      mensaje.attachments = [
-        {
-          "@odata.type": "#microsoft.graph.fileAttachment",
-          name: adjunto.nombre || "adjunto.pdf",
-          contentType: adjunto.mime || mimeDeNombre(adjunto.nombre) || "application/pdf",
-          contentBytes: adjunto.base64,
-        },
-      ];
+      adjuntos.push({
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        name: adjunto.nombre || "adjunto.pdf",
+        contentType: adjunto.mime || mimeDeNombre(adjunto.nombre) || "application/pdf",
+        contentBytes: adjunto.base64,
+      });
     }
-    const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/sendMail`;
+    if (adjuntos.length) mensaje.attachments = adjuntos;
+    const url = `${base}/sendMail`;
     const r = await fetchConReintento(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -2108,10 +2574,12 @@ app.get("/api/bc/:fuente", async (req, res) => {
 //     cada página como imagen además de leer el texto si lo hay.
 //     Identifica, por página: NUESTRO Nº de pedido (PCNN-NNNNNN /
 //     OCNN-NNNNNN), el Nº de albarán DEL PROVEEDOR y las líneas de
-//     material (descripción + cantidad). Agrupa páginas consecutivas
-//     del mismo pedido (una entrega puede ocupar varias páginas). Las
-//     páginas donde NO se reconoce ningún pedido se agrupan aparte, al
-//     final, para revisión manual.
+//     material (descripción + cantidad). Agrupa solo las páginas
+//     consecutivas de la MISMA entrega: mismo Nº de pedido y mismo Nº
+//     de albarán. El mismo proveedor manda a menudo varios albaranes y
+//     varios pedidos seguidos; eso NO se junta. Una página sin pedido
+//     solo hereda el anterior si es continuación de verdad (sin cabecera
+//     nueva). Si trae otro albarán, queda como documento aparte.
 //     Por cada grupo CON pedido: genera un PDF independiente (solo esas
 //     páginas, en base64, para previsualizar) y, si logra localizar el
 //     pedido en BC, trae sus líneas reales y propone el CRUCE con las
@@ -2124,7 +2592,8 @@ app.get("/api/bc/:fuente", async (req, res) => {
 //   POST /api/recepcion/subir-bc
 //     { pedido, albaran, pdfBase64, nombreArchivo, lineas: [{lineaId, cantidad}] }
 //     Este SÍ escribe en BC, y solo para lo que se le mande confirmado:
-//       1. Actualiza "Nº albarán proveedor" del pedido.
+//       1. Actualiza "Nº albarán proveedor" y "Su/Ntra. ref." del pedido
+//          (los dos con el mismo Nº de albarán).
 //       2. Sube el PDF (solo esas páginas) como adjunto en "Archivos de
 //          documento entrante" del pedido (Incoming Document).
 //       3. Por cada línea confirmada, rellena la "Cantidad a recibir"
@@ -2159,20 +2628,23 @@ async function extraerLotePDF(bytesLotePdf, numPaginasLote) {
     throw new Error("Falta ANTHROPIC_API_KEY en .env.");
   }
   const base64Lote = Buffer.from(bytesLotePdf).toString("base64");
-  const prompt = `Eres un asistente que lee documentos de proveedores (albaranes de entrega, notas de entrega, confirmaciones de pedido) que llegan escaneados/fotocopiados o exportados a PDF, con MUCHAS páginas y MUCHOS proveedores distintos seguidos.
+  const prompt = `Eres un asistente que lee documentos de proveedores (albaranes de entrega, notas de entrega, confirmaciones de pedido) que llegan escaneados/fotocopiados o exportados a PDF, con MUCHAS páginas seguidas.
 
-Te adjunto un PDF con ${numPaginasLote} página(s), en orden.
+Te adjunto un PDF con ${numPaginasLote} página(s), en orden. Lee CADA página por separado. No des por hecho que dos páginas son el mismo documento.
 
-Para CADA página del PDF adjunto (numeradas del 1 al ${numPaginasLote} dentro de este PDF), identifica:
+REGLA IMPORTANTE: el mismo proveedor (mismo membrete, mismo logo, mismo nombre) envía a menudo VARIOS albaranes y VARIOS pedidos distintos, uno detrás de otro. Que el proveedor sea el mismo NO significa que sea la misma entrega. No los juntes. No copies el Nº de pedido ni el Nº de albarán de la página anterior si no están impresos en ESTA página.
+
+Para CADA página (numeradas del 1 al ${numPaginasLote} dentro de este PDF), identifica:
 1. "pagina": el número de página DENTRO DE ESTE PDF (1, 2, 3...).
-2. "pedido": NUESTRO número de pedido de compra. SIEMPRE tiene el formato "PCNN-NNNNNN" u "OCNN-NNNNNN" (dos letras, dos dígitos de año, guion, 6 dígitos), por ejemplo "PC26-002262". Puede venir con etiquetas como "Su pedido", "Pedido nº", "Referencia", "PO", "Order", "Nuestra referencia", etc., o sin etiqueta, escrito a mano o impreso. Ignora cualquier otro número que no siga ese formato.
-3. "albaran": el número de albarán / nota de entrega / delivery note DEL PROVEEDOR (su propio número, no el nuestro).
-4. "lineas": un array con cada artículo/material de la tabla de esa página, con "descripcion" (el texto tal cual aparece) y "cantidad" (número — la cantidad entregada/enviada, NO el precio ni el importe). Si esa página no tiene tabla de artículos, deja "lineas": [].
+2. "pedido": NUESTRO número de pedido de compra, el que esté escrito EN ESTA PÁGINA. Formato "PCNN-NNNNNN" u "OCNN-NNNNNN" (dos letras, dos dígitos de año, guion, 6 dígitos), por ejemplo "PC26-002262". Puede venir como "Su pedido", "Pedido nº", "Referencia", "PO", "Order", "Nuestra referencia", a mano o impreso. Ignora cualquier otro número que no siga ese formato. Si en esta página no aparece, pon null. NUNCA rellenes aquí el pedido de la página anterior.
+3. "albaran": el número de albarán / nota de entrega / delivery note DEL PROVEEDOR escrito EN ESTA PÁGINA (su número, no el nuestro). Si esta página tiene cabecera de albarán, este campo es obligatorio: lee el número de ESTA página, aunque el proveedor sea el mismo que el anterior. Si de verdad no hay número, pon null.
+4. "esContinuacion": true SOLO si esta página no tiene cabecera propia y es claramente el resto de la tabla de la página anterior (pone "continúa" o "página 2", y no hay un albarán nuevo ni un pedido nuevo). false si la página tiene su propia cabecera, su fecha, su Nº de albarán o su Nº de pedido — aunque el proveedor sea idéntico al de la página anterior. Ante la duda, pon false.
+5. "lineas": cada artículo/material de la tabla de ESA página, con "descripcion" (el texto tal cual) y "cantidad" (la cantidad entregada/enviada, NO el precio ni el importe). Si no hay tabla, "lineas": [].
 
-Si una página es continuación de la anterior (no repite el nº de pedido porque es la misma entrega), pon "pedido": null — se heredará de la página anterior — pero SÍ incluye las "lineas" que veas en esa página de continuación. Si una página no tiene relación con ningún pedido reconocible, pon "pedido": null, "albaran": null y "lineas": [].
+Responde ÚNICAMENTE con un array JSON, sin texto adicional, backticks ni explicación, un objeto por página EN EL MISMO ORDEN Y CANTIDAD que las páginas del PDF (${numPaginasLote} objetos).
 
-Responde ÚNICAMENTE con un array JSON, sin texto adicional, backticks ni explicación, un objeto por página EN EL MISMO ORDEN Y CANTIDAD que las páginas del PDF (${numPaginasLote} objetos):
-[{"pagina":1,"pedido":"PC26-002262","albaran":"A-99321","lineas":[{"descripcion":"Tornillo M8 x100","cantidad":100}]}, {"pagina":2,"pedido":null,"albaran":null,"lineas":[]}]`;
+Ejemplo: la página 1 y la 3 son del MISMO proveedor, pero son albaranes y pedidos distintos, así que NO se heredan. La página 2 sí es continuación de la 1:
+[{"pagina":1,"pedido":"PC26-002262","albaran":"A-99321","esContinuacion":false,"lineas":[{"descripcion":"Tornillo M8 x100","cantidad":100}]},{"pagina":2,"pedido":null,"albaran":null,"esContinuacion":true,"lineas":[{"descripcion":"Tuerca M8","cantidad":100}]},{"pagina":3,"pedido":"PC26-003401","albaran":"A-99402","esContinuacion":false,"lineas":[{"descripcion":"Arandela","cantidad":50}]}]`;
 
   const response = await fetchConReintento("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -2211,8 +2683,11 @@ Responde ÚNICAMENTE con un array JSON, sin texto adicional, backticks ni explic
   }
   return (Array.isArray(parseado) ? parseado : []).map((item) => ({
     pagina: item.pagina,
-    pedido: item.pedido ? item.pedido.toString().trim().toUpperCase() : null,
+    pedido: normalizarNumPedido(item.pedido),
     albaran: item.albaran ? item.albaran.toString().trim() : null,
+    // false = esta página es otro documento (aunque sea el mismo proveedor).
+    // null = la IA no lo ha dicho; solo entonces se puede heredar el pedido.
+    esContinuacion: item.esContinuacion === true || item.esContinuacion === "true" ? true : item.esContinuacion === false || item.esContinuacion === "false" ? false : null,
     lineas: Array.isArray(item.lineas)
       ? item.lineas
           .map((l) => ({ descripcion: (l.descripcion || "").toString().trim(), cantidad: Number(l.cantidad) || 0 }))
@@ -2221,26 +2696,48 @@ Responde ÚNICAMENTE con un array JSON, sin texto adicional, backticks ni explic
   }));
 }
 
-// Agrupa páginas consecutivas del mismo pedido (una entrega puede
-// ocupar varias páginas; las de continuación no repiten el nº de
-// pedido, pero sí pueden traer más líneas de material).
+// Clave para comparar albaranes sin que un guion o un espacio los
+// haga parecer distintos ("A-100" y "A 100" son el mismo).
+function claveAlbaran(v) {
+  return String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function albaranDistinto(a, b) {
+  const na = claveAlbaran(a);
+  const nb = claveAlbaran(b);
+  if (!na || !nb) return false;
+  return na !== nb;
+}
+
+// ¿Esta página sigue siendo la misma entrega que el grupo abierto?
+// Una entrega puede ocupar varias páginas. Un albarán o un pedido
+// distinto —aunque el proveedor sea el mismo— abre otro grupo, y NO
+// hereda el Nº de pedido anterior.
+function esMismoDocumento(actual, d) {
+  if (!actual) return false;
+  if (d.pedido && actual.pedido && d.pedido !== actual.pedido) return false;
+  if (albaranDistinto(d.albaran, actual.albaran)) return false;
+  if (d.pedido && actual.pedido && d.pedido === actual.pedido) return true;
+  if (claveAlbaran(d.albaran) && claveAlbaran(actual.albaran)) return true;
+  // Sin números que confirmen que es la misma entrega: solo se hereda
+  // el pedido si la página es continuación (sin cabecera propia).
+  if (d.esContinuacion === true) return true;
+  if (d.esContinuacion === false) return false;
+  return !d.pedido && !claveAlbaran(d.albaran);
+}
+
 function agruparPorPedido(deteccionesPorPagina) {
   const grupos = [];
   let actual = null;
   for (const d of deteccionesPorPagina) {
-    if (d.pedido && (!actual || d.pedido !== actual.pedido)) {
+    if (!esMismoDocumento(actual, d)) {
       if (actual) grupos.push(actual);
-      actual = { pedido: d.pedido, albaran: d.albaran || null, paginas: [d.pagina], lineas: [...d.lineas] };
-    } else if (actual) {
+      actual = { pedido: d.pedido || null, albaran: d.albaran || null, paginas: [d.pagina], lineas: [...(d.lineas || [])] };
+    } else {
       actual.paginas.push(d.pagina);
       if (!actual.albaran && d.albaran) actual.albaran = d.albaran;
-      actual.lineas.push(...d.lineas);
-    } else {
-      // páginas iniciales sin ningún pedido detectado todavía: grupo "sin identificar"
-      if (!grupos.length || grupos[grupos.length - 1].pedido) grupos.push({ pedido: null, albaran: d.albaran || null, paginas: [], lineas: [] });
-      const g = grupos[grupos.length - 1];
-      g.paginas.push(d.pagina);
-      g.lineas.push(...d.lineas);
+      if (!actual.pedido && d.pedido) actual.pedido = d.pedido;
+      actual.lineas.push(...(d.lineas || []));
     }
   }
   if (actual) grupos.push(actual);
@@ -2402,15 +2899,21 @@ app.post("/api/recepcion/extraer", async (req, res) => {
     // de líneas con BC.
     const gruposFinal = [];
     for (const g of grupos) {
-      if (!g.pedido || !g.paginas.length) {
-        gruposFinal.push({ ...g, pdfBase64: null, lineasEmparejadas: [], lineasDisponiblesBC: [], vendorName: null, bcError: null });
+      // Vista previa también si el albarán se ha separado pero aún no
+      // tiene Nº de pedido: así se puede escribir a mano, sin haberlo
+      // juntado con el pedido anterior del mismo proveedor.
+      let pdfBase64 = null;
+      if (g.paginas.length) {
+        const nuevo = await PDFDocument.create();
+        const copiadas = await nuevo.copyPages(srcPdf, g.paginas.map((p) => p - 1));
+        copiadas.forEach((p) => nuevo.addPage(p));
+        const bytes = await nuevo.save();
+        pdfBase64 = Buffer.from(bytes).toString("base64");
+      }
+      if (!g.pedido) {
+        gruposFinal.push({ ...g, pdfBase64, lineasEmparejadas: [], lineasDisponiblesBC: [], vendorName: null, bcError: null });
         continue;
       }
-      const nuevo = await PDFDocument.create();
-      const copiadas = await nuevo.copyPages(srcPdf, g.paginas.map((p) => p - 1));
-      copiadas.forEach((p) => nuevo.addPage(p));
-      const bytes = await nuevo.save();
-      const pdfBase64 = Buffer.from(bytes).toString("base64");
 
       const bc = await buscarPedidoYLineasBC(g.pedido);
       const lineasEmparejadas = bc.lineasBC ? emparejarLineas(g.lineas, bc.lineasBC) : [];
@@ -2482,7 +2985,7 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
   const registrar = req.body?.registrar !== false; // «Subir este pedido en BC» = subir sin registrar
   if (!pedido) return res.status(400).json({ error: "Falta el Nº de pedido." });
 
-  const resultado = { pedido, version: "subir-bc-v5-cargos", albaran: { ok: false }, adjunto: { ok: false }, lineas: [] };
+  const resultado = { pedido, version: "subir-bc-v6-referencia", albaran: { ok: false }, referencia: null, adjunto: { ok: false }, lineas: [] };
 
   try {
     const token = await obtenerTokenBC();
@@ -2513,6 +3016,7 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
 
         let hecho = false;
         const intentos = [];
+        resultado.referencia = { ok: false };
         for (const clave of candidatosClave) {
           const urlRegistro = `${raizWS}/${encodeURIComponent(servicioPedidos)}${clave}`;
           const rGet = await fetchConReintento(urlRegistro, { headers: cabeceras });
@@ -2521,22 +3025,48 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
 
           const registro = await rGet.json();
           const etag = registro["@odata.etag"] || "*";
-          const rPatch = await fetchConReintento(urlRegistro, {
-            method: "PATCH",
-            headers: { ...cabeceras, "Content-Type": "application/json", "If-Match": etag },
-            body: JSON.stringify({ Vendor_Shipment_No: albaran }),
-          });
-          intentos.push(`${clave} → PATCH ${rPatch.status}`);
-          if (rPatch.ok) {
+          // "Su/Ntra. ref." de la cabecera del pedido = Your Reference.
+          // Se toma el nombre real que devuelve la página; si no viene,
+          // se prueba el estándar de BC.
+          const campoRef = ["Your_Reference", "YourReference", "yourReference"].find((k) => k in registro)
+            || Object.keys(registro).find((k) => /your.?reference|su.?ntra|ntra.?ref/i.test(k))
+            || "Your_Reference";
+          const parchear = async (cuerpo, etagActual) => {
+            const r = await fetchConReintento(urlRegistro, {
+              method: "PATCH",
+              headers: { ...cabeceras, "Content-Type": "application/json", "If-Match": etagActual || "*" },
+              body: JSON.stringify(cuerpo),
+            });
+            const texto = r.ok ? "" : (await r.text().catch(() => "")).slice(0, 300);
+            return { ok: r.ok, status: r.status, texto };
+          };
+          const ambos = await parchear({ Vendor_Shipment_No: albaran, [campoRef]: albaran }, etag);
+          intentos.push(`${clave} → PATCH albarán+Su/Ntra. ref. ${ambos.status}`);
+          if (ambos.ok) {
             resultado.albaran.ok = true;
+            resultado.referencia.ok = true;
             hecho = true;
           } else {
-            resultado.albaran.error = `BC respondió ${rPatch.status} al actualizar el albarán: ${(await rPatch.text().catch(() => "")).slice(0, 300)}`;
+            const soloAlb = await parchear({ Vendor_Shipment_No: albaran }, "*");
+            intentos.push(`${clave} → PATCH albarán ${soloAlb.status}`);
+            if (soloAlb.ok) {
+              resultado.albaran.ok = true;
+              hecho = true;
+            } else {
+              resultado.albaran.error = `BC respondió ${soloAlb.status} al actualizar el albarán: ${soloAlb.texto}`;
+            }
+            const rRef = await parchear({ [campoRef]: albaran }, "*");
+            intentos.push(`${clave} → PATCH ${campoRef} ${rRef.status}`);
+            if (rRef.ok) resultado.referencia.ok = true;
+            else resultado.referencia.error = `BC respondió ${rRef.status} al escribir Su/Ntra. ref.: ${rRef.texto}`;
           }
           break; // el registro SÍ se encontró con esta clave — no seguir probando otras
         }
         if (!hecho && !resultado.albaran.error) {
           resultado.albaran.error = `Pedido "${pedido}" no encontrado en "${servicioPedidos}" con ninguna de las claves probadas: ${intentos.join(" · ")}`;
+        }
+        if (resultado.referencia && !resultado.referencia.ok && !resultado.referencia.error) {
+          resultado.referencia.error = resultado.albaran.error || "No se ha escrito Su/Ntra. ref.";
         }
       } catch (e) {
         resultado.albaran.error = String(e.message || e);
@@ -2861,66 +3391,98 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
 const TOLERANCIA_PRECIO_PCT = 0.02; // 2% de diferencia relativa
 const TOLERANCIA_PRECIO_ABS = 0.02; // o 2 céntimos absolutos, lo que sea mayor
 
+function jsonDeRespuestaIA(texto) {
+  const limpio = String(texto || "").replace(/```json|```/g, "").trim();
+  const candidatos = [limpio];
+  const inicio = limpio.indexOf("[");
+  const fin = limpio.lastIndexOf("]");
+  if (inicio >= 0 && fin > inicio) candidatos.push(limpio.slice(inicio, fin + 1));
+  for (const candidato of candidatos) {
+    try {
+      const valor = JSON.parse(candidato);
+      if (Array.isArray(valor)) return valor;
+    } catch { /* el siguiente candidato */ }
+  }
+  return null;
+}
+
 async function extraerLoteFacturaPDF(bytesLotePdf, numPaginasLote) {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error("Falta ANTHROPIC_API_KEY en .env.");
   }
-  const base64Lote = Buffer.from(bytesLotePdf).toString("base64");
-  const prompt = `Eres un asistente que lee FACTURAS DE PROVEEDOR (compras), escaneadas/fotocopiadas o exportadas a PDF, con posiblemente varias facturas distintas seguidas en el mismo documento.
+  const prompt = `Eres un asistente que lee FACTURAS DE PROVEEDOR (compras).
 
-Te adjunto un PDF con ${numPaginasLote} página(s), en orden.
+El documento tiene ${numPaginasLote} página(s), en orden.
 
-Para CADA página del PDF adjunto (numeradas del 1 al ${numPaginasLote} dentro de este PDF), identifica:
-1. "pagina": el número de página DENTRO DE ESTE PDF (1, 2, 3...).
-2. "factura": el número de factura DEL PROVEEDOR (su propio número de factura, no el nuestro). Si la página es continuación de la factura de la página anterior (no repite el número), pon "factura": null — se heredará de la página anterior.
-3. "proveedor": el nombre o razón social DEL PROVEEDOR que emite la factura (el que aparece en la cabecera/membrete, no el nuestro — "Also Casals" o similar es el cliente, no el proveedor). Si la página es continuación y no repite el nombre, pon "proveedor": null — se heredará de la página anterior.
-4. "fecha": la fecha DE LA FACTURA (la de emisión del proveedor, no la de vencimiento ni la del pedido), en formato "YYYY-MM-DD". Si la página es continuación y no repite la fecha, pon "fecha": null — se heredará de la página anterior. Si no se encuentra ninguna fecha de factura en el documento, pon "fecha": null.
-5. "baseImponible": la BASE IMPONIBLE (subtotal antes de IVA/impuestos) que aparezca en el resumen/totales de esa página, como número (sin símbolo de moneda, con punto decimal). Normalmente solo sale en la ÚLTIMA página de la factura, en el resumen final — en las demás páginas pon "baseImponible": null.
-6. "importeTotal": el IMPORTE TOTAL de la factura (con IVA/impuestos incluidos) que aparezca en el resumen/totales de esa página, como número. Igual que la base imponible, normalmente solo sale en la ÚLTIMA página — en las demás pon "importeTotal": null.
-7. "lineas": un array con cada artículo/concepto facturado en la tabla de esa página, con:
-   - "descripcion": el texto tal cual aparece.
-   - "cantidad": la cantidad facturada (número).
-   - "precioUnitario": el precio unitario de esa línea (número, sin símbolo de moneda, con punto decimal — p.ej. 12.5, no "12,50 €"). Si la tabla trae precio con descuento aparte, usa el precio unitario ANTES de aplicar el descuento de línea (el que multiplicado por la cantidad da el importe bruto de la línea).
-   - "pedido": NUESTRO número de pedido de compra al que corresponde ESA línea. SIEMPRE tiene el formato "PCNN-NNNNNN" u "OCNN-NNNNNN" (dos letras, dos dígitos de año, guion, 6 dígitos), por ejemplo "PC26-002262". Puede venir con etiquetas como "Su pedido", "Pedido nº", "Referencia", "PO", "Order", "Nuestra referencia", etc. Una misma factura puede tener líneas de pedidos DISTINTOS — identifica el pedido línea por línea, no asumas que es el mismo para toda la factura. Si una línea no tiene ningún pedido nuestro reconocible, pon "pedido": null en esa línea.
-   Si esa página no tiene tabla de artículos, deja "lineas": [].
+Para CADA página (numeradas del 1 al ${numPaginasLote}), identifica:
+1. "pagina": el número de página (1, 2, 3...).
+2. "factura": el número de factura DEL PROVEEDOR (su propio número, no el nuestro). Si la página es continuación y no repite el número, pon "factura": null.
+3. "proveedor": la razón social DEL PROVEEDOR que emite la factura (el membrete, no "Also Casals", que es el cliente). Si es continuación y no lo repite, pon "proveedor": null.
+4. "fecha": la fecha DE EMISIÓN de la factura, "YYYY-MM-DD". No uses la de vencimiento ni la del pedido. Si no está, pon "fecha": null.
+5. "baseImponible": la base imponible (antes de IVA) del resumen, como número. Si no está en esa página, null.
+6. "importeTotal": el total con IVA del resumen, como número. Si no está en esa página, null.
+7. "lineas": cada artículo de la tabla de esa página:
+   - "descripcion": el texto tal cual.
+   - "cantidad": número.
+   - "precioUnitario": precio unitario antes del descuento de línea, con punto decimal.
+   - "pedido": NUESTRO pedido de compra SOLO si está impreso como "PCNN-NNNNNN" u "OCNN-NNNNNN" (ejemplo "PC26-002262"). Si no, null. No lo inventes.
+   Si no hay tabla, "lineas": [].
 
-Responde ÚNICAMENTE con un array JSON, sin texto adicional, backticks ni explicación, un objeto por página EN EL MISMO ORDEN Y CANTIDAD que las páginas del PDF (${numPaginasLote} objetos):
-[{"pagina":1,"factura":"F-2026-01234","proveedor":"Movistar-Telefónica de España S.A.U.","fecha":"2026-08-21","baseImponible":null,"importeTotal":null,"lineas":[{"descripcion":"Tornillo M8 x100","cantidad":100,"precioUnitario":0.12,"pedido":"PC26-002262"}]}, {"pagina":2,"factura":null,"proveedor":null,"fecha":null,"baseImponible":72.81,"importeTotal":88.10,"lineas":[]}]`;
+El resultado es un array JSON de ${numPaginasLote} objetos, en orden. Aunque el documento no sea una factura (albarán, confirmación de pedido, presupuesto), responde igual con ese array y rellena solo lo que esté escrito. Nunca expliques ni analices en prosa.
+[{"pagina":1,"factura":"F-2026-01234","proveedor":"Proveedor S.L.","fecha":"2026-08-21","baseImponible":null,"importeTotal":null,"lineas":[{"descripcion":"Tornillo M8","cantidad":100,"precioUnitario":0.12,"pedido":"PC26-002262"}]}]`;
 
-  const response = await fetchConReintento("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Lote } },
-            { type: "text", text: prompt },
-          ],
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const detalle = await response.text();
-    throw new Error(`Anthropic respondió ${response.status}: ${detalle.slice(0, 300)}`);
-  }
-  const data = await response.json();
-  const texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  const limpio = texto.replace(/```json|```/g, "").trim();
-  let parseado;
+  let textoPdf = "";
   try {
-    parseado = JSON.parse(limpio);
-  } catch {
-    throw new Error(`No se pudo interpretar la respuesta de la IA para este lote: ${limpio.slice(0, 200)}`);
+    const leido = await pdfParse(Buffer.from(bytesLotePdf));
+    textoPdf = String(leido?.text || "").replace(/\u0000/g, "").trim();
+  } catch { /* PDF escaneado o protegido: se lee como imagen */ }
+  const letras = (textoPdf.match(/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]/g) || []).length;
+  const porTexto = letras >= Math.max(120, numPaginasLote * 40);
+  console.log(`[facturas-compra/extraer] lote de ${numPaginasLote} pág. · ${porTexto ? `texto (${letras} caracteres)` : "imagen"}`);
+
+  const cierre = "Responde ÚNICAMENTE con el array JSON. Sin análisis, sin markdown y sin texto antes ni después.";
+  const content = porTexto
+    ? [{ type: "text", text: `${prompt}\n\nTEXTO DEL PDF (no inventes líneas que no estén aquí):\n${textoPdf.slice(0, 50000)}\n\n${cierre}` }]
+    : [
+        { type: "document", source: { type: "base64", media_type: "application/pdf", data: Buffer.from(bytesLotePdf).toString("base64") } },
+        { type: "text", text: `${prompt}\n\n${cierre}` },
+      ];
+
+  const pedir = async (messages) => {
+    const response = await fetchConReintento("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
+        max_tokens: 4096,
+        messages,
+      }),
+    });
+    if (!response.ok) {
+      const detalle = await response.text();
+      throw new Error(`Anthropic respondió ${response.status}: ${detalle.slice(0, 300)}`);
+    }
+    const data = await response.json();
+    return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  };
+
+  let texto = await pedir([{ role: "user", content }]);
+  let parseado = jsonDeRespuestaIA(texto);
+  if (!parseado) {
+    console.warn(`[facturas-compra/extraer] la IA respondió en texto, se pide el JSON otra vez: ${texto.slice(0, 180)}`);
+    texto = await pedir([
+      { role: "user", content },
+      { role: "assistant", content: texto.slice(0, 12000) },
+      { role: "user", content: "Eso no vale. Devuelve solo el array JSON con pagina, factura, proveedor, fecha, baseImponible, importeTotal y lineas. Sin explicación." },
+    ]);
+    parseado = jsonDeRespuestaIA(texto);
+  }
+  if (!parseado) {
+    throw new Error(`No se pudo interpretar la respuesta de la IA para este lote: ${String(texto).replace(/```json|```/g, "").trim().slice(0, 200)}`);
   }
   return (Array.isArray(parseado) ? parseado : []).map((item) => ({
     pagina: item.pagina,
@@ -3200,9 +3762,54 @@ async function obtenerHistoricoFacturasCompra(raiz, cabeceras) {
   return null;
 }
 
+async function facturaYaEntradaRapida(vendorInvoiceNumber) {
+  const seguro = String(vendorInvoiceNumber || "").trim().replace(/'/g, "''");
+  if (!seguro) return { encontrada: false };
+  const token = await obtenerTokenBC();
+  const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  const api = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+  try {
+    const r = await fetchConReintento(`${api}/purchaseInvoices?$filter=vendorInvoiceNumber eq '${seguro}'&$top=1&$select=number,vendorName,vendorInvoiceNumber`, { headers });
+    if (r.ok) {
+      const fila = ((await r.json()).value || [])[0];
+      if (fila) return { encontrada: true, numeroBC: fila.number || null, proveedor: fila.vendorName || null };
+    }
+  } catch { /* se prueba el histórico publicado */ }
+  const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+  const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+  const servicios = ["Hist_facturas_compra_Excel", "Purchase_Invoice_Header_Excel", "Purch_Inv_Header_Excel"];
+  let algunaLista = false;
+  for (const servicio of servicios) {
+    for (const campo of ["Vendor_Invoice_No", "Vendor_Invoice_No_"]) {
+      try {
+        const url = `${raiz}/${encodeURIComponent(servicio)}?$filter=${campo} eq '${seguro}'&$top=1`;
+        const r = await fetchConReintento(url, { headers });
+        if (!r.ok) continue;
+        algunaLista = true;
+        const fila = ((await r.json()).value || [])[0];
+        if (fila) {
+          return {
+            encontrada: true,
+            numeroBC: fila.No || fila.Document_No || null,
+            proveedor: fila.Buy_from_Vendor_Name || fila.Vendor_Name || null,
+          };
+        }
+      } catch { /* siguiente columna */ }
+    }
+  }
+  return algunaLista ? { encontrada: false } : null;
+}
+
 async function facturaYaEntradaEnBC(vendorInvoiceNumber) {
   if (!vendorInvoiceNumber) return { encontrada: false };
   try {
+    try {
+      const rapida = await facturaYaEntradaRapida(vendorInvoiceNumber);
+      if (rapida) return rapida;
+    } catch (e) {
+      console.warn("[facturas-compra/duplicados] Consulta directa falló, se mira el histórico:", String(e.message || e));
+    }
+
     const token = await obtenerTokenBC();
     const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
     const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
@@ -3247,6 +3854,28 @@ async function facturaYaEntradaEnBC(vendorInvoiceNumber) {
 // a escribir en BC con un campo sin confirmar.
 function normalizarTextoBC(s) {
   return (s || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function claveProveedor(s) {
+  return String(s || "")
+    .toUpperCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\b(S\.?\s*L\.?\s*U?\.?|S\.?\s*A\.?|S\.?\s*C\.?|COOP\.?|SOCIEDAD|LIMITADA)\b/g, " ")
+    .replace(/[^A-Z0-9]+/g, "")
+    .trim();
+}
+
+// El pedido de BC solo vale si su proveedor es el de la factura.
+// SECURITYPLA no puede quedar ligado a un pedido de LADISLAO MESTRE.
+function proveedoresParecidos(factura, pedido) {
+  const a = claveProveedor(factura);
+  const b = claveProveedor(pedido);
+  if (!a || !b) return true;
+  if (a === b || a.includes(b) || b.includes(a)) return true;
+  const corta = a.length < b.length ? a : b;
+  const larga = a.length < b.length ? b : a;
+  return corta.length >= 6 && larga.includes(corta.slice(0, 6));
 }
 
 function columnasHistLineas(headers) {
@@ -3352,10 +3981,572 @@ async function obtenerProveedoresDeGasto(raiz, cabeceras) {
   return gastoProveedoresCache;
 }
 
-// Transparencia (Maria, 2026-09-04): mismo patrón que "Ver columnas" de
-// Pedidos pendientes de facturar — para poder comprobar en pantalla qué
-// se ha detectado (columnas usadas + lista de proveedores de gasto con
-// su cuenta/OT) antes de fiarse, sin tener que adivinar a ciegas.
+// Cuando la factura llega sin pedido de compra, se mira la ÚLTIMA factura
+// de compra ya entrada de ese proveedor (no la cuenta más frecuente) y se
+// propone entrar esta igual: mismo tipo de línea, misma cuenta, misma OT
+// y mismo departamento. Los importes salen del PDF de ahora.
+function columnasUltimaEntrada(headers) {
+  const base = columnasHistLineas(headers);
+  const find = (res) => {
+    for (const re of res) {
+      const i = headers.findIndex((h) => re.test(h));
+      if (i >= 0) return headers[i];
+    }
+    return "";
+  };
+  return {
+    ...base,
+    fecha: find([/^Posting_Date$/i, /^Document_Date$/i, /fecha.*regist/i]),
+    documento: find([/^Document_No_?$/i]),
+    pedido: find([/^Order_No_?$/i, /^Pedido_No/i]),
+    proveedorNo: find([/Buy.?from.?Vendor.?No/i, /^Vendor_No_?$/i, /Pay.?to.?Vendor.?No/i]),
+    descripcion: find([/^Description$/i, /^Descripci[oó]n$/i]),
+    importe: find([/^Line_Amount$/i, /^Amount$/i, /^Importe$/i]),
+    cantidad: find([/^Quantity$/i, /^Cantidad$/i]),
+    precio: find([/^Direct_Unit_Cost$/i, /^Unit_Cost$/i, /coste.*unit/i]),
+    departamento: find([/Shortcut_Dimension_1_Code/i, /Global_Dimension_1_Code/i]),
+  };
+}
+
+function fechaFilaHistorico(valor) {
+  const s = (valor || "").toString().trim();
+  if (!s) return "";
+  const d = Date.parse(s);
+  return Number.isNaN(d) ? "" : new Date(d).toISOString();
+}
+
+function tipoLineaApi(tipoValor) {
+  const t = normalizarTextoBC(tipoValor);
+  if (/item|art/.test(t)) return "Item";
+  if (/recurso|resource/.test(t)) return "Resource";
+  if (/cargo|charge/.test(t)) return "Charge";
+  if (!t || /cuenta|g\/?l|account/.test(t)) return "Account";
+  return null;
+}
+
+async function buscarNumeroProveedor(nombre) {
+  if (!nombre) return "";
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const headers = { Authorization: `Bearer ${token}` };
+    const filtro = encodeURIComponent(`displayName eq '${String(nombre).replace(/'/g, "''")}'`);
+    const r = await fetchConReintento(`${base}/vendors?$filter=${filtro}&$select=number,displayName&$top=5`, { headers });
+    if (r.ok) {
+      const j = await r.json();
+      if (j.value?.[0]?.number) return String(j.value[0].number);
+    }
+    const r2 = await fetchConReintento(`${base}/vendors?$select=number,displayName&$top=400`, { headers });
+    if (!r2.ok) return "";
+    const j2 = await r2.json();
+    const hit = (j2.value || []).find((v) => v.displayName && proveedoresParecidos(nombre, v.displayName));
+    return hit?.number ? String(hit.number) : "";
+  } catch (e) {
+    console.warn("[facturas-compra/ultima] No se pudo buscar el proveedor:", String(e.message || e));
+    return "";
+  }
+}
+
+async function lineasHistoricoDelProveedor(raiz, cabeceras, nombreProveedor) {
+  const palabra = String(nombreProveedor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .match(/[A-Z]{4,}/);
+  const trozo = (palabra ? palabra[0] : "").slice(0, 12);
+  if (trozo.length < 4) return null;
+  const filtro = encodeURIComponent(`contains(Buy_from_Vendor_Name,'${trozo.replace(/'/g, "''")}')`);
+  const servicio = "Hist_líns_facturas_compra_Excel";
+  const url = `${raiz}/${encodeURIComponent(servicio)}?$filter=${filtro}&$orderby=Document_No desc&$top=80`;
+  const r = await fetchConReintento(url, cabeceras);
+  if (!r.ok) return null;
+  const filas = ((await r.json()).value || []).filter((fila) => proveedoresParecidos(nombreProveedor, fila.Buy_from_Vendor_Name || ""));
+  return filas.length ? filas : null;
+}
+
+function otUtil(valor) {
+  const s = String(valor || "").trim();
+  if (!s || /^_?sin[_\s-]*ot$/i.test(s)) return "";
+  return s;
+}
+
+async function proponerUltimaEntrada(nombreProveedor) {
+  if (!nombreProveedor) return null;
+  const token = await obtenerTokenBC();
+  const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+  const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+  const cabeceras = { headers: { Authorization: `Bearer ${token}` } };
+
+  // El histórico de líneas no tiene "Vendor Invoice No.", así que el
+  // cargador de duplicados lo descarta y la propuesta salía vacía.
+  // Aquí se filtra por el nombre del proveedor y se ordena por nº de factura BC.
+  let filasProveedor = await lineasHistoricoDelProveedor(raiz, cabeceras, nombreProveedor);
+  let campoProveedor = "Buy_from_Vendor_Name";
+  if (!filasProveedor) {
+    const historico = await obtenerHistoricoFacturasCompra(raiz, cabeceras);
+    if (!historico?.filas?.length || !historico.campoProveedor) return null;
+    campoProveedor = historico.campoProveedor;
+    filasProveedor = historico.filas.filter((fila) => {
+      const nombre = (fila[campoProveedor] || "").toString().trim();
+      return nombre && proveedoresParecidos(nombreProveedor, nombre);
+    });
+  }
+  if (!filasProveedor.length) return null;
+
+  const headers = Object.keys(filasProveedor[0]);
+  const cols = columnasUltimaEntrada(headers);
+  const delProveedor = filasProveedor;
+  if (!delProveedor.length) return null;
+
+  const grupos = new Map();
+  for (const fila of delProveedor) {
+    const doc = (cols.documento ? fila[cols.documento] : "") || "";
+    const claveDoc = String(doc || "").trim();
+    if (!claveDoc) continue;
+    if (!grupos.has(claveDoc)) {
+      grupos.set(claveDoc, {
+        clave: claveDoc,
+        fecha: "",
+        filas: [],
+        proveedor: (fila[campoProveedor] || "").toString().trim(),
+        vendorNumber: cols.proveedorNo ? String(fila[cols.proveedorNo] || "").trim() : "",
+      });
+    }
+    const gdoc = grupos.get(claveDoc);
+    gdoc.filas.push(fila);
+    const fch = cols.fecha ? fechaFilaHistorico(fila[cols.fecha]) : "";
+    if (fch && fch > gdoc.fecha) gdoc.fecha = fch;
+    if (!gdoc.vendorNumber && cols.proveedorNo) gdoc.vendorNumber = String(fila[cols.proveedorNo] || "").trim();
+  }
+  const lista = [...grupos.values()];
+  if (!lista.length) return null;
+  lista.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)) || String(b.clave).localeCompare(String(a.clave)));
+
+  // La factura más nueva de este proveedor, tal como se entró (cuenta o artículo).
+  const elegido = lista[0];
+  const lineaDe = (fila) => ({
+    tipo: cols.tipo ? String(fila[cols.tipo] || "").trim() : "",
+    tipoApi: tipoLineaApi(cols.tipo ? fila[cols.tipo] : ""),
+    cuenta: cols.cuenta ? String(fila[cols.cuenta] || "").trim() : "",
+    ot: cols.ot ? otUtil(fila[cols.ot]) : "",
+    departamento: cols.departamento ? String(fila[cols.departamento] || "").trim() : "",
+    descripcion: cols.descripcion ? String(fila[cols.descripcion] || "").trim() : "",
+    importe: cols.importe && fila[cols.importe] != null && fila[cols.importe] !== "" ? Number(fila[cols.importe]) : null,
+    cantidad: cols.cantidad && fila[cols.cantidad] != null && fila[cols.cantidad] !== "" ? Number(fila[cols.cantidad]) : null,
+    precio: cols.precio && fila[cols.precio] != null && fila[cols.precio] !== "" ? Number(fila[cols.precio]) : null,
+    pedido: cols.pedido ? String(fila[cols.pedido] || "").trim() : "",
+  });
+  const lineas = elegido.filas.map(lineaDe).filter((l) => l.cuenta || l.descripcion).slice(0, 12);
+  const principal = lineas.find((l) => l.cuenta && l.tipoApi) || lineas.find((l) => l.cuenta) || null;
+  const facturaProveedor = "";
+  const numeroBC = cols.documento ? elegido.clave : elegido.clave;
+  const fechaCorta = elegido.fecha ? elegido.fecha.slice(0, 10) : null;
+  const puedeCrear = !!(principal?.cuenta && principal?.tipoApi);
+  let vendorNumber = elegido.vendorNumber || "";
+  if (puedeCrear && !vendorNumber) vendorNumber = await buscarNumeroProveedor(elegido.proveedor || nombreProveedor);
+
+  const ref = `${numeroBC || facturaProveedor || "sin número"}${fechaCorta ? ` del ${fechaCorta}` : ""}`;
+  const nombre = elegido.proveedor || nombreProveedor;
+  const tipoTxt = principal?.tipo || principal?.tipoApi || "línea";
+  const otTxt = principal?.ot ? `, OT ${principal.ot}` : "";
+  const deptoTxt = principal?.departamento ? `, dimensión ${principal.departamento}` : "";
+  const resumen = puedeCrear
+    ? `No hay pedido de compra. La factura más nueva de ${nombre} es ${ref}. Se propone crear un pedido igual: ${tipoTxt} ${principal.cuenta}${otTxt}${deptoTxt}. La cantidad y el precio salen de este PDF.`
+    : `No hay pedido de compra y no se ha podido leer cómo se entró la factura más nueva de ${nombre}.`;
+
+  return {
+    proveedorFactura: nombreProveedor,
+    proveedorBC: nombre,
+    vendorNumber: vendorNumber || null,
+    numeroBC: numeroBC || null,
+    facturaProveedor: facturaProveedor || null,
+    fecha: fechaCorta,
+    cuenta: principal?.cuenta || null,
+    ot: principal?.ot || null,
+    departamento: principal?.departamento || null,
+    lineType: principal?.tipoApi || null,
+    puedeCrear,
+    lineas,
+    resumen,
+  };
+}
+
+function lineasBorradorComoUltima(comoUltima, propuesta) {
+  const crudas = Array.isArray(comoUltima?.lineas) ? comoUltima.lineas : [];
+  const utiles = crudas.filter((l) => l && (l.descripcion || l.precioUnitario != null || l.cantidad != null));
+  const tipo = propuesta.lineType || "Account";
+  const cuenta = propuesta.cuenta;
+  const base = (l) => ({
+    codigoBC: cuenta,
+    lineType: tipo,
+    ot: propuesta.ot || null,
+    depto: propuesta.departamento || null,
+    coincidencia: "manual",
+  });
+  if (utiles.length) {
+    return utiles.map((l) => ({
+      ...base(l),
+      descripcion: String(l.descripcion || `Factura ${comoUltima.factura || ""}`).trim().slice(0, 100),
+      cantidad: Number(l.cantidad) > 0 ? Number(l.cantidad) : 1,
+      precio: l.precioUnitario != null && l.precioUnitario !== "" && !Number.isNaN(Number(l.precioUnitario)) ? Number(l.precioUnitario) : null,
+    }));
+  }
+  const importe = Number(comoUltima?.baseImponible);
+  if (!importe) return [];
+  return [{
+    ...base(),
+    descripcion: `Factura ${comoUltima.factura || ""}`.trim().slice(0, 100),
+    cantidad: 1,
+    precio: importe,
+  }];
+}
+
+function lineasPedidoComoUltima(datos, propuesta) {
+  const plantillas = (propuesta.lineas || []).filter((l) => l.cuenta && l.tipoApi);
+  const pdf = (Array.isArray(datos?.lineas) ? datos.lineas : []).filter((l) => l && (l.descripcion || l.precioUnitario != null || l.cantidad != null));
+  const mezclar = (plantilla, actual) => ({
+    codigoBC: plantilla.cuenta,
+    lineType: plantilla.tipoApi,
+    ot: plantilla.ot || null,
+    depto: plantilla.departamento || null,
+    descripcion: String((actual?.descripcion || plantilla.descripcion || `Factura ${datos?.factura || ""}`)).trim().slice(0, 100),
+    cantidad: Number(actual?.cantidad) > 0 ? Number(actual.cantidad) : (Number(plantilla.cantidad) > 0 ? Number(plantilla.cantidad) : 1),
+    precio: actual?.precioUnitario != null && actual.precioUnitario !== "" && !Number.isNaN(Number(actual.precioUnitario))
+      ? Number(actual.precioUnitario)
+      : (plantilla.precio != null && !Number.isNaN(Number(plantilla.precio)) ? Number(plantilla.precio) : null),
+  });
+  if (pdf.length && plantillas.length === pdf.length) return pdf.map((l, i) => mezclar(plantillas[i], l));
+  if (pdf.length && plantillas[0]) return pdf.map((l) => mezclar(plantillas[0], l));
+  if (plantillas.length) return plantillas.map((p) => mezclar(p, null));
+  const importe = Number(datos?.baseImponible);
+  if (!importe || !propuesta.cuenta) return [];
+  return [mezclar({ cuenta: propuesta.cuenta, tipoApi: propuesta.lineType || "Account", ot: propuesta.ot, departamento: propuesta.departamento, descripcion: "" }, { cantidad: 1, precioUnitario: importe, descripcion: `Factura ${datos?.factura || ""}` })];
+}
+
+let cacheDimGlobal = null;
+
+async function dimensionesGlobales(token) {
+  if (cacheDimGlobal) return cacheDimGlobal;
+  const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+  const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+  const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  for (const servicio of ["General_Ledger_Setup", "GeneralLedgerSetup"]) {
+    const r = await fetchConReintento(`${raiz}/${encodeURIComponent(servicio)}?$top=1`, { headers });
+    if (!r.ok) continue;
+    const fila = ((await r.json()).value || [])[0] || {};
+    const d1 = fila.Global_Dimension_1_Code || null;
+    const d2 = fila.Global_Dimension_2_Code || null;
+    if (d1 || d2) {
+      cacheDimGlobal = { d1, d2 };
+      return cacheDimGlobal;
+    }
+  }
+  cacheDimGlobal = { d1: null, d2: null };
+  return cacheDimGlobal;
+}
+
+async function ponerValorDimension(urlColeccion, code, valueCode, token) {
+  if (!code || !valueCode) return "Falta el código de la dimensión en BC.";
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" };
+  const rLista = await fetchConReintento(urlColeccion, { headers });
+  if (!rLista.ok) {
+    const txt = (await rLista.text().catch(() => "")).slice(0, 180);
+    return `BC ${rLista.status} ${txt}`.trim();
+  }
+  const existentes = ((await rLista.json()).value || []);
+  const ya = existentes.find((d) => String(d.code || "").toUpperCase() === String(code).toUpperCase());
+  if (ya && ya.valueCode === valueCode) return null;
+  const r = ya?.id
+    ? await fetchConReintento(`${urlColeccion}(${ya.id})`, { method: "PATCH", headers, body: JSON.stringify({ valueCode }) })
+    : await fetchConReintento(urlColeccion, { method: "POST", headers, body: JSON.stringify({ code, valueCode }) });
+  if (r.ok) return null;
+  const txt = (await r.text().catch(() => "")).slice(0, 200);
+  return `BC ${r.status} ${txt}`.trim();
+}
+
+async function ponerOtEnLineaApi(lineaId, linea, token) {
+  if (!lineaId || (!linea?.depto && !linea?.ot)) return null;
+  const dims = await dimensionesGlobales(token);
+  const urlBase = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+  const url = `${urlBase}/purchaseOrderLines(${lineaId})/dimensionSetLines`;
+  const avisos = [];
+  if (linea.depto) {
+    if (!dims.d1) avisos.push("No encuentro en BC el código de la dimensión de departamento.");
+    else {
+      const mal = await ponerValorDimension(url, dims.d1, linea.depto, token);
+      if (mal) avisos.push(`No se pudo poner la dimensión ${linea.depto}: ${mal}`);
+    }
+  }
+  if (linea.ot) {
+    if (!dims.d2) avisos.push("No encuentro en BC el código de la dimensión de la OT.");
+    else {
+      const mal = await ponerValorDimension(url, dims.d2, linea.ot, token);
+      if (mal) avisos.push(`No se pudo poner la OT ${linea.ot}: ${mal}`);
+    }
+  }
+  return avisos.length ? avisos.join(" ") : null;
+}
+
+async function aplicarOtAlPedido(pedido) {
+  const ot = pedido?.plantilla?.ot || null;
+  const depto = pedido?.plantilla?.departamento || null;
+  if (!pedido?.id || (!ot && !depto)) return pedido;
+  const token = await obtenerTokenBC();
+  const urlBase = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" };
+  const avisos = (pedido.avisos || []).filter((a) => !/poner la OT|dimensión/i.test(a));
+  const dims = await dimensionesGlobales(token);
+  const urlCab = `${urlBase}/purchaseOrders(${pedido.id})/dimensionSetLines`;
+  if (depto && dims.d1) {
+    const mal = await ponerValorDimension(urlCab, dims.d1, depto, token);
+    if (mal) avisos.push(`No se pudo poner la dimensión en el pedido: ${mal}`);
+  }
+  if (ot && dims.d2) {
+    const mal = await ponerValorDimension(urlCab, dims.d2, ot, token);
+    if (mal) avisos.push(`No se pudo poner la OT en el pedido: ${mal}`);
+  }
+  if ((depto && !dims.d1) || (ot && !dims.d2)) avisos.push("No encuentro en BC el código de la dimensión global para copiar la OT.");
+  const r = await fetchConReintento(`${urlBase}/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${pedido.id}`)}`, { headers });
+  if (!r.ok) {
+    avisos.push(`No se pudieron leer las líneas para poner la OT: BC ${r.status}`);
+    return { ...pedido, avisos, otEnLinea: false };
+  }
+  const lineas = ((await r.json()).value || []).filter((l) => l.lineType && !/comment/i.test(l.lineType));
+  if (!lineas.length) {
+    avisos.push("El pedido no tiene líneas donde poner la OT.");
+    return { ...pedido, avisos, otEnLinea: false };
+  }
+  let puestas = 0;
+  for (const l of lineas) {
+    const aviso = await ponerOtEnLineaApi(l.id, { ot, depto }, token);
+    if (aviso) avisos.push(aviso);
+    else puestas += 1;
+  }
+  return { ...pedido, avisos, otEnLinea: puestas === lineas.length };
+}
+
+async function crearPedidoComoUltima(datos) {
+  const proveedor = String(datos?.proveedor || "").trim();
+  if (!proveedor) throw new Error("Falta el proveedor.");
+  const propuesta = await proponerUltimaEntrada(proveedor);
+  if (!propuesta?.puedeCrear) throw new Error(propuesta?.resumen || "No hay una factura anterior de este proveedor para copiar el pedido.");
+  const vendorNumber = propuesta.vendorNumber || await buscarNumeroProveedor(propuesta.proveedorBC || proveedor);
+  if (!vendorNumber) throw new Error(`No encuentro el nº de proveedor de ${propuesta.proveedorBC || proveedor} en BC.`);
+  const lineas = lineasPedidoComoUltima(datos, propuesta);
+  if (!lineas.length) throw new Error("No hay líneas para crear el pedido.");
+  const token = await obtenerTokenBC();
+  const cabeceras = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  const urlBase = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+  const orderDate = datos?.fecha && /^\d{4}-\d{2}-\d{2}$/.test(datos.fecha) ? datos.fecha : new Date().toISOString().slice(0, 10);
+  const rCab = await fetchConReintento(`${urlBase}/purchaseOrders`, {
+    method: "POST",
+    headers: cabeceras,
+    body: JSON.stringify({ vendorNumber, orderDate }),
+  });
+  if (!rCab.ok) throw new Error(`BC respondió ${rCab.status} creando el pedido: ${(await rCab.text().catch(() => "")).slice(0, 300)}`);
+  const cab = await rCab.json();
+  const avisos = [];
+  const lineasCreadas = [];
+  for (const l of lineas) {
+    const body = {
+      documentId: cab.id,
+      lineType: l.lineType,
+      lineObjectNumber: l.codigoBC,
+      quantity: Number(l.cantidad) || 1,
+      description: l.descripcion || undefined,
+    };
+    if (l.precio != null && !Number.isNaN(Number(l.precio))) body.directUnitCost = Number(l.precio);
+    const rLinea = await fetchConReintento(`${urlBase}/purchaseOrderLines`, {
+      method: "POST",
+      headers: cabeceras,
+      body: JSON.stringify(body),
+    });
+    if (!rLinea.ok) {
+      avisos.push(`Línea ${l.codigoBC}: BC ${rLinea.status} ${(await rLinea.text().catch(() => "")).slice(0, 180)}`);
+      continue;
+    }
+    const creada = await rLinea.json();
+    lineasCreadas.push(l.descripcion || l.codigoBC);
+    if (l.ot || l.depto) {
+      const avisoDim = await ponerOtEnLineaApi(creada.id, l, token);
+      if (avisoDim) avisos.push(avisoDim);
+    }
+  }
+  return {
+    numero: cab.number,
+    id: cab.id,
+    enlace: enlacePedidoCompraBC(cab.number),
+    vendorName: propuesta.proveedorBC,
+    lineasCreadas,
+    avisos,
+    plantilla: {
+      numeroBC: propuesta.numeroBC,
+      facturaProveedor: propuesta.facturaProveedor,
+      fecha: propuesta.fecha,
+      cuenta: propuesta.cuenta,
+      ot: propuesta.ot,
+      departamento: propuesta.departamento,
+      lineType: propuesta.lineType,
+    },
+  };
+}
+
+function urlApiComprasBC() {
+  return `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+}
+
+async function marcarCantidadARecibir(idPedido, token) {
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" };
+  const r = await fetchConReintento(`${urlApiComprasBC()}/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${idPedido}`)}`, { headers });
+  if (!r.ok) return;
+  const lineas = ((await r.json()).value || []);
+  for (const l of lineas) {
+    const qty = Number(l.quantity) || 0;
+    if (!(qty > 0) || Number(l.receiveQuantity) === qty) continue;
+    await fetchConReintento(`${urlApiComprasBC()}/purchaseOrderLines(${l.id})`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ receiveQuantity: qty }),
+    });
+  }
+}
+
+async function accionPedidoCompra(idPedido, accion, token) {
+  const r = await fetchConReintento(`${urlApiComprasBC()}/purchaseOrders(${idPedido})/Microsoft.NAV.${accion}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" },
+    body: "{}",
+  });
+  const texto = r.ok ? "" : (await r.text().catch(() => "")).slice(0, 400);
+  return { ok: r.ok, status: r.status, texto };
+}
+
+async function registrarPedidoPorServicio(numero) {
+  try {
+    const r = await fetch(
+      (process.env.BC_REGISTRO_URL || "http://localhost:5055").replace(/\/$/, "") + "/registrar",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(90000),
+        body: JSON.stringify({ numero_pedido: numero, empresa: EMPRESA_NOMBRE() }),
+      }
+    );
+    const datos = await r.json().catch(() => ({}));
+    if (r.ok && datos.ok) return { ok: true };
+    return { ok: false, error: datos.error || `El servicio de registro respondió ${r.status}.` };
+  } catch (e) {
+    return { ok: false, error: `No se pudo contactar con el registro del pedido (${String(e.message || e)}).` };
+  }
+}
+
+// Crea el pedido y, en el mismo paso, lo registra (recibir). Si la API
+// no tiene la acción de recibir, se usa el mismo registro de pantalla
+// que Recepción de material.
+async function registrarPedidoCompra(pedido) {
+  if (!pedido?.numero && !pedido?.id) return { ok: false, error: "Falta el pedido para registrarlo." };
+  const token = await obtenerTokenBC();
+  let id = pedido.id;
+  if (id) {
+    const cabR = await fetchConReintento(`${urlApiComprasBC()}/purchaseOrders(${id})?$select=id,fullyReceived`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (cabR.ok && (await cabR.json()).fullyReceived) return { ok: true };
+  } else if (pedido.numero) {
+    const r = await fetchConReintento(`${urlApiComprasBC()}/purchaseOrders?$filter=${encodeURIComponent(`number eq '${String(pedido.numero).replace(/'/g, "''")}'`)}&$top=1&$select=id,fullyReceived`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (r.ok) {
+      const cab = ((await r.json()).value || [])[0];
+      if (cab?.fullyReceived) return { ok: true };
+      id = cab?.id || null;
+    }
+  }
+  if (!id) return registrarPedidoPorServicio(pedido.numero);
+  await marcarCantidadARecibir(id, token);
+  let recibo = await accionPedidoCompra(id, "receive", token);
+  if (!recibo.ok && /release|liberar|lanzad/i.test(recibo.texto)) {
+    await accionPedidoCompra(id, "release", token);
+    recibo = await accionPedidoCompra(id, "receive", token);
+  }
+  if (recibo.ok) return { ok: true };
+  const accionNoExiste = recibo.status === 404 || /No HTTP resource|does not support|Resource not found|BadRequest_ResourceNotFound/i.test(recibo.texto);
+  if (accionNoExiste) return registrarPedidoPorServicio(pedido.numero);
+  return { ok: false, error: `BC no registró el pedido: ${recibo.status} ${recibo.texto}`.trim() };
+}
+
+const pedidosCreandose = new Map();
+
+function itemDeFacturaGuardada(d, { factura, msg, att }) {
+  const num = String(factura || "").trim();
+  if (!num) return null;
+  return (d.items || []).find((it) => {
+    const suya = it.extraida?.factura || it.factura;
+    if (String(suya || "").trim() !== num) return false;
+    if (msg && it.msg && it.msg !== msg) return false;
+    if (msg && att != null && it.att != null && String(it.att) !== String(att)) return false;
+    return !!it.extraida;
+  }) || null;
+}
+
+async function pedidoYaAnotado(datos) {
+  const d = await leerIndicePdfPendientes();
+  const it = itemDeFacturaGuardada(d, datos || {});
+  return it?.extraida?.pedidoCreado?.numero ? it.extraida.pedidoCreado : null;
+}
+
+async function anotarPedidoCreado(datos, pedido) {
+  if (!pedido?.numero) return;
+  const d = await leerIndicePdfPendientes();
+  const it = itemDeFacturaGuardada(d, datos || {});
+  if (!it) return;
+  it.extraida = { ...it.extraida, pedidoCreado: pedido };
+  await escribirIndicePdfPendientes(d);
+}
+
+// Si la factura no trae pedido, se crea uno igual que la última factura
+// de ese proveedor. Una sola vez: si ya se anotó, se devuelve el mismo.
+app.post("/api/facturas-compra/crear-pedido", async (req, res) => {
+  const datos = req.body || {};
+  const clave = `${String(datos.proveedor || "").trim()}|${String(datos.factura || "").trim()}|${datos.msg || ""}|${datos.att || ""}`;
+  if (pedidosCreandose.has(clave)) {
+    try {
+      return res.json(await pedidosCreandose.get(clave));
+    } catch (err) {
+      return res.status(409).json({ error: err.message || "No se ha podido crear el pedido de compra." });
+    }
+  }
+  let resolver;
+  let rechazar;
+  const espera = new Promise((ok, mal) => { resolver = ok; rechazar = mal; });
+  pedidosCreandose.set(clave, espera);
+  try {
+    const ya = await pedidoYaAnotado(datos);
+    let pedido = ya || await crearPedidoComoUltima(datos);
+    if (!ya) await anotarPedidoCreado(datos, pedido);
+    if (pedido.plantilla?.ot || pedido.plantilla?.departamento) {
+      pedido = await aplicarOtAlPedido(pedido);
+      await anotarPedidoCreado(datos, pedido);
+    }
+    if (!pedido.registro?.ok) {
+      pedido = {
+        ...pedido,
+        registro: pedido.lineasCreadas?.length
+          ? await registrarPedidoCompra(pedido)
+          : { ok: false, error: "No se registra: no se creó ninguna línea del pedido." },
+      };
+      await anotarPedidoCreado(datos, pedido);
+    }
+    resolver(pedido);
+    res.json(pedido);
+  } catch (err) {
+    rechazar(err);
+    res.status(409).json({ error: err.message || "No se ha podido crear el pedido de compra." });
+  } finally {
+    pedidosCreandose.delete(clave);
+  }
+});
+
 app.get("/api/facturas-compra/proveedores-gasto", async (req, res) => {
   try {
     const token = await obtenerTokenBC();
@@ -3369,6 +4560,28 @@ app.get("/api/facturas-compra/proveedores-gasto", async (req, res) => {
     res.json(datos);
   } catch (err) {
     res.status(500).json({ error: "Error detectando proveedores de gasto.", detalle: String(err.message || err) });
+  }
+});
+
+app.get("/api/facturas-compra/ya-entrada", async (req, res) => {
+  try {
+    const factura = String(req.query.factura || "").trim();
+    if (!factura) return res.status(400).json({ error: "Falta el nº de factura." });
+    const chequeo = await facturaYaEntradaEnBC(factura);
+    res.json(chequeo);
+  } catch (err) {
+    res.status(500).json({ error: "No se ha podido comprobar si la factura ya está entrada.", detalle: String(err.message || err) });
+  }
+});
+
+app.post("/api/facturas-compra/ultima-entrada", async (req, res) => {
+  try {
+    const proveedor = String(req.body?.proveedor || "").trim();
+    if (!proveedor) return res.status(400).json({ error: "Falta el proveedor." });
+    const ultimaEntrada = await proponerUltimaEntrada(proveedor);
+    res.json({ ultimaEntrada });
+  } catch (err) {
+    res.status(500).json({ error: "No se ha podido mirar el historial de facturas de compra.", detalle: String(err.message || err) });
   }
 });
 
@@ -3462,15 +4675,50 @@ async function pdfDesdeImagen(dataBuffer, tipo) {
   return pdfDoc;
 }
 
-app.post("/api/facturas-compra/extraer", async (req, res) => {
+const lecturasFondo = new Map();
+
+async function extraerFacturaHttp(req, res) {
+  if (req.body?.fondo && req.body?.origen?.msg) {
+    const clave = `${req.body.origen.msg}|${req.body.origen.att ?? ""}`;
+    const actual = lecturasFondo.get(clave);
+    if (actual?.estado === "leyendo") return res.json({ estado: "leyendo" });
+    if (actual?.estado === "lista") return res.json({ estado: "lista", paginas: actual.paginas, facturas: actual.facturas });
+    lecturasFondo.set(clave, { estado: "leyendo" });
+    const cuerpo = { ...req.body, fondo: false };
+    extraerFacturaHttp({ body: cuerpo }, {
+      _code: 200,
+      status(code) { this._code = code; return this; },
+      json(obj) {
+        if ((this._code || 200) >= 400) lecturasFondo.set(clave, { estado: "error", error: obj.detalle || obj.error || "No se ha podido leer la factura" });
+        else lecturasFondo.set(clave, { estado: "lista", paginas: obj.paginas, facturas: obj.facturas });
+      },
+    }).catch((err) => {
+      lecturasFondo.set(clave, { estado: "error", error: String(err.message || err) });
+    });
+    return res.json({ estado: "leyendo" });
+  }
   if (!PDFDocument) {
     return res.status(503).json({ error: "Falta instalar el paquete 'pdf-lib' en el backend. Ejecuta: npm install pdf-lib (y reinicia npm start)." });
   }
   try {
-    const { nombre, base64 } = req.body || {};
-    if (!base64) return res.status(400).json({ error: "Falta el campo 'base64' con el documento (PDF o foto)." });
-
-    const dataBuffer = Buffer.from(base64, "base64");
+    const { nombre, base64, origen } = req.body || {};
+    let dataBuffer = base64 ? Buffer.from(base64, "base64") : null;
+    if (!dataBuffer && origen?.msg) {
+      const indice = await leerIndicePdfPendientes();
+      const sid = idPdfPendiente(`mail-${origen.msg}-${origen.att || ""}`);
+      const guardado = indice.items.find((x) => x.id === sid);
+      dataBuffer = guardado ? leerBytesPdfPendiente(guardado) : null;
+      if (!dataBuffer) {
+        const token = await obtenerTokenGraph();
+        const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(M365_BUZONES.facturas)}/messages/${encodeURIComponent(origen.msg)}/attachments/${encodeURIComponent(origen.att || "")}`;
+        const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) return res.status(502).json({ error: "No se ha podido bajar el PDF del buzón." });
+        const a = await r.json();
+        if (!a.contentBytes) return res.status(404).json({ error: "El correo no trae el PDF." });
+        dataBuffer = Buffer.from(a.contentBytes, "base64");
+      }
+    }
+    if (!dataBuffer) return res.status(400).json({ error: "Falta el documento (PDF o foto)." });
     const tipoImagen = esCabeceraImagen(dataBuffer);
     // ignoreEncryption: true (Maria, 2026-09-04) — algunas facturas de
     // proveedor llegan como PDF con protección/encriptación (aunque sin
@@ -3514,9 +4762,24 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
     }
 
     const facturasFinal = [];
+    const aGuardarFacturas = [];
     for (const g of grupos) {
       if (!g.factura || !g.paginas.length) {
-        facturasFinal.push({ ...g, pdfBase64: null, pedidosDetalle: [], veredicto: null, motivos: [] });
+        let pdfBase64 = null;
+        if (g.paginas?.length) {
+          const nuevo = await PDFDocument.create();
+          const copiadas = await nuevo.copyPages(srcPdf, g.paginas.map((p) => p - 1));
+          copiadas.forEach((p) => nuevo.addPage(p));
+          pdfBase64 = Buffer.from(await nuevo.save()).toString("base64");
+        }
+        facturasFinal.push({
+          ...g,
+          pdfBase64,
+          pedidosDetalle: [],
+          lineasSinPedido: g.lineas || [],
+          veredicto: "revisar",
+          motivos: ["Sin número de factura reconocido."],
+        });
         continue;
       }
       const nuevo = await PDFDocument.create();
@@ -3524,6 +4787,48 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
       copiadas.forEach((p) => nuevo.addPage(p));
       const bytes = await nuevo.save();
       const pdfBase64 = Buffer.from(bytes).toString("base64");
+
+      // Antes de analizar pedidos o proponer cómo entrarla: si este nº de
+      // factura ya está registrado en BC, se para aquí.
+      const chequeoDuplicado = await facturaYaEntradaEnBC(g.factura);
+      if (chequeoDuplicado.encontrada) {
+        const motivosDup = [
+          `⚠ Esta factura ya está entrada en BC (factura ${chequeoDuplicado.numeroBC || "?"}${chequeoDuplicado.proveedor ? " · " + chequeoDuplicado.proveedor : ""}). No se analiza ni se crea borrador.`,
+        ];
+        facturasFinal.push({
+          ...g,
+          pdfBase64,
+          pedidosDetalle: [],
+          lineasSinPedido: [],
+          veredicto: "ya_entrada",
+          motivos: motivosDup,
+          gastoSugerido: null,
+          ultimaEntrada: null,
+          yaEntrada: true,
+          entradaInfo: chequeoDuplicado,
+        });
+        await registrarFacturaValidada({
+          factura: g.factura,
+          fechaFactura: g.fecha || null,
+          proveedores: g.proveedor ? [g.proveedor] : [],
+          pedidos: [],
+          veredicto: "ya_entrada",
+          motivos: motivosDup,
+        });
+        const { pdfBase64: _pdfDup, ...sinPdfDup } = facturasFinal[facturasFinal.length - 1];
+        aGuardarFacturas.push({
+          id: origen?.msg ? `fac-${origen.msg}-${origen.att || ""}` : `fac-${g.factura}`,
+          empresaId: EMPRESA_ID(),
+          nombre: `Factura_${g.factura}.pdf`,
+          factura: g.factura,
+          msg: origen?.msg || null,
+          att: origen?.att || null,
+          bytes: Buffer.from(pdfBase64, "base64"),
+          sobrescribir: true,
+          extraida: sinPdfDup,
+        });
+        continue;
+      }
 
       // Agrupar las líneas de ESTA factura por el pedido al que
       // pertenecen (una factura puede tocar varios pedidos).
@@ -3588,6 +4893,8 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
         }
       }
 
+      await Promise.all([...porPedido.keys()].map((pedido) => pedidoBC(pedido)));
+
       for (const [pedido, lineasDePedido] of porPedido) {
         const bc = await pedidoBC(pedido);
         if (bc.error) {
@@ -3619,6 +4926,27 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
           continue;
         }
         const lineasEmparejadas = emparejarLineasFactura(lineasDePedido, bc.lineasBC);
+        if (g.proveedor && bc.vendorName && !proveedoresParecidos(g.proveedor, bc.vendorName)) {
+          ok = false;
+          motivos.push(`Pedido ${pedido} es de ${bc.vendorName}, y la factura es de ${g.proveedor}. No se relaciona.`);
+          pedidosDetalle.push({
+            pedido: null,
+            pedidoDescartado: pedido,
+            vendorName: g.proveedor,
+            bcError: `El pedido ${pedido} es de ${bc.vendorName}, no de ${g.proveedor}. Elige un pedido de ${g.proveedor}.`,
+            lineas: (lineasDePedido || []).map((lf) => ({
+              descripcionFactura: lf.descripcion,
+              cantidadFacturada: lf.cantidad,
+              precioFacturado: lf.precioUnitario,
+              lineaBC: null,
+              coincidencia: "sin_match",
+              pendienteRecepcion: false,
+              diferenciaPrecio: false,
+            })),
+            enlaceBC: null,
+          });
+          continue;
+        }
         // TODAS las líneas del pedido en BC (no solo la emparejada), para
         // poder elegir a mano en pantalla cuando el emparejamiento
         // automático no encuentra nada o se equivoca — igual que ya hace
@@ -3665,26 +4993,22 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
         }
       }
 
-      // Comprobación de DUPLICADO: ¿esta factura (por su Nº de proveedor)
-      // ya está registrada en BC? Si es así, se avisa igual que cualquier
-      // otro motivo de "revisar antes" — no bloquea el resto del chequeo,
-      // solo lo añade.
-      const chequeoDuplicado = await facturaYaEntradaEnBC(g.factura);
-      if (chequeoDuplicado.encontrada) {
-        ok = false;
-        motivos.unshift(
-          `⚠ Esta factura ya está entrada en BC (factura ${chequeoDuplicado.numeroBC || "?"}${chequeoDuplicado.proveedor ? " · " + chequeoDuplicado.proveedor : ""}) — revisa antes de volver a entrarla.`
-        );
+      const hayPedidoUtil = pedidosDetalle.some((p) => p.pedido && !p.bcError);
+      let ultimaEntrada = null;
+      if (!hayPedidoUtil && g.proveedor) {
+        try {
+          ultimaEntrada = await proponerUltimaEntrada(g.proveedor);
+        } catch (e) {
+          console.warn("[facturas-compra/ultima] Error buscando la última entrada:", String(e.message || e));
+        }
+        if (ultimaEntrada?.resumen) motivos.push(ultimaEntrada.resumen);
       }
 
       // "gasto" (Maria, 2026-09-04): ni verde (no hay línea creada
       // todavía, hace falta que Maria la registre) ni rojo (no es un
       // error a corregir — es el funcionamiento normal de este
-      // proveedor) — un tercer estado propio, solo cuando no hay ningún
-      // otro motivo de revisión aparte de "sin pedido" (p. ej. si además
-      // sale duplicada, se queda como "revisar" para no enmascararlo).
-      const soloMotivoEsGasto =
-        gastoSugerido && !chequeoDuplicado.encontrada && motivos.length === 1;
+      // proveedor). Si la factura ya estaba entrada, no se llega aquí.
+      const soloMotivoEsGasto = gastoSugerido && motivos.length === 1;
       const veredicto = soloMotivoEsGasto ? "gasto" : ok ? "ok" : "revisar";
 
       facturasFinal.push({
@@ -3708,6 +5032,7 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
         veredicto,
         motivos,
         gastoSugerido,
+        ultimaEntrada,
         yaEntrada: chequeoDuplicado.encontrada,
         entradaInfo: chequeoDuplicado.encontrada ? chequeoDuplicado : null,
       });
@@ -3723,6 +5048,31 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
           veredicto,
           motivos,
         });
+        const { pdfBase64: _pdf, ...sinPdf } = facturasFinal[facturasFinal.length - 1];
+        aGuardarFacturas.push({
+          id: origen?.msg ? `fac-${origen.msg}-${origen.att || ""}` : `fac-${g.factura}`,
+          empresaId: EMPRESA_ID(),
+          nombre: `Factura_${g.factura}.pdf`,
+          factura: g.factura,
+          msg: origen?.msg || null,
+          att: origen?.att || null,
+          bytes: Buffer.from(pdfBase64, "base64"),
+          sobrescribir: true,
+          extraida: sinPdf,
+        });
+      }
+    }
+    if (aGuardarFacturas.length) {
+      try {
+        await guardarPdfsPendientes(aGuardarFacturas);
+        if (origen?.msg && origen?.att) {
+          await guardarPdfsPendientes([{
+            id: `mail-${origen.msg}-${origen.att}`,
+            facturas: aGuardarFacturas.map((f) => f.factura),
+          }]);
+        }
+      } catch (e) {
+        console.warn("[facturas-pdf] No se pudo guardar el PDF de la factura validada:", String(e.message || e));
       }
     }
 
@@ -3734,6 +5084,15 @@ app.post("/api/facturas-compra/extraer", async (req, res) => {
     console.error("Error /api/facturas-compra/extraer:", err);
     res.status(500).json({ error: "Error extrayendo/validando las facturas del documento.", detalle: String(err.message || err) });
   }
+}
+
+app.post("/api/facturas-compra/extraer", extraerFacturaHttp);
+
+app.get("/api/facturas-compra/lectura", (req, res) => {
+  const clave = `${req.query.msg || ""}|${req.query.att ?? ""}`;
+  const trabajo = lecturasFondo.get(clave);
+  if (!trabajo) return res.json({ estado: "ninguna" });
+  res.json({ estado: trabajo.estado, paginas: trabajo.paginas, facturas: trabajo.facturas, error: trabajo.error });
 });
 
 // Botón "Actualizar desde BC" en una tarjeta de factura, por pedido: sin
@@ -3779,34 +5138,12 @@ app.post("/api/facturas-compra/refrescar-pedido", async (req, res) => {
 // por proveedor (BC no permite mezclarlos en una misma factura).
 // -----------------------------------------------------------------------
 app.post("/api/facturas-compra/entrar-bc", async (req, res) => {
-  const { factura, fechaFactura, pdfBase64, nombreArchivo, lineasFactura, forzar } = req.body || {};
+  const { factura, fechaFactura, pdfBase64, nombreArchivo, lineasFactura, forzar, comoUltima } = req.body || {};
   if (!factura) return res.status(400).json({ error: "Falta el nº de factura." });
-  if (!Array.isArray(lineasFactura) || !lineasFactura.length) {
-    return res.status(400).json({ error: "Falta 'lineasFactura' (descripción/cantidad/precioUnitario/pedido por línea)." });
-  }
   const invoiceDate =
     fechaFactura && /^\d{4}-\d{2}-\d{2}$/.test(fechaFactura) ? fechaFactura : new Date().toISOString().slice(0, 10);
 
-  const porPedido = new Map();
-  for (const l of lineasFactura) {
-    if (!l.pedido) continue;
-    if (!porPedido.has(l.pedido)) porPedido.set(l.pedido, []);
-    porPedido.get(l.pedido).push(l);
-  }
-  if (!porPedido.size) return res.status(400).json({ error: "Ninguna línea tiene un pedido asociado — no se puede entrar la factura." });
-
-  // "Entrar en BC de todas formas" (Maria, 2026-09-04): con forzar=true,
-  // los motivos de abajo que son decisión de negocio (factura duplicada,
-  // línea sin encontrar, pendiente de recibir, precio distinto) dejan de
-  // bloquear con 409 — se anotan en `avisos` (ya se enseñan en pantalla)
-  // y se sigue creando la factura. Lo que NO se puede saltar nunca:
-  // no tener forma de identificar el proveedor en BC (bc.error /
-  // vendorNumber ausente) — sin eso no hay a qué proveedor crear la
-  // factura, forzar o no.
   const avisos = [];
-
-  // Re-comprobar duplicado EN VIVO también aquí (no solo al subir el
-  // PDF) — por si se entró desde otra pestaña/sesión mientras tanto.
   const chequeoDuplicado = await facturaYaEntradaEnBC(factura);
   if (chequeoDuplicado.encontrada) {
     const mensajeDuplicado = `Esta factura ya está entrada en BC (factura ${chequeoDuplicado.numeroBC || "?"}${chequeoDuplicado.proveedor ? " · " + chequeoDuplicado.proveedor : ""})`;
@@ -3816,12 +5153,77 @@ app.post("/api/facturas-compra/entrar-bc", async (req, res) => {
     avisos.push(`⚠ Forzado: ${mensajeDuplicado}, pero se ha creado de nuevo porque se ha pedido entrarla igual.`);
   }
 
+  let porProveedor = new Map();
+  if (comoUltima?.proveedor) {
+    const propuesta = await proponerUltimaEntrada(comoUltima.proveedor);
+    if (!propuesta?.puedeCrear) {
+      return res.status(409).json({ error: propuesta?.resumen || "No hay una última factura sin pedido de este proveedor para copiar la cuenta." });
+    }
+    const vendorNumber = propuesta.vendorNumber || await buscarNumeroProveedor(propuesta.proveedorBC || comoUltima.proveedor);
+    if (!vendorNumber) {
+      return res.status(409).json({ error: `No encuentro el nº de proveedor de ${propuesta.proveedorBC || comoUltima.proveedor} en BC — no se puede crear el borrador.` });
+    }
+    const lineas = lineasBorradorComoUltima({ ...comoUltima, factura }, propuesta);
+    if (!lineas.length) {
+      return res.status(400).json({ error: "La factura no trae importe para crear la línea como la última entrada." });
+    }
+    porProveedor.set(vendorNumber, { vendorName: propuesta.proveedorBC, pedidos: [], lineas });
+  } else {
+  if (!Array.isArray(lineasFactura) || !lineasFactura.length) {
+    return res.status(400).json({ error: "Falta 'lineasFactura' (descripción/cantidad/precioUnitario/pedido por línea)." });
+  }
+
+  const porPedido = new Map();
+  for (const l of lineasFactura) {
+    if (!l.pedido) continue;
+    if (!porPedido.has(l.pedido)) porPedido.set(l.pedido, []);
+    porPedido.get(l.pedido).push(l);
+  }
+  if (!porPedido.size) {
+    if (!forzar) return res.status(400).json({ error: "Ninguna línea tiene un pedido asociado — no se puede entrar la factura." });
+    const proveedorForzado = String(req.body?.proveedor || "").trim();
+    if (!proveedorForzado) {
+      return res.status(400).json({ error: "No hay pedido y falta el proveedor para crear el borrador como la última factura." });
+    }
+    const propuestaForzada = await proponerUltimaEntrada(proveedorForzado);
+    if (!propuestaForzada?.puedeCrear) {
+      return res.status(409).json({ error: propuestaForzada?.resumen || `No hay una factura anterior de ${proveedorForzado} para copiar la cuenta y crear el borrador.` });
+    }
+    const vendorForzado = propuestaForzada.vendorNumber || await buscarNumeroProveedor(propuestaForzada.proveedorBC || proveedorForzado);
+    if (!vendorForzado) {
+      return res.status(409).json({ error: `No encuentro el nº de proveedor de ${propuestaForzada.proveedorBC || proveedorForzado} en BC — no se puede crear el borrador.` });
+    }
+    const lineasForzadas = lineasBorradorComoUltima({
+      proveedor: proveedorForzado,
+      factura,
+      baseImponible: req.body?.baseImponible,
+      lineas: lineasFactura,
+    }, propuestaForzada);
+    if (!lineasForzadas.length) {
+      return res.status(400).json({ error: "La factura no trae importe para crear la línea como la última entrada." });
+    }
+    avisos.push(`Forzado sin pedido: borrador copiado de la factura ${propuestaForzada.numeroBC || propuestaForzada.facturaProveedor || "anterior"} de ${propuestaForzada.proveedorBC || proveedorForzado}.`);
+    porProveedor.set(vendorForzado, { vendorName: propuestaForzada.proveedorBC, pedidos: [], lineas: lineasForzadas });
+  } else {
+
+  // "Entrar en BC de todas formas" (Maria, 2026-09-04): con forzar=true,
+  // los motivos de abajo que son decisión de negocio (factura duplicada,
+  // línea sin encontrar, pendiente de recibir, precio distinto) dejan de
+  // bloquear con 409 — se anotan en `avisos` (ya se enseñan en pantalla)
+  // y se sigue creando la factura. Lo que NO se puede saltar nunca:
+  // no tener forma de identificar el proveedor en BC (bc.error /
+  // vendorNumber ausente) — sin eso no hay a qué proveedor crear la
+  // factura, forzar o no.
+
+  // Re-comprobar duplicado EN VIVO también aquí (no solo al subir el
+  // PDF) — por si se entró desde otra pestaña/sesión mientras tanto.
+  // (el chequeo ya se ha hecho arriba, antes de elegir el camino)
+
   // Re-validar EN VIVO contra BC (no fiarse del semáforo calculado al
   // subir el PDF) y agrupar por proveedor — BC no permite mezclar
   // proveedores distintos en una misma factura de compra. Las líneas ya
   // emparejadas NO se usan para crear nada en BC — solo para la
   // comprobación de seguridad y para el resumen que se muestra en pantalla.
-  const porProveedor = new Map(); // vendorNumber -> { vendorName, pedidos:[], lineas:[] }
   for (const [pedido, lineasDePedido] of porPedido) {
     const bc = await buscarPedidoYLineasBC(pedido);
     if (bc.error) return res.status(409).json({ error: `Pedido ${pedido}: ${bc.error}` });
@@ -3864,6 +5266,8 @@ app.post("/api/facturas-compra/entrar-bc", async (req, res) => {
         coincidencia: l.coincidencia,
       });
     }
+  }
+  }
   }
 
   if (porProveedor.size > 1) {
@@ -3946,19 +5350,36 @@ app.post("/api/facturas-compra/entrar-bc", async (req, res) => {
             documentId: cab.id,
             lineType: l.lineType,
             lineObjectNumber: l.codigoBC,
+            description: l.descripcion ? String(l.descripcion).slice(0, 100) : undefined,
             quantity: Number(l.cantidad) || 0,
           };
           if (l.precio !== null && l.precio !== undefined && !Number.isNaN(Number(l.precio))) {
             bodyLinea.directUnitCost = Number(l.precio);
           }
           if (l.unitOfMeasureCode) bodyLinea.unitOfMeasureCode = l.unitOfMeasureCode;
-          const rLinea = await fetchConReintento(`${urlBase}/purchaseInvoiceLines`, {
+          if (l.depto) bodyLinea.shortcutDimension1Code = l.depto;
+          if (l.ot) bodyLinea.shortcutDimension2Code = l.ot;
+          let rLinea = await fetchConReintento(`${urlBase}/purchaseInvoiceLines`, {
             method: "POST",
             headers: cabeceras,
             body: JSON.stringify(bodyLinea),
           });
+          let sinDimension = false;
+          if (!rLinea.ok && (bodyLinea.shortcutDimension1Code || bodyLinea.shortcutDimension2Code)) {
+            sinDimension = true;
+            delete bodyLinea.shortcutDimension1Code;
+            delete bodyLinea.shortcutDimension2Code;
+            rLinea = await fetchConReintento(`${urlBase}/purchaseInvoiceLines`, {
+              method: "POST",
+              headers: cabeceras,
+              body: JSON.stringify(bodyLinea),
+            });
+          }
           if (rLinea.ok) {
             item.lineasCreadas.push(l.descripcion || l.codigoBC);
+            if (sinDimension) {
+              avisos.push(`Línea ${l.codigoBC} creada. La OT ${l.ot || "—"} y el departamento ${l.depto || "—"} hay que apuntarlos en el borrador: BC no los ha aceptado por la API.`);
+            }
           } else {
             const detalleLinea = (await rLinea.text().catch(() => "")).slice(0, 200);
             item.lineasSinCrear.push(`${l.descripcion || l.codigoBC} (BC respondió ${rLinea.status}: ${detalleLinea})`);
@@ -4070,13 +5491,155 @@ app.post("/api/facturas-compra/entrar-bc", async (req, res) => {
     avisos,
   });
 
+  if (!huboError) {
+    try {
+      await borrarPdfPendienteFactura(factura);
+    } catch (e) {
+      console.warn("[facturas-pdf] No se pudo borrar el PDF ya registrado en BC:", String(e.message || e));
+    }
+  }
+
   res.status(huboError ? 207 : 200).json({ ok: !huboError, facturasCreadas, avisos });
 });
+
+// -----------------------------------------------------------------------
+// PDF DE FACTURAS PENDIENTES — se guarda al cargar la bandeja (y al
+// validar) y se borra solo cuando la factura se registra en BC.
+// El archivo va a server/data/facturas_pdf/ (no se versiona). El índice
+// va a Postgres (app_state · facturas_pdf_pendientes).
+// -----------------------------------------------------------------------
+const CLAVE_PDF_PENDIENTES = "facturas_pdf_pendientes";
+
+function dirPdfPendientes() {
+  const dir = path.join(__dirname, "data", "facturas_pdf");
+  fsEstado.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+const crypto = require("crypto");
+
+function idPdfPendiente(s) {
+  const texto = String(s || "pdf");
+  const hash = crypto.createHash("sha256").update(texto).digest("hex").slice(0, 32);
+  const corto = texto.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40);
+  return `${corto}-${hash}`;
+}
+
+async function leerIndicePdfPendientes() {
+  const d = await db.getDoc(CLAVE_PDF_PENDIENTES, { items: [], registradas: [] });
+  return {
+    items: Array.isArray(d?.items) ? d.items : [],
+    registradas: Array.isArray(d?.registradas) ? d.registradas : [],
+  };
+}
+
+async function escribirIndicePdfPendientes(d) {
+  await db.setDoc(CLAVE_PDF_PENDIENTES, { items: d.items || [], registradas: (d.registradas || []).slice(0, 2000) });
+}
+
+function yaRegistradaPdf(d, p) {
+  const reg = d.registradas || [];
+  if (p.factura && reg.includes(`fac:${p.factura}`)) return true;
+  if (p.msg && p.att && reg.includes(`mail:${p.msg}|${p.att}`)) return true;
+  return false;
+}
+
+async function guardarPdfsPendientes(lista) {
+  if (!lista?.length) return;
+  const d = await leerIndicePdfPendientes();
+  for (const p of lista) {
+    if (yaRegistradaPdf(d, p)) continue;
+    const sid = idPdfPendiente(p.id);
+    const archivo = `${sid}.pdf`;
+    const ruta = path.join(dirPdfPendientes(), archivo);
+    if (p.bytes && (p.sobrescribir || !fsEstado.existsSync(ruta))) {
+      fsEstado.writeFileSync(ruta, p.bytes);
+    }
+    if (!fsEstado.existsSync(ruta)) continue;
+    const prev = d.items.find((x) => x.id === sid) || {};
+    const item = {
+      ...prev,
+      id: sid,
+      empresaId: p.empresaId !== undefined ? p.empresaId : prev.empresaId || null,
+      nombre: p.nombre || prev.nombre || archivo,
+      factura: p.factura !== undefined ? p.factura : prev.factura || null,
+      facturas: p.facturas || prev.facturas || [],
+      asunto: p.asunto !== undefined ? p.asunto : prev.asunto || "",
+      de: p.de !== undefined ? p.de : prev.de || "",
+      fecha: p.fecha || prev.fecha || new Date().toISOString(),
+      msg: p.msg !== undefined ? p.msg : prev.msg || null,
+      att: p.att !== undefined ? p.att : prev.att || null,
+      archivo,
+      ts: new Date().toISOString(),
+      extraida: p.extraida !== undefined ? p.extraida : prev.extraida || null,
+    };
+    d.items = [item, ...d.items.filter((x) => x.id !== sid)];
+  }
+  await escribirIndicePdfPendientes(d);
+}
+
+async function borrarPdfPendienteFactura(factura) {
+  const num = String(factura || "").trim();
+  if (!num) return;
+  const d = await leerIndicePdfPendientes();
+  const quedan = [];
+  for (const it of d.items) {
+    const vinculadas = it.facturas || [];
+    const esLaFactura = it.factura === num;
+    const estabaVinculada = vinculadas.includes(num);
+    if (esLaFactura) {
+      try { fsEstado.unlinkSync(path.join(dirPdfPendientes(), it.archivo)); } catch {}
+      if (!(d.registradas || []).includes(`fac:${num}`)) d.registradas = [`fac:${num}`, ...(d.registradas || [])];
+      continue;
+    }
+    if (estabaVinculada) {
+      const facturas = vinculadas.filter((f) => f !== num);
+      if (!facturas.length) {
+        try { fsEstado.unlinkSync(path.join(dirPdfPendientes(), it.archivo)); } catch {}
+        if (it.msg && it.att) {
+          const clave = `mail:${it.msg}|${it.att}`;
+          if (!(d.registradas || []).includes(clave)) d.registradas = [clave, ...(d.registradas || [])];
+        }
+        continue;
+      }
+      quedan.push({ ...it, facturas });
+      continue;
+    }
+    quedan.push(it);
+  }
+  d.items = quedan;
+  await escribirIndicePdfPendientes(d);
+}
+
+function leerBytesPdfPendiente(item) {
+  try {
+    return fsEstado.readFileSync(path.join(dirPdfPendientes(), item.archivo));
+  } catch {
+    return null;
+  }
+}
 
 // -----------------------------------------------------------------------
 // BANDEJA DE FACTURAS (facturacio@) — CIF → empresa; Postgres bandeja_facturas
 // -----------------------------------------------------------------------
 const leerBandejaProc = async () => db.getDoc("bandeja_facturas", {});
+const CLAVE_VISTA_BANDEJA = "bandeja_facturas_vista";
+
+async function leerVistaBandeja() {
+  const d = await db.getDoc(CLAVE_VISTA_BANDEJA, { actualizadoEn: null, items: [] });
+  return {
+    actualizadoEn: d?.actualizadoEn || null,
+    items: Array.isArray(d?.items) ? d.items : [],
+  };
+}
+
+function decorarItemsBandeja(items, procesadas) {
+  return items.map((it) => ({
+    ...it,
+    procesada: procesadas[`${it.msg}|${it.att}`] || null,
+    pdfGuardado: true,
+  }));
+}
 const normCif = (v) => String(v || "").toUpperCase().replace(/^ES/, "").replace(/[^A-Z0-9]/g, "");
 const cacheCifPdf = new Map();
 
@@ -4098,18 +5661,63 @@ async function detectarEmpresaPdf(attId, base64, empresas) {
   return resultado;
 }
 
+function offsetMinutosZona(timeZone, date) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const p = Object.fromEntries(dtf.formatToParts(date).map((x) => [x.type, x.value]));
+  const hora = p.hour === "24" ? 0 : Number(p.hour);
+  const comoUtc = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), hora, Number(p.minute), Number(p.second));
+  return Math.round((comoUtc - date.getTime()) / 60000);
+}
+
+// Medianoche de Madrid de hace (dias-1) días. "1 día" = desde las 00:00 de hoy aquí, no las 00:00 UTC.
+function inicioVentanaMadrid(dias) {
+  const dtf = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
+  const p = Object.fromEntries(dtf.formatToParts(new Date()).map((x) => [x.type, x.value]));
+  const utcMedianoche = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day) - (dias - 1), 0, 0, 0);
+  const offset = offsetMinutosZona("Europe/Madrid", new Date(utcMedianoche));
+  return new Date(utcMedianoche - offset * 60 * 1000);
+}
+
 app.get("/api/facturas-compra/bandeja", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   const buzon = M365_BUZONES.facturas;
   const dias = Math.min(Math.max(Number(req.query.dias) || 7, 1), 90);
   try {
+    const vista = await leerVistaBandeja();
+    const procesadas = await leerBandejaProc();
+    // cache=1: la pantalla pinta al momento lo ya leído, sin tocar Outlook.
+    if (req.query.cache === "1") {
+      return res.json({
+        buzon, dias, empresaActual: EMPRESA_ID(),
+        actualizadoEn: vista.actualizadoEn,
+        desdeCache: true, nuevos: 0,
+        items: decorarItemsBandeja(vista.items, procesadas),
+      });
+    }
+
     const empresas = await empresasApp().catch(() => [{ id: process.env.BC_COMPANY_ID, nombre: process.env.BC_COMPANY_NAME, cif: "B43831593", porDefecto: true }]);
     const token = await obtenerTokenGraph();
     const headers = { Authorization: `Bearer ${token}` };
     const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/inbox/messages`;
-    const hoy = new Date();
-    const desde = new Date(Date.UTC(hoy.getUTCFullYear(), hoy.getUTCMonth(), hoy.getUTCDate() - (dias - 1))).toISOString().slice(0, 19) + "Z";
-    let url = `${base}?$select=id,subject,from,receivedDateTime,hasAttachments&$top=100&$filter=receivedDateTime ge ${desde}`;
+    // desde = última actualización: solo correos nuevos. Sin desde, la
+    // primera vez trae la ventana de días. hasta = relleno hacia atrás.
+    let desdeFiltro;
+    if (req.query.desde) {
+      const t = new Date(req.query.desde);
+      if (Number.isNaN(t.getTime())) return res.status(400).json({ error: "Fecha 'desde' no válida." });
+      t.setTime(t.getTime() - 2 * 60 * 1000);
+      desdeFiltro = t.toISOString().slice(0, 19) + "Z";
+    } else {
+      desdeFiltro = inicioVentanaMadrid(dias).toISOString().slice(0, 19) + "Z";
+    }
+    let filtro = `receivedDateTime ge ${desdeFiltro}`;
+    const hasta = req.query.hasta ? new Date(req.query.hasta) : null;
+    if (hasta && !Number.isNaN(hasta.getTime())) filtro += ` and receivedDateTime lt ${hasta.toISOString().slice(0, 19)}Z`;
+    let url = `${base}?$select=id,subject,from,receivedDateTime,hasAttachments&$top=100&$filter=${filtro}`;
     const mensajes = [];
     while (url && mensajes.length < 300) {
       const r = await fetchConReintento(url, { headers });
@@ -4118,10 +5726,11 @@ app.get("/api/facturas-compra/bandeja", async (req, res) => {
       mensajes.push(...(j.value || []));
       url = j["@odata.nextLink"] || null;
     }
-    const procesadas = await leerBandejaProc();
-    const items = [];
+    const conocidos = new Set(vista.items.map((it) => it.msg));
+    const nuevos = [];
+    const aGuardar = [];
     for (const msg of mensajes) {
-      if (!msg.hasAttachments) continue;
+      if (!msg.hasAttachments || conocidos.has(msg.id)) continue;
       const ar = await fetchConReintento(`${base}/${msg.id}/attachments`, { headers });
       if (!ar.ok) continue;
       for (const att of (await ar.json()).value || []) {
@@ -4130,18 +5739,44 @@ app.get("/api/facturas-compra/bandeja", async (req, res) => {
         if (!esPdf || !(att["@odata.type"] || "").endsWith("fileAttachment") || !att.contentBytes) continue;
         const det = await detectarEmpresaPdf(att.id, att.contentBytes, empresas);
         const emp = empresas.find((e) => e.id === det.empresaId);
-        const clave = `${msg.id}|${att.id}`;
-        items.push({
+        aGuardar.push({
+          id: `mail-${msg.id}-${att.id}`,
+          empresaId: det.empresaId || null,
+          nombre,
+          asunto: msg.subject || "",
+          de: msg.from?.emailAddress?.address || "",
+          fecha: msg.receivedDateTime || "",
+          msg: msg.id,
+          att: att.id,
+          bytes: Buffer.from(att.contentBytes, "base64"),
+        });
+        nuevos.push({
           msg: msg.id, att: att.id, nombre,
           asunto: msg.subject || "", de: msg.from?.emailAddress?.address || "", deNombre: msg.from?.emailAddress?.name || "",
           fecha: msg.receivedDateTime || "",
           empresaId: det.empresaId, empresaNombre: emp ? emp.displayName || emp.nombre : null, cif: det.cif, sinTexto: det.sinTexto, variosCif: !!det.varios,
-          procesada: procesadas[clave] || null,
         });
       }
     }
-    items.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
-    res.json({ buzon, dias, empresaActual: EMPRESA_ID(), items });
+    const mapa = new Map(vista.items.map((it) => [`${it.msg}|${it.att}`, it]));
+    for (const it of nuevos) mapa.set(`${it.msg}|${it.att}`, it);
+    const fusion = [...mapa.values()]
+      .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)))
+      .slice(0, 800)
+      .map(({ procesada, pdfGuardado, ...rest }) => rest);
+    const esAtras = !!(hasta && !Number.isNaN(hasta.getTime()));
+    const actualizadoEn = esAtras ? (vista.actualizadoEn || new Date().toISOString()) : new Date().toISOString();
+    await db.setDoc(CLAVE_VISTA_BANDEJA, { actualizadoEn, items: fusion });
+    try {
+      if (aGuardar.length) await guardarPdfsPendientes(aGuardar);
+    } catch (e) {
+      console.warn("[facturas-pdf] No se pudieron guardar los PDF de la bandeja:", String(e.message || e));
+    }
+    res.json({
+      buzon, dias, empresaActual: EMPRESA_ID(),
+      actualizadoEn, desdeCache: false, nuevos: nuevos.length,
+      items: decorarItemsBandeja(fusion, procesadas),
+    });
   } catch (err) {
     console.error("Error /api/facturas-compra/bandeja:", err);
     res.status(500).json({ error: "No se pudo leer el buzón de facturas.", detalle: String(err.message || err) });
@@ -4150,15 +5785,98 @@ app.get("/api/facturas-compra/bandeja", async (req, res) => {
 
 app.get("/api/facturas-compra/bandeja/pdf", async (req, res) => {
   try {
+    const indice = await leerIndicePdfPendientes();
+    const sid = idPdfPendiente(`mail-${req.query.msg}-${req.query.att}`);
+    const guardado = indice.items.find((x) => x.id === sid);
+    if (guardado) {
+      const bytes = leerBytesPdfPendiente(guardado);
+      if (bytes) return res.json({ nombre: guardado.nombre, base64: bytes.toString("base64"), guardado: true });
+    }
     const token = await obtenerTokenGraph();
     const buzon = M365_BUZONES.facturas;
     const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/messages/${encodeURIComponent(req.query.msg)}/attachments/${encodeURIComponent(req.query.att)}`;
     const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!r.ok) throw new Error(`Graph respondió ${r.status}`);
     const a = await r.json();
+    if (a.contentBytes) {
+      try {
+        await guardarPdfsPendientes([{
+          id: `mail-${req.query.msg}-${req.query.att}`,
+          nombre: a.name,
+          msg: req.query.msg,
+          att: req.query.att,
+          bytes: Buffer.from(a.contentBytes, "base64"),
+        }]);
+      } catch (e) {
+        console.warn("[facturas-pdf] No se pudo guardar el PDF al descargarlo:", String(e.message || e));
+      }
+    }
     res.json({ nombre: a.name, base64: a.contentBytes });
   } catch (err) {
     res.status(500).json({ error: "No se pudo descargar la factura.", detalle: String(err.message || err) });
+  }
+});
+
+app.post("/api/facturas-compra/incidencia", async (req, res) => {
+  try {
+    const { msg, att, factura, facturaOriginal, incidencia, motivos, veredicto, pedidosDetalle, fecha, baseImponible, importeTotal, lineasSinPedido, proveedor } = req.body || {};
+    if (!msg && !factura) return res.status(400).json({ error: "Falta la factura." });
+    const d = await leerIndicePdfPendientes();
+    let coinciden = d.items.filter((x) =>
+      (msg && x.msg === msg && String(x.att ?? "") === String(att ?? "")) ||
+      ((factura || facturaOriginal) && (x.factura === factura || x.factura === facturaOriginal || x.extraida?.factura === factura || x.extraida?.factura === facturaOriginal))
+    );
+    if (!coinciden.length) return res.status(404).json({ error: "No hay PDF guardado de esta factura." });
+    const deEsta = coinciden.filter((x) => !x.extraida?.factura || x.extraida.factura === factura || x.extraida.factura === facturaOriginal || x.factura === factura || x.factura === facturaOriginal);
+    if (deEsta.length) coinciden = deEsta;
+    for (const it of coinciden) {
+      const previa = it.extraida || {};
+      it.factura = factura || it.factura || previa.factura || null;
+      it.extraida = {
+        ...previa,
+        factura: factura || previa.factura || it.factura || null,
+        proveedor: proveedor !== undefined ? (String(proveedor || "").trim() || null) : (previa.proveedor || null),
+        fecha: fecha !== undefined ? fecha : previa.fecha,
+        baseImponible: baseImponible !== undefined ? baseImponible : previa.baseImponible,
+        importeTotal: importeTotal !== undefined ? importeTotal : previa.importeTotal,
+        pedidosDetalle: Array.isArray(pedidosDetalle) ? pedidosDetalle : previa.pedidosDetalle,
+        lineasSinPedido: Array.isArray(lineasSinPedido) ? lineasSinPedido : previa.lineasSinPedido,
+        incidencia: incidencia !== undefined ? String(incidencia || "") : (previa.incidencia || ""),
+        motivos: Array.isArray(motivos) ? motivos : (previa.motivos || []),
+        veredicto: veredicto || previa.veredicto,
+      };
+      it.ts = new Date().toISOString();
+    }
+    await escribirIndicePdfPendientes(d);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "No se ha podido guardar la incidencia.", detalle: String(err.message || err) });
+  }
+});
+
+app.get("/api/facturas-compra/pendientes", async (req, res) => {
+  try {
+    const empresa = EMPRESA_ID();
+    const indice = await leerIndicePdfPendientes();
+    const facturas = [];
+    for (const it of indice.items) {
+      if (!it.extraida) continue;
+      // Las lecturas guardadas con el nombre cortado repetían el primer PDF.
+      if (!/-[a-f0-9]{32}$/.test(String(it.id || ""))) continue;
+      if (it.empresaId && it.empresaId !== empresa) continue;
+      const bytes = leerBytesPdfPendiente(it);
+      if (!bytes) continue;
+      facturas.push({
+        ...it.extraida,
+        pdfBase64: bytes.toString("base64"),
+        pdfGuardado: true,
+        origen: it.msg ? { msg: it.msg, att: it.att } : null,
+      });
+    }
+    facturas.sort((a, b) => String(b.factura || "").localeCompare(String(a.factura || "")));
+    res.json({ facturas });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudieron leer las facturas guardadas.", detalle: String(err.message || err) });
   }
 });
 
@@ -4196,6 +5914,7 @@ app.get(/^\/(?!api).*/, (req, res) => {
       "Frontend no compilado. En desarrollo usa Vite (:5173); en Docker el build va en public/."
     );
   }
+  res.setHeader("Cache-Control", "no-cache");
   res.sendFile(indexHtml);
 });
 

@@ -73,6 +73,35 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
     try { json = texto ? JSON.parse(texto) : null; } catch {}
     return { ok: r.ok, status: r.status, json, texto };
   }
+  // El 502 que ve Maria es este servidor traduciendo un rechazo de BC.
+  // Aquí se deja solo la frase útil (sin CorrelationId ni JSON).
+  function textoErrorBC(texto) {
+    let msg = String(texto || "");
+    try {
+      const j = JSON.parse(msg);
+      msg = j?.error?.message || j?.message || msg;
+    } catch { /* BC a veces responde texto plano */ }
+    msg = msg.replace(/\s*CorrelationId:.*$/i, "").trim();
+    const serie = msg.match(/No\. Series\s+(\S+)/i);
+    if (serie && /assign numbers automatically/i.test(msg)) {
+      return `Business Central no asigna el código solo: en la serie ${serie[1]} no está activado «Números por defecto». En clientes y proveedores el código es el NIF, sin guiones.`;
+    }
+    return msg || "Business Central ha rechazado el cambio.";
+  }
+  // ALSO CASALS, FERROS y QUIMLAB: el Nº de cliente/proveedor ES el NIF
+  // (serie CLIE sin «Números por defecto»). Sin number, el alta falla.
+  const FICHAS_CODIGO_NIF = new Set(["customers", "vendors"]);
+  const normalizarNif = (v) => String(v || "").toUpperCase().replace(/[\s.\-]/g, "");
+  function completarAltaFicha(recurso, datos) {
+    if (!FICHAS_CODIGO_NIF.has(recurso) || !datos || typeof datos !== "object") return datos;
+    const out = { ...datos };
+    if (out.taxRegistrationNumber != null && String(out.taxRegistrationNumber).trim() !== "") {
+      out.taxRegistrationNumber = normalizarNif(out.taxRegistrationNumber);
+    }
+    if (out.number != null && String(out.number).trim() !== "") out.number = normalizarNif(out.number);
+    if (!out.number && out.taxRegistrationNumber) out.number = out.taxRegistrationNumber;
+    return out;
+  }
   const limpiar = (obj) => {
     if (!obj || typeof obj !== "object") return obj;
     const o = {};
@@ -284,6 +313,7 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
           ({ datos, legible } = await resolverCodigosApi(base, entrada.datos));
           // CREAR: comprobar que los campos existen en esta entidad (con un registro de muestra)
           if (entrada.operacion === "crear") {
+            datos = completarAltaFicha(entrada.recurso, datos);
             const muestra = await pedir(`${base}/${encodeURIComponent(entrada.recurso)}?$top=1`);
             const ej = muestra.ok && muestra.json?.value?.[0];
             if (ej) {
@@ -293,6 +323,14 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
                   `Estos campos NO existen en '${entrada.recurso}' de la API v2.0: ${faltan.join(", ")}. Campos válidos: ${Object.keys(limpiar(ej)).filter((k) => !k.startsWith("@")).join(", ").slice(0, 1500)}. ` +
                     `Quítalos del alta. Si son grupos contables u otros datos de ficha, crea primero el registro y después propón modificarlos en un web service OData de ficha (búscalo con listar_recursos origen odata, p.ej. ficha de cliente/proveedor); si no hay ninguno publicado, díselo a Maria.`
                 );
+              }
+            }
+            if (FICHAS_CODIGO_NIF.has(entrada.recurso) && datos.number) {
+              const ya = await pedir(`${base}/${encodeURIComponent(entrada.recurso)}?$filter=${encodeURIComponent(`number eq '${String(datos.number).replace(/'/g, "''")}'`)}&$select=number,displayName&$top=1`);
+              const existe = ya.ok && ya.json?.value?.[0];
+              if (existe) {
+                const tipo = entrada.recurso === "customers" ? "cliente" : "proveedor";
+                throw new Error(`Ya existe el ${tipo} ${existe.number}${existe.displayName ? ` (${existe.displayName})` : ""}. No hace falta crearlo.`);
               }
             }
           }
@@ -356,7 +394,7 @@ Cómo trabajar:
 - Antes de proponer un cambio, consulta el registro para tener la clave exacta y los nombres de campo reales. En la API v2.0 la clave es (id-guid). En los web services OData la clave suele ser compuesta, p.ej. Pedido_compra_Excel(Document_Type='Order',No='PC26-003403') o PurchaseLines(Document_Type='Order',Document_No='PC26-003403',Line_No=20000).
 - Convenciones de ALSO CASALS: pedidos de compra PCaa-nnnnnn, ofertas de compra OCaa-nnnnnn, pedidos de venta PVaa-nnnnnn; OT = Shortcut_Dimension_2_Code (formato AC015129/2026); departamento/unidad de negocio = Shortcut_Dimension_1_Code (MAN, INS, CON, AMT, AUT…). Nº albarán del proveedor en la cabecera de compra = Vendor_Shipment_No.
 - IMÁGENES: Maria puede pegar capturas (fichas de cliente o proveedor de otro programa, albaranes, pedidos…). Léelas con cuidado, campo a campo. Si algún dato no se lee bien o es ambiguo, pregúntalo antes de proponer el cambio. No inventes datos que no salgan en la imagen.
-- CREAR UN CLIENTE: 1) comprueba que no exista ya (consultar customers por taxRegistrationNumber = CIF/NIF y por displayName parecido); si existe, díselo. 2) Consulta un cliente parecido existente para ver cómo se rellenan los campos en esta empresa. 3) Propón crear en recurso 'customers' (origen api) con: displayName, addressLine1 (y addressLine2 si hace falta), city, state (provincia), postalCode, country ('ES'), phoneNumber, email, taxRegistrationNumber. NO pongas 'number' (BC lo asigna con su numeración) salvo que Maria lo pida o una regla lo diga; el «Código» de la captura es del otro programa. Términos y forma de pago: en la API van como paymentTermsId / paymentMethodId — puedes poner el CÓDIGO (p.ej. «0D», «TRANSF») y el sistema lo traduce solo. La API v2.0 de customers/vendors NO tiene grupos contables (genBusPostingGroup, vatBusPostingGroup, customerPostingGroup…): no los pongas en el alta; después del alta busca un web service OData de ficha de cliente/proveedor (listar_recursos origen odata) y propón ahí un segundo cambio con los grupos. Datos como persona de contacto, forma de pago o tarifa: menciónalos y, tras crear el cliente, ofrece ponerlos con un segundo cambio si hay un campo en BC para ello (consúltalo). Un proveedor igual con 'vendors'.
+- CREAR UN CLIENTE: 1) comprueba que no exista ya. El campo taxRegistrationNumber NO se puede filtrar: busca por number (el código) y por displayName parecido. 2) Consulta un cliente parecido existente para ver cómo se rellenan los campos en esta empresa. 3) Propón crear en recurso 'customers' (origen api) con: number, displayName, addressLine1 (y addressLine2 si hace falta), city, state (provincia), postalCode, country ('ES'), phoneNumber, email, taxRegistrationNumber. En ALSO CASALS, FERROS y QUIMLAB el código del cliente ES el NIF/CIF/NIE: number y taxRegistrationNumber iguales, en mayúsculas y SIN guiones ni espacios (Y9583277-L se envía como Y9583277L). La serie de BC no numera sola; si omites number, el alta falla. El «Código» de una captura de otro programa no lo uses si no es el NIF. Términos y forma de pago: en la API van como paymentTermsId / paymentMethodId — puedes poner el CÓDIGO (p.ej. «0D», «TRANSF») y el sistema lo traduce solo. La API v2.0 de customers/vendors NO tiene grupos contables (genBusPostingGroup, vatBusPostingGroup, customerPostingGroup…): no los pongas en el alta; después del alta busca un web service OData de ficha de cliente/proveedor (listar_recursos origen odata) y propón ahí un segundo cambio con los grupos. Datos como persona de contacto, forma de pago o tarifa: menciónalos y, tras crear el cliente, ofrece ponerlos con un segundo cambio si hay un campo en BC para ello (consúltalo). Un proveedor igual con 'vendors' (el código también es el NIF).
 - Si una consulta devuelve demasiado, acota con filtro/select/top. Si algo falla, explica el error de BC en palabras sencillas y propone alternativa.
 - Resume los resultados en tablas o listas cortas; no vuelques JSON en bruto.`;
   };
@@ -468,6 +506,7 @@ Cómo trabajar:
           body: JSON.stringify(cambio.datos),
         });
       } else {
+        if (cambio.origen === "api") cambio.datos = completarAltaFicha(cambio.recurso, cambio.datos);
         r = await pedir(`${base}/${encodeURIComponent(cambio.recurso)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -478,7 +517,7 @@ Cómo trabajar:
       cambio.resultado = r.ok ? limpiar(r.json) : { status: r.status, error: r.texto.slice(0, 600) };
       cambio.aplicadoTs = new Date().toISOString();
       await anotar(cambio);
-      if (!r.ok) return res.status(502).json({ error: `BC rechazó el cambio (${r.status})`, detalle: r.texto.slice(0, 600), cambio });
+      if (!r.ok) return res.status(502).json({ error: textoErrorBC(r.texto), detalle: r.texto.slice(0, 600), cambio });
       res.json({ ok: true, cambio });
     } catch (err) {
       cambio.estado = "error";
@@ -657,6 +696,211 @@ Cómo trabajar:
       const lista = await db.getDoc("cambios_bc", []);
       res.json({ cambios: (Array.isArray(lista) ? lista : []).slice(-100).reverse() });
     } catch { res.json({ cambios: [] }); }
+  });
+
+  // Copia el pedido de venta con las columnas visibles de la rejilla de Maria
+  // (oct 2026) y el precio de venta que propone el asistente. Business Central
+  // exige el mismo número de columnas, en el mismo orden, para pegar la fila.
+  app.post("/api/ia-bc/copiar-pedido", async (req, res) => {
+    try {
+      const cuerpo = req.body || {};
+      const propuesta = (Array.isArray(cuerpo.articulos) ? cuerpo.articulos : [])
+        .map((a) => ({
+          no: String(a?.no || "").trim().toUpperCase(),
+          descripcion: String(a?.descripcion || "").replace(/[\t\r\n]+/g, " ").trim(),
+          precio: Number(a?.precio),
+          cantidad: a?.cantidad == null || a.cantidad === "" ? null : Number(a.cantidad),
+        }))
+        .filter((a) => /^[A-Z0-9._-]{3,40}$/.test(a.no) && Number.isFinite(a.precio));
+      if (!propuesta.length) return res.status(400).json({ error: "No hay artículos con precio para copiar." });
+      const precios = new Map(propuesta.map((a) => [a.no, a]));
+      const ot = String(cuerpo.ot || "").trim();
+      const documento = String(cuerpo.documento || "").trim();
+      if (ot && !/^[A-Za-z0-9./-]{4,30}$/.test(ot)) return res.status(400).json({ error: "La OT no tiene un formato válido." });
+      if (documento && !/^[A-Za-z0-9-]{4,30}$/.test(documento)) return res.status(400).json({ error: "El número de pedido no es válido." });
+
+      const { e, base } = await urlBase("odata", cuerpo.empresa || cuerpo.empresaNombre);
+      const servicio = process.env.BC_WS_LINEASVENTA || "SalesInvLines";
+      validarRecurso(servicio);
+      const esc = (s) => String(s).replace(/'/g, "''");
+      const traer = async (filtro) => {
+        const filas = [];
+        let url = `${base}/${encodeURIComponent(servicio)}?$filter=${encodeURIComponent(filtro)}&$top=500`;
+        for (let i = 0; i < 12 && url; i++) {
+          const r = await pedir(url);
+          if (!r.ok) throw new Error(textoErrorBC(r.texto) || `BC respondió ${r.status}`);
+          filas.push(...(r.json?.value || []));
+          url = r.json?.["@odata.nextLink"] || null;
+        }
+        return filas;
+      };
+      const leer = (fila, nombres) => {
+        const claves = Object.keys(fila || {});
+        for (const nombre of nombres) {
+          if (Object.prototype.hasOwnProperty.call(fila, nombre)) return fila[nombre];
+          const hit = claves.find((k) => k.toLowerCase() === nombre.toLowerCase());
+          if (hit) return fila[hit];
+        }
+        return undefined;
+      };
+      const num = (fila, nombres) => {
+        const v = leer(fila, nombres);
+        if (v == null || v === "") return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      };
+      const normNo = (fila) => String(leer(fila, ["No", "No."]) || "").trim().toUpperCase();
+      const elegir = (filas) => {
+        const map = new Map();
+        for (const f of filas) {
+          const doc = String(leer(f, ["Document_No"]) || "").trim();
+          if (!doc) continue;
+          if (!map.has(doc)) map.set(doc, { doc, tipo: String(leer(f, ["Document_Type"]) || ""), n: 0 });
+          if (precios.has(normNo(f))) map.get(doc).n += 1;
+        }
+        const lista = [...map.values()].filter((x) => x.n > 0);
+        lista.sort((a, b) => {
+          const ap = /order|pedido/i.test(a.tipo) ? 1 : 0;
+          const bp = /order|pedido/i.test(b.tipo) ? 1 : 0;
+          if (ap !== bp) return bp - ap;
+          if (a.n !== b.n) return b.n - a.n;
+          return b.doc.localeCompare(a.doc);
+        });
+        return lista[0] || null;
+      };
+
+      let elegido = null;
+      if (documento) {
+        const filasDoc = await traer(`Document_No eq '${esc(documento)}'`);
+        elegido = elegir(filasDoc) || (filasDoc[0] ? { doc: documento, tipo: String(leer(filasDoc[0], ["Document_Type"]) || ""), n: 0 } : null);
+      }
+      if (!elegido && ot) elegido = elegir(await traer(`Shortcut_Dimension_2_Code eq '${esc(ot)}'`));
+      if (!elegido) {
+        const filtroNos = propuesta.map((a) => `No eq '${esc(a.no)}'`).join(" or ");
+        elegido = elegir(await traer(filtroNos));
+      }
+
+      const dinero = (n) => {
+        const x = Number(n);
+        if (!Number.isFinite(x)) return "";
+        const [ent, decRaw] = x.toFixed(5).split(".");
+        let dec = decRaw.replace(/0+$/, "");
+        if (dec.length < 2) dec = dec.padEnd(2, "0");
+        return `${ent},${dec}`;
+      };
+      const cantTxt = (n) => {
+        if (n == null || n === "") return "";
+        const x = Number(n);
+        if (!Number.isFinite(x)) return "";
+        return x.toFixed(5).replace(/\.?0+$/, "").replace(".", ",");
+      };
+      const txt = (v) => String(v ?? "").replace(/[\t\r\n]+/g, " ").trim();
+      const tipoVisible = (v) => {
+        const t = String(v ?? "").trim().toLowerCase();
+        if (!t || t === "comment" || t === "comentario") return "Comentario";
+        if (t === "item" || t === "artículo" || t === "articulo") return "Artículo";
+        if (t === "resource" || t === "recurso") return "Recurso";
+        if (t === "g/l account" || t === "account" || t === "cuenta") return "Cuenta";
+        if (t.includes("charge") || t.includes("cargo")) return "Cargo (producto)";
+        if (t.includes("fixed") || t.includes("activo")) return "Activo fijo";
+        return String(v ?? "").trim();
+      };
+      const htmlEsc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const esArticulo = (f) => {
+        const t = String(leer(f, ["Type"]) ?? "").trim().toLowerCase();
+        if (/resource|recurso|comment|comentario|g\/l|cuenta|charge|cargo|fixed|activo/.test(t)) return false;
+        if (t === "item" || t === "artículo" || t === "articulo") return true;
+        return /^PR\d/i.test(normNo(f));
+      };
+
+      let lineas = [];
+      let actualizados = 0;
+      const noEncontrados = [];
+      if (elegido) {
+        lineas = await traer(`Document_No eq '${esc(elegido.doc)}'`);
+        lineas.sort((a, b) => (num(a, ["Line_No"]) || 0) - (num(b, ["Line_No"]) || 0));
+        lineas = lineas.filter((f) => esArticulo(f) && precios.has(normNo(f)));
+        if (lineas.length > 400) lineas = lineas.slice(0, 400);
+        const presentes = new Set(lineas.map(normNo));
+        for (const a of propuesta) if (!presentes.has(a.no)) noEncontrados.push(a.no);
+      }
+
+      const filaPegado = (f, forzar) => {
+        const no = normNo(f);
+        const prop = precios.get(no);
+        const precioBc = num(f, ["Unit_Price"]);
+        const cambia = !!(prop && (precioBc == null || Math.abs(prop.precio - precioBc) > 0.0000001));
+        const precio = prop ? prop.precio : precioBc;
+        if (cambia) actualizados += 1;
+        const d1 = num(f, ["Percent_Dto_linea_1", "Line_Discount_Percent", "Line_Discount_x0025_"]) || 0;
+        const d2 = num(f, ["Percent_Dto_linea_2"]) || 0;
+        const d3 = num(f, ["Percent_Dto_linea_3"]) || 0;
+        const cantidad = num(f, ["Quantity"]);
+        const importeBc = num(f, ["Line_Amount"]);
+        const importe = cambia && cantidad != null
+          ? cantidad * prop.precio * (1 - d1 / 100) * (1 - d2 / 100) * (1 - d3 / 100)
+          : importeBc;
+        const claveEmp = Object.keys(f).find((k) => /emplead/i.test(k));
+        const claveCargo = Object.keys(f).find((k) => /item_charge_qty_to_handle|qty_to_handle/i.test(k));
+        const celdas = [
+          tipoVisible(leer(f, ["Type"])),
+          no,
+          txt(leer(f, ["VAT_Prod_Posting_Group"])),
+          txt(leer(f, ["Item_Reference_No", "Cross_Reference_No"])),
+          txt(forzar?.descripcion || leer(f, ["Description"])),
+          txt(leer(f, ["Location_Code"])),
+          txt(leer(f, ["Shortcut_Dimension_2_Code"])),
+          cantTxt(cantidad),
+          cantTxt(num(f, ["Quantity_Shipped"])),
+          cantTxt(num(f, ["Qty_to_Ship"])),
+          dinero(precio ?? 0),
+          dinero(d1),
+          dinero(d2),
+          dinero(d3),
+          dinero(importe ?? 0),
+          cantTxt(num(f, ["Qty_to_Invoice"])),
+          cantTxt(num(f, ["Quantity_Invoiced"])),
+          txt(leer(f, ["Unit_of_Measure_Code"])),
+          cantTxt(num(f, ["Qty_to_Assign"]) ?? 0),
+          cantTxt(claveCargo ? num(f, [claveCargo]) ?? 0 : 0),
+          cantTxt(num(f, ["Qty_Assigned"]) ?? 0),
+          txt(leer(f, ["Shortcut_Dimension_1_Code"])),
+          txt(claveEmp ? leer(f, [claveEmp]) : ""),
+        ];
+        return celdas;
+      };
+
+      let filas;
+      if (lineas.length) {
+        filas = lineas.map((f) => filaPegado(f));
+      } else {
+        filas = propuesta.map((a) => filaPegado({
+          Type: "Item",
+          No: a.no,
+          Description: a.descripcion,
+          Quantity: a.cantidad || 1,
+          Qty_to_Ship: a.cantidad || 1,
+          Qty_to_Invoice: a.cantidad || 1,
+          Unit_Price: a.precio,
+        }, a));
+        actualizados = propuesta.length;
+      }
+
+      const tsv = filas.map((f) => f.join("\t")).join("\r\n");
+      const html = `<table><tbody>${filas.map((f) => `<tr>${f.map((c) => `<td>${htmlEsc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      const que = elegido && /quote|oferta/i.test(elegido.tipo) ? "oferta" : "pedido";
+      let mensaje;
+      if (elegido && lineas.length) {
+        mensaje = `Copiado el ${que} ${elegido.doc}: ${filas.length} líneas de artículo y ${actualizados} precios actualizados. En BC, selecciona solo esas líneas de artículo y pulsa Ctrl+V.`;
+        if (noEncontrados.length) mensaje += ` No están en el documento: ${noEncontrados.slice(0, 8).join(", ")}.`;
+      } else {
+        mensaje = `No he encontrado un pedido abierto con estos artículos. He copiado ${filas.length} líneas nuevas: en BC, haz clic en una línea vacía y pulsa Ctrl+V.`;
+      }
+      res.json({ tsv, html, pedido: elegido?.doc || "", lineas: filas.length, actualizados, mensaje, empresa: e.nombre });
+    } catch (e) {
+      console.error("[ia-bc] copiar-pedido:", e);
+      res.status(500).json({ error: String(e.message || e) });
+    }
   });
 
   async function anotar(cambio) {

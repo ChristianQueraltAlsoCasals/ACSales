@@ -52,7 +52,10 @@ PUERTO = 5055
 # La página del navegador vive en esta variable global — se crea UNA VEZ
 # al arrancar (en el hilo principal) y el servidor HTTP (también en el
 # hilo principal, sin hilos propios) la usa en cada petición.
+# Si Maria cierra la pestaña o Edge se cae, se vuelve a abrir solo.
 _pagina = None
+_contexto = None
+_playwright = None
 
 
 def url_pedido_directo(numero_pedido: str) -> str:
@@ -171,16 +174,80 @@ def buscar_boton_registrar(pagina, tiempo_max_seg: int = 20):
     return None, None
 
 
+def _pagina_viva(pagina) -> bool:
+    try:
+        return pagina is not None and not pagina.is_closed()
+    except Exception:
+        return False
+
+
+def abrir_navegador():
+    """Abre (o vuelve a abrir) Edge con el perfil ya identificado."""
+    global _contexto, _pagina
+    if _contexto is not None:
+        try:
+            _contexto.close()
+        except Exception:
+            pass
+        _contexto = None
+    _contexto = _playwright.chromium.launch_persistent_context(
+        str(CARPETA_PERFIL),
+        channel="msedge",
+        headless=False,
+        viewport=None,
+        args=["--start-minimized"],
+    )
+    _pagina = _contexto.pages[0] if _contexto.pages else _contexto.new_page()
+    return _pagina
+
+
+def asegurar_pagina():
+    """La pestaña que teníamos puede haberse cerrado aunque Edge siga abierto."""
+    global _pagina
+    if _pagina_viva(_pagina):
+        return _pagina
+    if _contexto is not None:
+        try:
+            abiertas = [p for p in _contexto.pages if _pagina_viva(p)]
+            if abiertas:
+                _pagina = abiertas[0]
+                return _pagina
+            _pagina = _contexto.new_page()
+            return _pagina
+        except Exception as e:
+            print(f"[servicio_registro] La ventana de Edge ya no responde ({e}). La vuelvo a abrir.")
+    return abrir_navegador()
+
+
 def registrar_un_pedido(pagina, numero_pedido: str) -> dict:
     t_total = time.time()
     resultado = {"pedido": numero_pedido, "ok": False, "error": None}
 
     url = url_pedido_directo(numero_pedido)
     try:
+        pagina = asegurar_pagina()
         pagina.goto(url, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
-        resultado["error"] = f"Error navegando: {e}"
-        return resultado
+        texto = str(e)
+        if "has been closed" in texto or "Target closed" in texto:
+            print("[servicio_registro] Edge cerró la página al entrar. Reintento con una pestaña nueva.")
+            try:
+                pagina = abrir_navegador()
+                pagina.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e2:
+                resultado["error"] = (
+                    "La ventana de Edge del registro se cerró y no he podido volver a abrirla. "
+                    "Cierra esa ventana de Edge, deja abierta la ventana negra «Registro pedidos BC» y pulsa otra vez. "
+                    f"Detalle: {e2}"
+                )
+                return resultado
+        else:
+            resultado["error"] = f"Error navegando: {e}"
+            return resultado
+    try:
+        pagina.bring_to_front()
+    except Exception:
+        pass
 
     # OJO: no usamos wait_for_load_state("networkidle") — BC es una SPA
     # que sigue haciendo peticiones de fondo (auto-guardado, telemetría),
@@ -368,27 +435,21 @@ class ManejadorPeticiones(BaseHTTPRequestHandler):
 
 
 def main():
-    global _pagina
+    global _playwright
     if not CARPETA_PERFIL.exists():
         raise SystemExit(f"No encuentro {CARPETA_PERFIL} — ejecuta primero: python login_setup.py")
 
     print("Arrancando el navegador (una sola vez, puede tardar unos segundos)...")
     with sync_playwright() as playwright:
+        _playwright = playwright
         # --start-minimized en vez de --start-maximized: sigue siendo un
         # navegador normal (mismo comportamiento con BC, sin riesgos de
         # detección de bot ni renderizado distinto por ir headless), solo
         # que no te salta por encima mientras trabajas en otra ventana.
-        contexto = playwright.chromium.launch_persistent_context(
-            str(CARPETA_PERFIL),
-            channel="msedge",
-            headless=False,
-            viewport=None,
-            args=["--start-minimized"],
-        )
-        _pagina = contexto.pages[0] if contexto.pages else contexto.new_page()
+        abrir_navegador()
 
-        servidor = HTTPServer(("127.0.0.1", PUERTO), ManejadorPeticiones)
-        print(f"✅ Navegador listo. Sirviendo en http://localhost:{PUERTO}")
+        servidor = HTTPServer(("0.0.0.0", PUERTO), ManejadorPeticiones)
+        print(f"Navegador listo. Sirviendo en http://localhost:{PUERTO}")
         print("Deja esta ventana ABIERTA mientras trabajas en Recepción de material.")
         try:
             servidor.serve_forever()
@@ -396,7 +457,11 @@ def main():
             print("\nParando el servicio...")
         finally:
             servidor.server_close()
-            contexto.close()
+            if _contexto is not None:
+                try:
+                    _contexto.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

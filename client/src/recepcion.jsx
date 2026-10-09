@@ -231,6 +231,22 @@ const COLOR_PRIORIDAD = {
 // todo a este proveedor»). Para = email de la ficha del proveedor en BC
 // (o el recordado), CC = responsables del departamento de cada OT.
 // Se envía vía Graph desde el buzón personal (/api/correo/enviar).
+const NOMBRE_DEPTO = {
+  INS: "Instalaciones",
+  MAN: "Mantenimiento",
+  AUT: "Automatización",
+  CON: "Construcción",
+};
+
+function etiquetaDepartamento(codigo) {
+  const raw = String(codigo || "").trim();
+  if (!raw) return "";
+  const seg = raw.split("-")[0].trim().toUpperCase();
+  const nombre = NOMBRE_DEPTO[seg];
+  if (!nombre) return raw;
+  return raw.toUpperCase() === seg ? `${nombre} (${seg})` : `${nombre} (${raw})`;
+}
+
 function htmlReclamacion(pedidosSel, intro, cierre) {
   const parrafos = (t) => escHtml(t).split(/\n/).join("<br>");
   const th = 'style="text-align:left;padding:4px 8px;border-bottom:1px solid #cbd5e1;background:#f1f5f9;font-size:12px"';
@@ -241,7 +257,8 @@ function htmlReclamacion(pedidosSel, intro, cierre) {
     const filas = pend.length
       ? pend.map((l) => `<tr><td ${td}>${escHtml(l.art)}</td><td ${td}>${escHtml(l.desc)}</td><td ${tdR}>${fmtCant(l.cant)}</td><td ${tdR}><b>${fmtCant(l.pend)}</b></td><td ${td}>${escHtml(l.ud)}</td><td ${td}>${escHtml(fmtFecha(l.fechaEsp))}</td></tr>`).join("")
       : `<tr><td ${td} colspan="6">(ver pedido)</td></tr>`;
-    return `<p style="margin:14px 0 4px;font-size:13px"><b>Pedido ${escHtml(p.num)}</b>${p.fecha ? ` · fecha pedido ${escHtml(fmtFecha(p.fecha) || p.fecha)}` : ""}${p.ot ? ` · Ref. obra ${escHtml(p.ot)}` : ""}</p>
+    const depto = etiquetaDepartamento(p.depto);
+    return `<p style="margin:14px 0 4px;font-size:13px"><b>Pedido ${escHtml(p.num)}</b>${p.fecha ? ` · fecha pedido ${escHtml(fmtFecha(p.fecha) || p.fecha)}` : ""}${p.ot ? ` · Ref. obra ${escHtml(p.ot)}` : ""}${depto ? ` · Departamento ${escHtml(depto)}` : ""}</p>
 <table style="border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif"><thead><tr><th ${th}>Código</th><th ${th}>Descripción</th><th ${th}>Cant. pedida</th><th ${th}>Pendiente</th><th ${th}>Ud.</th><th ${th}>Fecha prevista</th></tr></thead><tbody>${filas}</tbody></table>`;
   }).join("");
   return `<div style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#1e293b"><p>${parrafos(intro)}</p>${bloques}<p style="margin-top:16px">${parrafos(cierre)}</p></div>`;
@@ -498,6 +515,28 @@ function motivoYaRecibido(g, registrados) {
 const CLAVE_AUTOR = "recepcion_autor_v1"; // nombre de quien escribe, por navegador
 const leerAutor = () => { try { return localStorage.getItem(CLAVE_AUTOR) || ""; } catch { return ""; } };
 
+// Nota de correo: la primera línea es destinatario/asunto; el resto es el mensaje.
+function partesNotaCorreo(texto) {
+  const t = String(texto || "");
+  const nl = t.indexOf("\n");
+  if (nl !== -1) return { cabecera: t.slice(0, nl), mensaje: t.slice(nl + 1) };
+  const finAsunto = t.indexOf("»");
+  if (finAsunto !== -1) return { cabecera: t.slice(0, finAsunto + 1), mensaje: t.slice(finAsunto + 1).replace(/^\s+/, "") };
+  return null;
+}
+
+function CuerpoNota({ nota }) {
+  const partes = String(nota.autor || "").includes("Correo") ? partesNotaCorreo(nota.texto) : null;
+  if (!partes?.mensaje) return nota.texto;
+  return (
+    <>
+      {partes.cabecera}
+      {"\n"}
+      <span className="font-bold text-slate-900">{partes.mensaje}</span>
+    </>
+  );
+}
+
 function NotasPedido({ pedido, notas, onCambio }) {
   const [texto, setTexto] = useState("");
   const [autor, setAutor] = useState(leerAutor);
@@ -542,7 +581,7 @@ function NotasPedido({ pedido, notas, onCambio }) {
         <div key={n.id} className="group flex items-start gap-2 text-[11px] py-0.5">
           <span className="text-slate-400 whitespace-nowrap">{selloHora(n.ts)}</span>
           <span className="font-semibold text-slate-600 whitespace-nowrap">{n.autor}:</span>
-          <span className="text-slate-700 whitespace-pre-wrap flex-1">{n.texto}{n.enlace ? <> <a href={n.enlace} target="_blank" rel="noreferrer" className="text-blue-600 underline whitespace-nowrap">Abrir en Outlook</a></> : null}</span>
+          <span className="text-slate-700 whitespace-pre-wrap flex-1"><CuerpoNota nota={n} />{n.enlace ? <> <a href={n.enlace} target="_blank" rel="noreferrer" className="text-blue-600 underline font-normal whitespace-nowrap">Abrir en Outlook</a></> : null}</span>
           <button onClick={() => borrar(n.id)} className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600" title="Borrar nota"><Trash2 size={12} /></button>
         </div>
       ))}
@@ -586,7 +625,8 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
   const [ocultarRevisados, setOcultarRevisados] = useState(false);
 
   // "Subir Documento" — PDF con muchas páginas y muchos pedidos/proveedores.
-  // Se lee, se agrupa por Nº de pedido y se cruzan las líneas de material
+  // Se lee, se agrupa por entrega (Nº de pedido + Nº de albarán; el mismo
+  // proveedor con varios albaranes no se junta) y se cruzan las líneas de material
   // con BC en el backend (/api/recepcion/extraer, solo lectura). Aquí se
   // revisa "como un libro" — un pedido a la vez, con el PDF al lado — y al
   // confirmar CADA pedido se sube a BC (/api/recepcion/subir-bc): Nº
@@ -762,13 +802,16 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
         lineas: mapearLineas(g.lineasEmparejadas, i),
         lineasPdf: g.lineas || [], // líneas tal cual leídas del albarán (para volver a cruzar con otro pedido)
       }));
+      const esRevision = (g) => !!(g.pedido || g.albaran || (g.lineasPdf && g.lineasPdf.length));
       setPanelDoc({
         archivo: file.name,
         paginasTotal: json.paginas,
-        // Los ya recibidos/registrados se apartan (se pueden volver a mostrar)
-        gruposId: grupos.filter((g) => g.pedido && !motivoYaRecibido(g, registrados)),
+        // Los ya recibidos/registrados se apartan (se pueden volver a mostrar).
+        // Un albarán separado sin Nº de pedido también se revisa: el pedido
+        // se escribe a mano, no se hereda del proveedor anterior.
+        gruposId: grupos.filter((g) => esRevision(g) && !motivoYaRecibido(g, registrados)),
         gruposYaRecibidos: grupos.filter((g) => g.pedido && motivoYaRecibido(g, registrados)).map((g) => ({ ...g, motivo: motivoYaRecibido(g, registrados) })),
-        gruposSinId: grupos.filter((g) => !g.pedido),
+        gruposSinId: grupos.filter((g) => !esRevision(g)),
         avisos: json.avisos || [], // páginas que la IA no pudo leer (el resto sí)
       });
     } catch (err) {
@@ -1098,7 +1141,7 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
         <div className="mt-4 bg-white border border-purple-200 rounded-lg p-4">
           <div className="flex items-center justify-between mb-2">
             <div className="text-sm font-semibold text-slate-700">
-              «{panelDoc.archivo}» · {panelDoc.paginasTotal} página(s) · {panelDoc.gruposId.length} pedido(s) por revisar
+              «{panelDoc.archivo}» · {panelDoc.paginasTotal} página(s) · {panelDoc.gruposId.length} documento(s) por revisar
               {(panelDoc.gruposYaRecibidos || []).length > 0 && (
                 <> · <button onClick={() => setVerYaRecibidos((v) => !v)} className="text-emerald-700 underline decoration-dotted hover:text-emerald-800" title="Ver qué pedidos son">
                   {panelDoc.gruposYaRecibidos.length} ya recibido(s) (ocultos) {verYaRecibidos ? "▴" : "▾"}
@@ -1224,7 +1267,8 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                           <RefreshCw size={12} className={cruzando === g.id ? "animate-spin" : ""} />
                           {cruzando === g.id ? "Cargando…" : "Cargar pedido"}
                         </button>
-                        {!existe && <span title="No aparece en la lista de pedidos cargada — revisar" className="text-amber-600 text-[11px]">⚠ no está en la lista</span>}
+                        {g.pedido && !existe && <span title="No aparece en la lista de pedidos cargada — revisar" className="text-amber-600 text-[11px]">⚠ no está en la lista</span>}
+                        {!g.pedido && <span className="text-amber-700 text-[11px]">Albarán aparte: escribe su Nº de pedido y pulsa Cargar pedido</span>}
                       </div>
                       <div className="flex items-center gap-2 mb-3">
                         <label className="text-xs font-semibold text-slate-500 w-20">Nº albarán</label>
@@ -1446,7 +1490,7 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
 
                       <button
                         onClick={() => confirmarGrupo(indiceActual)}
-                        disabled={estado?.subiendo}
+                        disabled={estado?.subiendo || !g.pedido}
                         className="inline-flex items-center gap-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-4 py-2"
                       >
                         {estado?.subiendo ? <RefreshCw size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
@@ -1454,8 +1498,8 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                       </button>
                       <button
                         onClick={() => confirmarGrupo(indiceActual, { registrar: false })}
-                        disabled={estado?.subiendo}
-                        title="Sube el Nº de albarán, el PDF y las cantidades a recibir, pero NO registra: lo registras tú después desde BC"
+                        disabled={estado?.subiendo || !g.pedido}
+                        title="Sube el Nº de albarán, lo copia en Su/Ntra. ref., adjunta el PDF y rellena las cantidades a recibir, pero NO registra: lo registras tú después desde BC"
                         className="ml-2 inline-flex items-center gap-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-4 py-2"
                       >
                         {estado?.subiendo ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
@@ -1468,6 +1512,11 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                           <div className={estado.resultado.albaran.ok ? "text-emerald-700" : "text-amber-700"}>
                             {estado.resultado.albaran.ok ? "✓ Nº albarán actualizado" : `✗ Nº albarán: ${estado.resultado.albaran.error || "error"}`}
                           </div>
+                          {estado.resultado.referencia && (
+                            <div className={estado.resultado.referencia.ok ? "text-emerald-700" : "text-amber-700"}>
+                              {estado.resultado.referencia.ok ? "✓ Su/Ntra. ref. actualizada con el Nº de albarán" : `✗ Su/Ntra. ref.: ${estado.resultado.referencia.error || "error"}`}
+                            </div>
+                          )}
                           <div className={estado.resultado.adjunto.ok ? "text-emerald-700" : "text-amber-700"}>
                             {estado.resultado.adjunto.ok ? "✓ PDF adjuntado en Archivos de documento entrante" : `✗ Adjunto: ${estado.resultado.adjunto.error || "error"}`}
                           </div>
