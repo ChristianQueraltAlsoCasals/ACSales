@@ -59,6 +59,57 @@ async function buscarUsuarioErp(username, empresa) {
   return result.recordset[0] || null;
 }
 
+const MSG_USUARIO_DUPLICADO =
+  "Contacta con Administración e IT, tu usuario está duplicado en ambas empresas";
+
+async function listarUsuariosErpPorUsername(username) {
+  const login = normalizarUsuario(username);
+  if (!login) return [];
+  const p = await getPool();
+  const result = await p.request()
+    .input("username", sql.NVarChar, login)
+    .query(`
+      SELECT
+        u.id,
+        u.username,
+        u.password,
+        u.salt,
+        u.nombre,
+        u.email,
+        u.empresa,
+        LTRIM(RTRIM(CAST(u.Trabajador AS NVARCHAR(50)))) AS codi_treballador,
+        LTRIM(RTRIM(t.Nombre)) AS nom_treballador
+      FROM dbo.usuarios u
+      LEFT JOIN dbo.Trabajadores t
+        ON LTRIM(RTRIM(CAST(t.Codigo AS NVARCHAR(50)))) = LTRIM(RTRIM(CAST(u.Trabajador AS NVARCHAR(50))))
+       AND t.empresa = u.empresa
+      WHERE LOWER(LTRIM(RTRIM(u.username))) = LOWER(@username)
+        AND u.dbaixa IS NULL
+      ORDER BY CASE u.empresa WHEN '0001' THEN 1 WHEN '0002' THEN 2 WHEN '0003' THEN 3 ELSE 9 END
+    `);
+  return result.recordset || [];
+}
+
+async function resolverUsuarioErpPorCredenciales(username, password) {
+  const rows = await listarUsuariosErpPorUsername(username);
+  if (!rows.length) return { ok: false };
+
+  const empresas = new Set();
+  for (const r of rows) {
+    const e = normalitzarEmpresaCodi(r.empresa) || String(r.empresa || "").trim();
+    if (e) empresas.add(e);
+  }
+  if (empresas.size > 1) {
+    return { ok: false, duplicado: true };
+  }
+
+  const user = rows[0];
+  if (!verificarPasswordAcapp(password, user.salt, user.password)) {
+    return { ok: false };
+  }
+  return { ok: true, user };
+}
+
 function emailPerErp(erpUser) {
   const email = String(erpUser.email || "").trim().toLowerCase();
   if (email) return email;
@@ -163,6 +214,9 @@ async function asegurarUsuarioLocal(erpUser) {
 module.exports = {
   verificarPasswordAcapp,
   buscarUsuarioErp,
+  listarUsuariosErpPorUsername,
+  resolverUsuarioErpPorCredenciales,
+  MSG_USUARIO_DUPLICADO,
   asegurarUsuarioLocal,
   normalizarUsuario,
 };
