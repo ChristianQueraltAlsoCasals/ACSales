@@ -3502,6 +3502,7 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
       const recibo = await registrarRecepcionPorApi(purchaseOrderId, token, pedido);
       if (recibo.ok) {
         resultado.registro = { ok: true, via: "api", accion: recibo.accion, viaApi: recibo.viaApi };
+        console.log(`[subir-bc] Registro OK via ${recibo.viaApi}.${recibo.accion} · pedido ${pedido}`);
         await anotarRegistrado();
       } else {
         console.warn(
@@ -4693,9 +4694,9 @@ function urlApiComprasBC() {
   return `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
 }
 
-/** Extensión AlsoCasals Remesas: si publica purchaseOrders + receive / receiveByNumber. */
-function urlApiRemesasBC() {
-  return `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/alsocasals/remesas/v1.0/companies(${EMPRESA_ID()})`;
+/** Extensión AlsoCasals Purchasing API: purchaseOrders + receive / receiveByNumber. */
+function urlApiPurchasingBC() {
+  return `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/alsocasals/purchasing/v1.0/companies(${EMPRESA_ID()})`;
 }
 
 async function marcarCantidadARecibir(idPedido, token) {
@@ -4724,9 +4725,9 @@ async function postAccionPedido(base, pathSuffix, token, bodyObj) {
   return { ok: r.ok, status: r.status, texto };
 }
 
-/** Acciones bound en API v2 o remesas (mismo id de pedido). */
+/** Acciones bound en API v2 o purchasing (mismo id de pedido). */
 async function accionPedidoCompra(idPedido, accion, token, origen = "v2") {
-  const base = origen === "remesas" ? urlApiRemesasBC() : urlApiComprasBC();
+  const base = origen === "purchasing" ? urlApiPurchasingBC() : urlApiComprasBC();
   const r = await postAccionPedido(base, `/purchaseOrders(${idPedido})/Microsoft.NAV.${accion}`, token, {});
   return { ...r, accion, origen };
 }
@@ -4748,48 +4749,42 @@ function esAccionAusente(status, texto) {
 
 /**
  * Registrar recepción por API (= «Recibir», no facturar).
- * Orden: remesas receive → remesas receiveByNumber → v2 receive → (opcional) receiveAndInvoice.
- * Si remesas aún no expone purchaseOrders/receive → 404 y cae a Playwright (BC_REGISTRO_URL).
+ * Orden: purchasing receive → purchasing receiveByNumber (orderNo) → v2 receive → (opcional) receiveAndInvoice.
+ * API: alsocasals/purchasing/v1.0 (extensión AlsoCasals Purchasing).
  */
 async function registrarRecepcionPorApi(idPedido, token, numeroPedido) {
   const num = String(numeroPedido || "").trim();
   const intentos = [];
 
-  // 1) Extensión remesas — bound receive por id
+  // 1) Extensión purchasing — bound receive por id
   if (idPedido) {
-    let recibo = await accionPedidoCompra(idPedido, "receive", token, "remesas");
-    intentos.push(`remesas.receive(${recibo.status})`);
-    if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "remesas" };
+    let recibo = await accionPedidoCompra(idPedido, "receive", token, "purchasing");
+    intentos.push(`purchasing.receive(${recibo.status})`);
+    if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "purchasing" };
 
     if (!esAccionAusente(recibo.status, recibo.texto) && /release|liberar|lanzad|open/i.test(recibo.texto || "")) {
-      const lanzar = await accionPedidoCompra(idPedido, "release", token, "remesas");
-      intentos.push(`remesas.release(${lanzar.status})`);
+      const lanzar = await accionPedidoCompra(idPedido, "release", token, "purchasing");
+      intentos.push(`purchasing.release(${lanzar.status})`);
       if (lanzar.ok || /already|ya.*lanzad|released/i.test(lanzar.texto || "")) {
-        recibo = await accionPedidoCompra(idPedido, "receive", token, "remesas");
-        intentos.push(`remesas.receive2(${recibo.status})`);
-        if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "remesas" };
+        recibo = await accionPedidoCompra(idPedido, "receive", token, "purchasing");
+        intentos.push(`purchasing.receive2(${recibo.status})`);
+        if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "purchasing" };
       }
     }
   }
 
-  // 2) Extensión remesas — receiveByNumber (unbound / por número)
+  // 2) Extensión purchasing — receiveByNumber (campo oficial: orderNo)
   if (num) {
-    const cuerpos = [
-      { number: num },
-      { orderNumber: num },
-      { no: num },
-      { purchaseOrderNumber: num },
-    ];
+    const cuerpos = [{ orderNo: num }];
     for (const cuerpo of cuerpos) {
       const r = await postAccionPedido(
-        urlApiRemesasBC(),
+        urlApiPurchasingBC(),
         "/purchaseOrders/Microsoft.NAV.receiveByNumber",
         token,
         cuerpo
       );
-      intentos.push(`remesas.receiveByNumber(${Object.keys(cuerpo)[0]}:${r.status})`);
-      if (r.ok) return { ...r, accion: "receiveByNumber", viaApi: "remesas" };
-      // 400 por campo incorrecto → probar siguiente cuerpo; 404 acción → salir
+      intentos.push(`purchasing.receiveByNumber(${Object.keys(cuerpo)[0]}:${r.status})`);
+      if (r.ok) return { ...r, accion: "receiveByNumber", viaApi: "purchasing" };
       if (esAccionAusente(r.status, r.texto)) break;
       if (r.status !== 400 && r.status !== 422) break;
     }
@@ -4823,7 +4818,7 @@ async function registrarRecepcionPorApi(idPedido, token, numeroPedido) {
     status: 502,
     accion: "receive",
     texto: intentos.join(" → "),
-    hint: "No se pudo recibir por API (remesas receive / receiveByNumber ni v2). Revisa extensión Remesas ≥1.2.44 o usa Playwright de respaldo.",
+    hint: "No se pudo recibir por API (alsocasals/purchasing receive / receiveByNumber ni v2).",
   };
 }
 
