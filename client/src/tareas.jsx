@@ -103,11 +103,15 @@ function FeinaCorreu({ correo, onRec }) {
   const [error, setError] = useState(null);
   const [ocupada, setOcupada] = useState("");
   const [aviso, setAviso] = useState(null);
+  const [fallida, setFallida] = useState(null);
+  const [pista, setPista] = useState("");
+  const [avisoImporte, setAvisoImporte] = useState("");
+  const [importeOk, setImporteOk] = useState(false);
 
   useEffect(() => {
     if (!correo?.id && !correo?.cuerpo) return;
     let vivo = true;
-    setCargando(true); setError(null); setRec(null); setAviso(null);
+    setCargando(true); setError(null); setRec(null); setAviso(null); setFallida(null); setPista(""); setAvisoImporte(""); setImporteOk(false);
     fetch("/api/correo/recomendacion", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -131,21 +135,36 @@ function FeinaCorreu({ correo, onRec }) {
     return () => { vivo = false; };
   }, [correo?.id]);
 
-  const preparar = async (accion, clave) => {
-    setOcupada(clave); setError(null);
+  const preparar = async (accion, clave, pistaTexto) => {
+    setOcupada(clave); setError(null); setAvisoImporte(""); setImporteOk(false);
     try {
       const r = await fetch("/api/correo/accion-bc", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tipo: accion.tipo, factura: accion.factura || "", cliente: accion.cliente || "" }),
+        body: JSON.stringify({
+          tipo: accion.tipo,
+          factura: accion.factura || "",
+          cliente: accion.cliente || "",
+          pista: pistaTexto || "",
+        }),
       });
       const d = await r.json().catch(() => ({}));
-      if (!r.ok) { setError(d.error || "No he pogut preparar el document."); return; }
+      if (!r.ok) {
+        setFallida({ accion, clave });
+        setError(d.error || "No he pogut preparar el document.");
+        return;
+      }
+      setFallida(null);
+      setPista("");
+      setAvisoImporte(d.avisoImporte || "");
+      setImporteOk(!!d.importeOk);
       const que = accion.tipo === "abono" ? "Abonament" : "Factura";
+      const quien = d.cliente ? " Client: " + d.cliente + "." : "";
       const extra = (d.avisos || []).length ? " Revisa les línies: " + d.avisos[0] : " El registres tu a BC.";
-      setAviso(que + (d.numero ? " " + d.numero : "") + " preparat." + extra);
+      setAviso(que + (d.numero ? " " + d.numero : "") + " preparat." + quien + extra);
       if (d.enlace) window.open(d.enlace, "_blank", "noopener");
     } catch {
+      setFallida({ accion, clave });
       setError("No he pogut connectar amb el servidor.");
     } finally {
       setOcupada("");
@@ -176,7 +195,37 @@ function FeinaCorreu({ correo, onRec }) {
         );
       })}
       {aviso && <div className="text-[12px] text-green-800">{aviso}</div>}
-      {error && <div className="text-[12px] text-red-700">{error}</div>}
+      {avisoImporte && <div className={"text-[12px] font-semibold rounded px-2 py-1 border " + (importeOk ? "text-green-800 bg-green-50 border-green-200" : "text-red-800 bg-red-50 border-red-200")}>{avisoImporte}</div>}
+      {error && (
+        <div className="space-y-2">
+          <div className="text-[12px] text-red-700">{error}</div>
+          {fallida && (
+            <form
+              className="flex gap-1"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const texto = pista.trim();
+                if (!texto || ocupada) return;
+                preparar(fallida.accion, fallida.clave, texto);
+              }}
+            >
+              <input
+                value={pista}
+                onChange={(e) => setPista(e.target.value)}
+                placeholder="DNI, número de client o nom"
+                className="flex-1 min-w-0 text-[12px] border border-red-200 rounded px-2 py-1"
+              />
+              <button
+                type="submit"
+                disabled={!pista.trim() || !!ocupada}
+                className="text-[12px] font-semibold text-white bg-slate-800 rounded px-2 py-1 disabled:opacity-50"
+              >
+                Buscar
+              </button>
+            </form>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -979,10 +979,69 @@ async function bcPedir(url, token, method, body) {
 function textoErrorBC(r) {
   return r.json?.error?.message || String(r.texto || "").slice(0, 300) || `BC respondió ${r.status}`;
 }
+function eurosEs(n) {
+  const [entero, dec] = Number(n).toFixed(2).split(".");
+  return entero.replace(/\B(?=(\d{3})+(?!\d))/g, ".") + "," + dec + " €";
+}
+// En Also Casals el código del cliente es el NIF, sin guiones. taxRegistrationNumber no se puede filtrar.
+function codigosClienteEnTexto(texto) {
+  const tokens = String(texto || "").toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+  const candidatos = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    const siguiente = tokens[i + 1] || "";
+    if (/^(?:[0-9]{8}[A-Z]|[XYZ][0-9]{7}[A-Z]|[A-Z][0-9]{7}[0-9A-Z])$/.test(t)) candidatos.push(t);
+    else if (/^[0-9]{8}$/.test(t) && /^[A-Z]$/.test(siguiente)) candidatos.push(t + siguiente);
+    else if (/^[XYZ][0-9]{7}$/.test(t) && /^[A-Z]$/.test(siguiente)) candidatos.push(t + siguiente);
+    else if (/^[A-Z][0-9]{7}$/.test(t) && /^[0-9A-Z]$/.test(siguiente)) candidatos.push(t + siguiente);
+  }
+  return [...new Set(candidatos)];
+}
+async function elegirClienteBC(base, token, clienteNombre, pista) {
+  const nombre = String(clienteNombre || "").trim();
+  const pistaTxt = String(pista || "").trim().slice(0, 160);
+  const codigos = codigosClienteEnTexto(pistaTxt);
+  for (const codigo of codigos) {
+    const esc = codigo.replace(/'/g, "''");
+    const r = await bcPedir(`${base}/customers?$filter=${encodeURIComponent(`number eq '${esc}'`)}&$select=number,displayName&$top=1`, token);
+    if (!r.ok) return { error: "No he podido buscar el cliente.", detalle: textoErrorBC(r), status: 502 };
+    const uno = (r.json?.value || [])[0];
+    if (uno) return { elegido: uno };
+  }
+  const pistaCodigo = pistaTxt && !/\s/.test(pistaTxt) ? pistaTxt.toUpperCase().replace(/[^A-Z0-9]/g, "") : "";
+  if (pistaCodigo && pistaCodigo.length >= 3 && pistaCodigo.length <= 20 && !codigos.includes(pistaCodigo)) {
+    const esc = pistaCodigo.replace(/'/g, "''");
+    const r = await bcPedir(`${base}/customers?$filter=${encodeURIComponent(`number eq '${esc}'`)}&$select=number,displayName&$top=1`, token);
+    if (!r.ok) return { error: "No he podido buscar el cliente.", detalle: textoErrorBC(r), status: 502 };
+    const uno = (r.json?.value || [])[0];
+    if (uno) return { elegido: uno };
+    return { error: `No encuentro ningún cliente con el código ${pistaCodigo} en ${EMPRESA_NOMBRE()}.`, status: 409 };
+  }
+  if (codigos.length) {
+    return { error: `No encuentro ningún cliente con el DNI ${codigos[0]} en ${EMPRESA_NOMBRE()}.`, status: 409 };
+  }
+  const nombreBusqueda = pistaTxt || nombre;
+  if (!nombreBusqueda) return { elegido: null };
+  const trozo = nombreBusqueda.replace(/'/g, "''").slice(0, 40);
+  const cli = await bcPedir(`${base}/customers?$filter=${encodeURIComponent(`contains(displayName,'${trozo}')`)}&$select=number,displayName&$top=8`, token);
+  if (!cli.ok) return { error: "No he podido buscar el cliente.", detalle: textoErrorBC(cli), status: 502 };
+  const lista = cli.json?.value || [];
+  const exacto = lista.find((c) => String(c.displayName || "").toLowerCase() === nombreBusqueda.toLowerCase());
+  const elegido = exacto || (lista.length === 1 ? lista[0] : null);
+  if (!elegido) {
+    const nombres = lista.map((c) => c.displayName).filter(Boolean).slice(0, 5).join(", ");
+    return {
+      error: nombres ? `Hay varios clientes parecidos a «${nombreBusqueda}»: ${nombres}.` : `No encuentro el cliente «${nombreBusqueda}» en ${EMPRESA_NOMBRE()}.`,
+      status: 409,
+    };
+  }
+  return { elegido };
+}
 app.post("/api/correo/accion-bc", async (req, res) => {
   const tipo = req.body?.tipo === "factura" ? "factura" : req.body?.tipo === "abono" ? "abono" : "";
   const factura = String(req.body?.factura || "").trim();
   const clienteNombre = String(req.body?.cliente || "").trim();
+  const pista = String(req.body?.pista || "").trim();
   if (!tipo) return res.status(400).json({ error: "No sé si es un abono o una factura." });
   if (factura && !/^[A-Za-z0-9][A-Za-z0-9./-]{2,24}$/.test(factura)) {
     return res.status(400).json({ error: "El número de factura no es válido." });
@@ -999,18 +1058,14 @@ app.post("/api/correo/accion-bc", async (req, res) => {
       if (!origen) return res.status(404).json({ error: `No encuentro la factura ${factura} en ${EMPRESA_NOMBRE()}.` });
     }
     let customerNumber = origen?.customerNumber || "";
-    if (clienteNombre) {
-      const trozo = clienteNombre.replace(/'/g, "''").slice(0, 40);
-      const cli = await bcPedir(`${base}/customers?$filter=${encodeURIComponent(`contains(displayName,'${trozo}')`)}&$select=number,displayName&$top=8`, token);
-      if (!cli.ok) return res.status(502).json({ error: "No he podido buscar el cliente.", detalle: textoErrorBC(cli) });
-      const lista = cli.json?.value || [];
-      const exacto = lista.find((c) => String(c.displayName || "").toLowerCase() === clienteNombre.toLowerCase());
-      const elegido = exacto || (lista.length === 1 ? lista[0] : null);
-      if (!elegido) {
-        const nombres = lista.map((c) => c.displayName).filter(Boolean).slice(0, 5).join(", ");
-        return res.status(409).json({ error: nombres ? `Hay varios clientes parecidos a «${clienteNombre}»: ${nombres}.` : `No encuentro el cliente «${clienteNombre}» en ${EMPRESA_NOMBRE()}.` });
+    let clienteElegido = null;
+    if (clienteNombre || (pista && !customerNumber)) {
+      const hallado = await elegirClienteBC(base, token, clienteNombre, pista);
+      if (hallado.error) return res.status(hallado.status || 409).json({ error: hallado.error, detalle: hallado.detalle });
+      if (hallado.elegido) {
+        clienteElegido = hallado.elegido;
+        customerNumber = hallado.elegido.number;
       }
-      customerNumber = elegido.number;
     }
     if (!customerNumber) return res.status(400).json({ error: "Falta el cliente del documento." });
 
@@ -1041,6 +1096,32 @@ app.post("/api/correo/accion-bc", async (req, res) => {
         const creada = await bcPedir(`${base}/${coleccion}(${doc.id})/${destino}`, token, "POST", cuerpoLinea);
         if (!creada.ok) avisos.push(`${l.lineObjectNumber || l.description || "línea"}: ${textoErrorBC(creada)}`);
       }
+      const ots = await otsDeFacturaRegistrada(base, token, origen.id);
+      if (!ots.ot) avisos.push("La factura original no tiene nº de OT, así que el documento nuevo tampoco.");
+      else if (doc.number) {
+        const malOt = await escribirOtDocumentoVenta(token, tipo, doc.number, ots.ot, ots.porLinea);
+        if (malOt) avisos.push(malOt);
+      }
+    }
+    let avisoImporte = "";
+    let importeOk = false;
+    const nombreDoc = tipo === "abono" ? "La nota de abono" : "La factura nueva";
+    if (origen && doc.id) {
+      const recien = await bcPedir(`${base}/${coleccion}(${doc.id})?$select=totalAmountExcludingTax`, token);
+      const nuevo = Number(recien.json?.totalAmountExcludingTax);
+      const original = Number(origen.totalAmountExcludingTax);
+      if (recien.ok && Number.isFinite(nuevo) && Number.isFinite(original)) {
+        if (Math.abs(nuevo - original) > 0.009) {
+          avisoImporte = `${nombreDoc} tiene un importe distinto al de la factura ${origen.number || factura}: ${eurosEs(nuevo)} sin IVA frente a ${eurosEs(original)}.`;
+        } else {
+          importeOk = true;
+          avisoImporte = `${nombreDoc} está hecha. El importe coincide con la factura ${origen.number || factura}: ${eurosEs(original)} sin IVA.`;
+        }
+      }
+    }
+    if (!avisoImporte && doc.number) {
+      importeOk = true;
+      avisoImporte = `${nombreDoc} ${doc.number} está hecha. La registras tú.`;
     }
     const pagina = tipo === "abono" ? 44 : 43;
     res.json({
@@ -1048,11 +1129,67 @@ app.post("/api/correo/accion-bc", async (req, res) => {
       tipo,
       numero: doc.number || "",
       enlace: doc.number ? urlDocumentoBC(pagina, doc.number) : "",
+      cliente: clienteElegido?.displayName || "",
+      clienteNumero: clienteElegido?.number || customerNumber || "",
+      avisoImporte,
+      importeOk,
       avisos: avisos.slice(0, 5),
     });
   } catch (err) {
     console.error("Error preparando documento de venta:", err);
     res.status(500).json({ error: "No he podido preparar el documento.", detalle: String(err.message || err) });
+  }
+});
+
+// Borrador de factura de venta VACÍO, desde la ficha de la OT.
+// No copia líneas y no se registra: Maria trae las del albarán en BC
+// («Traer líneas alb. venta») y registra ella.
+app.post("/api/bc/factura-venta-borrador", async (req, res) => {
+  const clienteNumero = String(req.body?.clienteNumero || "").trim();
+  const clienteNombre = String(req.body?.cliente || "").trim();
+  const ot = String(req.body?.ot || "").trim();
+  if (!clienteNumero && !clienteNombre) return res.status(400).json({ error: "Falta el cliente de la OT." });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    let customerNumber = clienteNumero;
+    let clienteElegido = null;
+    if (customerNumber) {
+      const esc = customerNumber.replace(/'/g, "''");
+      const busca = await bcPedir(`${base}/customers?$filter=${encodeURIComponent(`number eq '${esc}'`)}&$select=number,displayName&$top=1`, token);
+      if (!busca.ok) return res.status(502).json({ error: "No he podido buscar el cliente.", detalle: textoErrorBC(busca) });
+      const uno = (busca.json?.value || [])[0];
+      if (!uno) return res.status(409).json({ error: `No encuentro el cliente ${customerNumber} en ${EMPRESA_NOMBRE()}.` });
+      clienteElegido = uno;
+      customerNumber = uno.number;
+    } else {
+      const hallado = await elegirClienteBC(base, token, clienteNombre, "");
+      if (hallado.error) return res.status(hallado.status || 409).json({ error: hallado.error, detalle: hallado.detalle });
+      if (!hallado.elegido) return res.status(400).json({ error: "Falta el cliente de la OT." });
+      clienteElegido = hallado.elegido;
+      customerNumber = hallado.elegido.number;
+    }
+    const alta = await bcPedir(`${base}/salesInvoices`, token, "POST", { customerNumber });
+    if (!alta.ok) return res.status(502).json({ error: "No he podido crear la factura.", detalle: textoErrorBC(alta) });
+    const doc = alta.json || {};
+    const avisos = [];
+    if (ot && doc.number) {
+      const malOt = await escribirOtDocumentoVenta(token, "factura", doc.number, ot, []);
+      if (malOt) avisos.push(malOt);
+    } else if (!ot) {
+      avisos.push("La OT no tiene código, así que la factura queda sin Cód. OT.");
+    }
+    res.json({
+      ok: true,
+      numero: doc.number || "",
+      enlace: doc.number ? urlDocumentoBC(43, doc.number) : "",
+      cliente: clienteElegido?.displayName || "",
+      clienteNumero: customerNumber,
+      avisos: avisos.slice(0, 5),
+    });
+  } catch (err) {
+    console.error("Error creando borrador de factura de venta:", err);
+    res.status(500).json({ error: "No he podido crear la factura.", detalle: String(err.message || err) });
   }
 });
 
@@ -1774,6 +1911,7 @@ const FUENTES_BC = {
   movs_contabilidad: { entidad: "generalLedgerEntries", campoFecha: "postingDate" },
   // tarifas_venta va por FUENTES_WS: salesPrices NO existe en la API v2.0 estándar
   facturas_venta: { entidad: "salesInvoices", campoFecha: "invoiceDate" },
+  abonos_venta: { entidad: "salesCreditMemos", campoFecha: "creditMemoDate" },
 };
 
 // Fuentes que van por WEB SERVICE de página (no por la API estándar).
@@ -4287,6 +4425,133 @@ async function ponerOtEnLineaApi(lineaId, linea, token) {
   return avisos.length ? avisos.join(" ") : null;
 }
 
+function raizODataBC() {
+  const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+  return `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+}
+
+async function parcheOData(url, cuerpo, token) {
+  const r = await fetchConReintento(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "If-Match": "*",
+    },
+    body: JSON.stringify(cuerpo),
+  });
+  if (r.ok) return null;
+  const txt = (await r.text().catch(() => "")).slice(0, 220);
+  return `BC ${r.status} ${txt}`.trim();
+}
+
+// «Cód. OT» de la pantalla es Shortcut_Dimension_2_Code. Las dimensiones
+// de la API no rellenan esa casilla.
+async function escribirOtPedidoCompra(numero, ot, token) {
+  if (!numero || !ot) return null;
+  const raiz = raizODataBC();
+  const esc = String(numero).replace(/'/g, "''");
+  const servicio = FUENTES_WS.pedidos_compra.servicio;
+  const cabeceras = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  const malCab = await parcheOData(
+    `${raiz}/${encodeURIComponent(servicio)}(Document_Type='Order',No='${esc}')`,
+    { Shortcut_Dimension_2_Code: ot },
+    token
+  );
+  const avisos = [];
+  if (malCab) avisos.push(`No se pudo poner la OT en la cabecera del pedido: ${malCab}`);
+  const servicioLineas = servicio + "PurchLines";
+  let r = await fetchConReintento(
+    `${raiz}/${encodeURIComponent(servicioLineas)}?$filter=${encodeURIComponent(`Document_No eq '${esc}'`)}&$select=Line_No,Type,Shortcut_Dimension_2_Code`,
+    { headers: cabeceras }
+  );
+  if (!r.ok) {
+    r = await fetchConReintento(
+      `${raiz}/${encodeURIComponent(servicioLineas)}?$filter=${encodeURIComponent(`Document_No eq '${esc}'`)}&$select=Line_No,Shortcut_Dimension_2_Code`,
+      { headers: cabeceras }
+    );
+  }
+  if (!r.ok) {
+    avisos.push(`No se pudieron leer las líneas para el Cód. OT: BC ${r.status}`);
+    return avisos.join(" ") || null;
+  }
+  for (const f of (await r.json()).value || []) {
+    if (!f.Line_No || /comment/i.test(String(f.Type || ""))) continue;
+    if (String(f.Shortcut_Dimension_2_Code || "") === ot) continue;
+    const clave = `(Document_Type='Order',Document_No='${esc}',Line_No=${Number(f.Line_No)})`;
+    const mal = await parcheOData(
+      `${raiz}/${encodeURIComponent(servicioLineas)}${clave}`,
+      { Shortcut_Dimension_2_Code: ot },
+      token
+    );
+    if (mal) avisos.push(`Línea ${f.Line_No}: ${mal}`);
+  }
+  return avisos.length ? avisos.join(" ") : null;
+}
+
+async function otsDeFacturaRegistrada(base, token, facturaId) {
+  const dims = await dimensionesGlobales(token);
+  const codigoOt = String(dims.d2 || "OT").toUpperCase();
+  const valor = (lista) => {
+    const hit = (lista || []).find((d) => String(d.code || "").toUpperCase() === codigoOt);
+    return hit?.valueCode ? String(hit.valueCode) : "";
+  };
+  const cab = await bcPedir(`${base}/salesInvoices(${facturaId})/dimensionSetLines`, token);
+  const otCab = cab.ok ? valor(cab.json?.value) : "";
+  let lin = await bcPedir(`${base}/salesInvoices(${facturaId})/salesInvoiceLines?$select=id,sequence,lineType,lineObjectNumber`, token);
+  if (!lin.ok) lin = await bcPedir(`${base}/salesInvoices(${facturaId})/salesInvoiceLines`, token);
+  const porLinea = [];
+  if (lin.ok) {
+    for (const l of (lin.json?.value || []).slice(0, 40)) {
+      if (!l.id || String(l.lineType || "") === "Comment") continue;
+      const d = await bcPedir(`${base}/salesInvoices(${facturaId})/salesInvoiceLines(${l.id})/dimensionSetLines`, token);
+      const ot = d.ok ? valor(d.json?.value) : "";
+      if (ot) porLinea.push({ lineNumber: Number(l.sequence) || 0, numero: String(l.lineObjectNumber || ""), ot });
+    }
+  }
+  return { ot: otCab || porLinea[0]?.ot || "", porLinea };
+}
+
+async function escribirOtDocumentoVenta(token, tipo, numero, ot, porLinea) {
+  if (!numero || !ot) return null;
+  const documentType = tipo === "abono" ? "Credit Memo" : "Invoice";
+  const raiz = raizODataBC();
+  const esc = String(numero).replace(/'/g, "''");
+  const cabeceras = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  const filtro = encodeURIComponent(`number eq '${esc}' and documentType eq '${documentType}'`);
+  const r = await fetchConReintento(
+    `${raiz}/salesDocuments?$filter=${filtro}&$select=id,number&$top=2`,
+    { headers: cabeceras }
+  );
+  if (!r.ok) return `No he podido abrir el documento para poner la OT: BC ${r.status}`;
+  const doc = ((await r.json()).value || [])[0];
+  if (!doc?.id) return `No encuentro ${numero} para poner el Cód. OT.`;
+  const avisos = [];
+  const malCab = await parcheOData(`${raiz}/salesDocuments(${doc.id})`, { shortcutDimension2Code: ot }, token);
+  if (malCab) avisos.push(`No se pudo poner la OT en la cabecera: ${malCab}`);
+  const filtroL = encodeURIComponent(`documentNumber eq '${esc}' and documentType eq '${documentType}'`);
+  const rl = await fetchConReintento(
+    `${raiz}/salesDocumentLines?$filter=${filtroL}&$select=lineNumber,type,number,shortcutDimension2Code`,
+    { headers: cabeceras }
+  );
+  if (!rl.ok) {
+    avisos.push(`No se pudieron leer las líneas para el Cód. OT: BC ${rl.status}`);
+    return avisos.join(" ") || null;
+  }
+  for (const f of (await rl.json()).value || []) {
+    if (!f.lineNumber || /comment/i.test(String(f.type || ""))) continue;
+    const especifica = (porLinea || []).find((p) => p.lineNumber && p.lineNumber === Number(f.lineNumber))
+      || (porLinea || []).find((p) => p.numero && p.numero === String(f.number || ""));
+    const valor = especifica?.ot || ot;
+    if (String(f.shortcutDimension2Code || "") === valor) continue;
+    const clave = `(documentType='${documentType}',documentNumber='${esc}',lineNumber=${Number(f.lineNumber)})`;
+    const mal = await parcheOData(`${raiz}/salesDocumentLines${clave}`, { shortcutDimension2Code: valor }, token);
+    if (mal) avisos.push(`Línea ${f.lineNumber}: ${mal}`);
+  }
+  return avisos.length ? avisos.join(" ") : null;
+}
+
 async function aplicarOtAlPedido(pedido) {
   const ot = pedido?.plantilla?.ot || null;
   const depto = pedido?.plantilla?.departamento || null;
@@ -4306,15 +4571,22 @@ async function aplicarOtAlPedido(pedido) {
     if (mal) avisos.push(`No se pudo poner la OT en el pedido: ${mal}`);
   }
   if ((depto && !dims.d1) || (ot && !dims.d2)) avisos.push("No encuentro en BC el código de la dimensión global para copiar la OT.");
+  const cerrar = async (otEnLinea) => {
+    if (ot && pedido.numero) {
+      const malPagina = await escribirOtPedidoCompra(pedido.numero, ot, token);
+      if (malPagina) avisos.push(malPagina);
+    }
+    return { ...pedido, avisos, otEnLinea };
+  };
   const r = await fetchConReintento(`${urlBase}/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${pedido.id}`)}`, { headers });
   if (!r.ok) {
     avisos.push(`No se pudieron leer las líneas para poner la OT: BC ${r.status}`);
-    return { ...pedido, avisos, otEnLinea: false };
+    return cerrar(false);
   }
   const lineas = ((await r.json()).value || []).filter((l) => l.lineType && !/comment/i.test(l.lineType));
   if (!lineas.length) {
     avisos.push("El pedido no tiene líneas donde poner la OT.");
-    return { ...pedido, avisos, otEnLinea: false };
+    return cerrar(false);
   }
   let puestas = 0;
   for (const l of lineas) {
@@ -4322,7 +4594,7 @@ async function aplicarOtAlPedido(pedido) {
     if (aviso) avisos.push(aviso);
     else puestas += 1;
   }
-  return { ...pedido, avisos, otEnLinea: puestas === lineas.length };
+  return cerrar(puestas === lineas.length);
 }
 
 async function crearPedidoComoUltima(datos) {

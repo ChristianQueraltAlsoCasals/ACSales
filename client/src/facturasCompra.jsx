@@ -33,7 +33,7 @@
  */
 import React, { Fragment, useState, useRef, useMemo, useEffect } from "react";
 import { createPortal } from "react-dom";
-import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet, Inbox, Send } from "lucide-react";
+import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet, Inbox, Send, StickyNote } from "lucide-react";
 import { emailsPorCodigoDepartamento, EMAIL_POR_DEFECTO } from "./departamentos.js";
 import { empresaGuardada } from "./empresa.jsx";
 
@@ -2774,16 +2774,151 @@ function textoIncidencia(f, motivos) {
 }
 
 function resumenLectura(f) {
+  const pedidos = [...new Set(
+    [
+      ...(Array.isArray(f.pedidos) ? f.pedidos : []),
+      ...(f.pedidosDetalle || []).map((p) => p.pedido).filter(Boolean),
+    ].map((p) => String(p).toUpperCase())
+  )];
+  const completa = Array.isArray(f.pedidosDetalle);
   return {
     factura: f.factura || "",
     fecha: f.fecha || "",
+    proveedor: f.proveedor || (f.pedidosDetalle || []).map((p) => p.vendorName).find(Boolean) || "",
+    baseImponible: f.baseImponible ?? null,
+    importeTotal: f.importeTotal ?? null,
     veredicto: f.veredicto || "",
     motivos: f.motivos || [],
     pdfGuardado: !!(f.pdfBase64 || f.pdfGuardado),
     yaEntrada: !!f.yaEntrada,
-    pendientesRecibir: pendientesRecibirDe(f),
-    incidencia: textoIncidencia(f),
+    pendientesRecibir: completa ? pendientesRecibirDe(f) : (f.pendientesRecibir || []),
+    incidencia: completa ? textoIncidencia(f) : (f.incidencia || textoIncidencia(f)),
+    pedidos,
   };
+}
+
+function fmtFechaFactura(v) {
+  if (!v) return "—";
+  const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[3]}/${m[2]}/${m[1]}`;
+  return String(v);
+}
+
+function moneyFactura(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  return fmtEur(Number(v));
+}
+
+function ivaFactura(f) {
+  if (f?.importeTotal === null || f?.importeTotal === undefined || f?.importeTotal === "") return null;
+  if (f?.baseImponible === null || f?.baseImponible === undefined || f?.baseImponible === "") return null;
+  const n = Number(f.importeTotal) - Number(f.baseImponible);
+  return Number.isFinite(n) ? n : null;
+}
+
+function estaEntrada(f) {
+  return !!(f?.yaEntrada || f?.veredicto === "ya_entrada");
+}
+
+function estadoLectura(f) {
+  if (estaEntrada(f)) return { tono: "text-slate-400", texto: "—" };
+  if (f?.veredicto === "gasto") return { tono: "text-blue-800 font-semibold", texto: "Proveedor de gasto" };
+  if (f?.veredicto === "ok") return { tono: "text-emerald-700 font-semibold", texto: "Se puede entrar" };
+  const err = String(f?.incidencia || "").trim();
+  return { tono: "text-red-800", texto: err || "Errores detectados" };
+}
+
+function marcaEntrada(f) {
+  if (!f) return { tono: "text-slate-400", texto: "Sin leer" };
+  if (estaEntrada(f)) return { tono: "text-emerald-700 font-semibold", texto: "Entrada" };
+  return { tono: "text-amber-800 font-semibold", texto: "No entrada" };
+}
+
+function PanelCorreoFila({ it }) {
+  const recibido = it?.fecha
+    ? new Date(it.fecha).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "—";
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 text-[12px]">
+      <div><span className="text-slate-500">De </span><span className="text-slate-800">{it.deNombre || "—"}</span>{it.de ? <span className="text-slate-500"> · {it.de}</span> : null}</div>
+      <div><span className="text-slate-500">Recibido </span><span className="text-slate-800">{recibido}</span></div>
+      <div className="sm:col-span-2"><span className="text-slate-500">Asunto </span><span className="text-slate-800">{it.asunto || "—"}</span></div>
+      <div className="sm:col-span-2"><span className="text-slate-500">Archivo </span><span className="text-slate-800">{it.nombre || "—"}</span></div>
+    </div>
+  );
+}
+
+function PanelNotasFila({ pedidos, notasMap, onGuardada }) {
+  const [pedido, setPedido] = useState(pedidos[0] || "");
+  const [texto, setTexto] = useState("");
+  const [autor, setAutor] = useState(() => { try { return localStorage.getItem("recepcion_autor_v1") || ""; } catch { return ""; } });
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState(null);
+  const notas = (notasMap && pedido && notasMap[pedido]) || [];
+
+  const guardar = async () => {
+    const t = texto.trim();
+    if (!pedido || !t) return;
+    setGuardando(true);
+    setError(null);
+    try {
+      if (autor.trim()) localStorage.setItem("recepcion_autor_v1", autor.trim());
+      const r = await fetch("/api/recepcion/nota", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pedido, texto: t, autor: autor.trim() }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.error || `Error ${r.status}`);
+      onGuardada(pedido, json.notas || []);
+      setTexto("");
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+    setGuardando(false);
+  };
+
+  if (!pedidos.length) {
+    return <div className="text-[12px] text-slate-500">Esta factura no tiene pedido. Las notas se guardan en el pedido de compra.</div>;
+  }
+  return (
+    <div className="text-[12px]">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-slate-500">Pedido</span>
+        {pedidos.length === 1 ? (
+          <span className="font-semibold text-slate-800">{pedidos[0]}</span>
+        ) : (
+          <select value={pedido} onChange={(e) => setPedido(e.target.value)} className="border border-slate-300 rounded px-1 py-0.5 bg-white">
+            {pedidos.map((p) => <option key={p} value={p}>{p}</option>)}
+          </select>
+        )}
+      </div>
+      {notas.length === 0 && <div className="text-slate-400 mb-1">Sin notas en este pedido.</div>}
+      <div className="space-y-0.5 max-h-40 overflow-y-auto">
+        {notas.map((n) => (
+          <div key={n.id} className="text-slate-700">
+            <span className="text-slate-400">{selloCorreo(n.ts)}</span>{" "}
+            <span className="font-semibold">{n.autor}:</span> {n.texto}
+            {n.enlace ? <> <a href={n.enlace} target="_blank" rel="noopener noreferrer" className="text-sky-700 underline">Abrir en Outlook</a></> : null}
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 mt-2">
+        <input value={autor} onChange={(e) => setAutor(e.target.value)} placeholder="Tu nombre" className="border border-slate-300 rounded px-2 py-1 w-28 bg-white" />
+        <input
+          value={texto}
+          onChange={(e) => setTexto(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") guardar(); }}
+          placeholder="Añadir nota… (Enter para guardar)"
+          className="flex-1 border border-slate-300 rounded px-2 py-1 bg-white"
+        />
+        <button type="button" onClick={guardar} disabled={guardando || !texto.trim()} className="text-[11px] font-semibold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-50 rounded px-2 py-1">
+          {guardando ? "Guardando…" : "Añadir"}
+        </button>
+      </div>
+      {error && <div className="text-red-700 mt-1">{error}</div>}
+    </div>
+  );
 }
 
 function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, facturas = [], lecturas = {}, renderFactura }) {
@@ -2795,15 +2930,38 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
   const [datos, setDatos] = useState(null);
   const [verOtras, setVerOtras] = useState(false);
   const [verProcesadas, setVerProcesadas] = useState(false);
+  const [filtroEntrada, setFiltroEntrada] = useState("todas");
   const empresa = empresaGuardada();
   const datosRef = useRef(null);
   const arranque = useRef(false);
   const filaRef = useRef(null);
+  const [extra, setExtra] = useState(null);
+  const [notasMap, setNotasMap] = useState(null);
+  const [notasCargando, setNotasCargando] = useState(false);
+  const [notasFallo, setNotasFallo] = useState(null);
 
   useEffect(() => {
     if (!filaAbierta) return;
     filaRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, [filaAbierta]);
+
+  useEffect(() => {
+    if (extra?.tipo !== "notas" || notasMap) return;
+    let vivo = true;
+    setNotasCargando(true);
+    setNotasFallo(null);
+    fetch("/api/recepcion")
+      .then((r) => { if (!r.ok) throw new Error("Error"); return r.json(); })
+      .then((d) => { if (vivo) setNotasMap(d.notas || {}); })
+      .catch(() => { if (vivo) { setNotasFallo("No se han podido cargar las notas."); setNotasMap({}); } })
+      .finally(() => { if (vivo) setNotasCargando(false); });
+    return () => { vivo = false; };
+  }, [extra, notasMap]);
+
+  const abrirExtra = (e, clave, tipo) => {
+    e.stopPropagation();
+    setExtra((prev) => (prev?.clave === clave && prev.tipo === tipo ? null : { clave, tipo }));
+  };
 
   const pintar = (j) => {
     datosRef.current = j;
@@ -2882,8 +3040,24 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
   const deEsta = items.filter((it) => it.empresaId === actualId);
   const sinAsignar = items.filter((it) => !it.empresaId);
   const deOtras = items.filter((it) => it.empresaId && it.empresaId !== actualId);
+  const clasificarEntrada = (it) => {
+    const clave = `${it.msg}|${it.att}`;
+    const deFila = facturasDeFila(facturas, it);
+    const leidas = (deFila.length ? deFila : (lecturas[clave] || [])).map(resumenLectura);
+    if (!leidas.length) return "sin";
+    const n = leidas.filter(estaEntrada).length;
+    if (n === 0) return "no";
+    if (n === leidas.length) return "si";
+    return "mixta";
+  };
   const visibles = [...deEsta, ...sinAsignar, ...(verOtras ? deOtras : [])]
     .filter((it) => verProcesadas || !it.procesada)
+    .filter((it) => {
+      if (filtroEntrada === "todas") return true;
+      const c = clasificarEntrada(it);
+      if (filtroEntrada === "entradas") return c === "si" || c === "mixta";
+      return c === "sin" || c === "no" || c === "mixta";
+    })
     .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
   const pendientesEsta = deEsta.filter((it) => !it.procesada).length;
 
@@ -2905,6 +3079,13 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
             </label>
             <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={verOtras} onChange={(e) => setVerOtras(e.target.checked)} /> Ver también las de otras empresas ({deOtras.length})</label>
             <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={verProcesadas} onChange={(e) => setVerProcesadas(e.target.checked)} /> Ver ocultadas</label>
+            <label className="flex items-center gap-1">Entrada
+              <select value={filtroEntrada} onChange={(e) => setFiltroEntrada(e.target.value)} className="border border-slate-300 rounded px-1 py-0.5">
+                <option value="todas">Todas</option>
+                <option value="entradas">Entradas</option>
+                <option value="no">No entradas</option>
+              </select>
+            </label>
             <button onClick={() => cargar()} disabled={sincronizando} className="flex items-center gap-1 text-purple-700 hover:underline disabled:opacity-50">
               <RefreshCw size={12} className={sincronizando ? "animate-spin" : ""} /> {sincronizando ? "Buscando nuevos…" : "Buscar nuevos"}
             </button>
@@ -2913,63 +3094,60 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
           {error && <div className="text-[12px] text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-2">{error}</div>}
           {cargando && !datos && <div className="text-[12px] text-slate-400">Leyendo el buzón por primera vez…</div>}
           {sincronizando && datos && <div className="text-[12px] text-purple-700 mb-1">Buscando correos nuevos{horaActualizacion ? ` desde las ${horaActualizacion}` : ""}… La lista guardada sigue visible.</div>}
-          {datos && visibles.length === 0 && <div className="text-[12px] text-slate-400">No hay facturas pendientes de {empresa?.displayName || "esta empresa"} en este periodo.</div>}
+          {datos && visibles.length === 0 && <div className="text-[12px] text-slate-400">{filtroEntrada === "todas" ? `No hay facturas pendientes de ${empresa?.displayName || "esta empresa"} en este periodo.` : "Ninguna factura con este filtro de entrada."}</div>}
           {visibles.length > 0 && (
-            <table className="w-full text-[12px]">
-              <thead>
-                <tr className="text-left text-slate-500 border-b border-slate-200">
-                  <th className="py-1 pr-2">Recibido</th><th className="py-1 pr-2">De</th><th className="py-1 pr-2">Asunto / archivo</th><th className="py-1 pr-2">Empresa (por CIF)</th><th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibles.map((it) => {
-                  const otra = it.empresaId && it.empresaId !== actualId;
-                  const clave = `${it.msg}|${it.att}`;
-                  const leyendoEsta = leyendoMap[clave];
-                  const abierta = filaAbierta === clave;
-                  const deEsta = facturasDeFila(facturas, it);
-                  const errorEsta = errorFila?.clave === clave ? errorFila.texto : null;
-                  const panel = abierta && (deEsta.length > 0 || errorEsta);
-                  return (
-                    <Fragment key={clave}>
-                      <tr
-                        onClick={() => { if (!otra && !it.procesada) onAbrir?.(it); }}
-                        className={`${panel ? "" : "border-b border-slate-100"} ${it.procesada ? "opacity-60" : ""} ${abierta || leyendoEsta ? "bg-purple-50" : ""} ${otra || it.procesada ? "" : "cursor-pointer hover:bg-purple-50"}`}
-                      >
-                        <td className={`py-1 pr-2 whitespace-nowrap text-slate-500 ${abierta || leyendoEsta ? "border-l-4 border-purple-500 pl-2" : ""}`}>{new Date(it.fecha).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</td>
-                        <td className="py-1 pr-2 truncate max-w-[180px]" title={it.de}>{it.deNombre || it.de}</td>
-                        <td className="py-1 pr-2">
-                          <div className="truncate max-w-[320px]" title={it.asunto}>{it.asunto}</div>
-                          <div className="text-[10px] text-slate-400 truncate max-w-[320px]">{it.nombre}</div>
-                          {(lecturas[clave] || []).some((f) => !f.yaEntrada && f.incidencia) && !leyendoEsta && (
-                            <div className="mt-0.5 max-w-[480px] space-y-0.5">
-                              {(lecturas[clave] || []).filter((f) => !f.yaEntrada && f.incidencia).map((f, i) => (
-                                <div key={`${f.factura}-${i}`} className="text-[11px] text-orange-900">
-                                  <span className="font-semibold">Pendiente de entrar</span>
-                                  {f.incidencia ? <span> · {f.incidencia}</span> : null}
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                          {leyendoEsta && (
-                            <div className="mt-0.5 flex items-center gap-1 text-[11px] font-medium text-purple-800">
-                              <Loader2 size={12} className="animate-spin" /> {leyendoEsta} · sigue en segundo plano
-                            </div>
-                          )}
-                          {!leyendoEsta && errorEsta && !abierta && (
-                            <div className="mt-0.5 text-[11px] text-red-700">No se ha podido leer: {errorEsta}</div>
-                          )}
+            <div className="overflow-x-auto">
+              <table className="w-full text-[12px] min-w-[1180px]">
+                <thead>
+                  <tr className="text-left text-slate-500 border-b border-slate-200">
+                    <th className="py-1 pr-2 whitespace-nowrap">Fecha de la factura</th>
+                    <th className="py-1 pr-2 whitespace-nowrap">Nº de factura</th>
+                    <th className="py-1 pr-2">Proveedor</th>
+                    <th className="py-1 pr-2">Se puede entrar / Errores detectados</th>
+                    <th className="py-1 pr-2 whitespace-nowrap">Entrada</th>
+                    <th className="py-1 pr-2 text-right whitespace-nowrap">Base imponible</th>
+                    <th className="py-1 pr-2 text-right">IVA</th>
+                    <th className="py-1 pr-2 text-right whitespace-nowrap">Importe total</th>
+                    <th className="py-1 pr-1"></th>
+                    <th className="py-1 pr-2"></th>
+                    <th className="py-1"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibles.map((it) => {
+                    const otra = it.empresaId && it.empresaId !== actualId;
+                    const clave = `${it.msg}|${it.att}`;
+                    const leyendoEsta = leyendoMap[clave];
+                    const estaAbierta = filaAbierta === clave;
+                    const deEsta = facturasDeFila(facturas, it);
+                    const errorEsta = errorFila?.clave === clave ? errorFila.texto : null;
+                    const panel = estaAbierta && (deEsta.length > 0 || errorEsta);
+                    const leidas = (deEsta.length ? deEsta : (lecturas[clave] || [])).map(resumenLectura);
+                    const leidasFiltro = filtroEntrada === "entradas"
+                      ? leidas.filter(estaEntrada)
+                      : filtroEntrada === "no"
+                        ? leidas.filter((f) => !estaEntrada(f))
+                        : leidas;
+                    const tieneLectura = leidasFiltro.length > 0;
+                    const lineas = tieneLectura ? leidasFiltro : [null];
+                    const pedidosNotas = [...new Set(leidas.flatMap((f) => f.pedidos || []))];
+                    const cuentaNotas = notasMap ? pedidosNotas.reduce((n, p) => n + ((notasMap[p] || []).length), 0) : 0;
+                    const extraEsta = extra?.clave === clave ? extra.tipo : null;
+                    const btnExtra = (activo) => `inline-flex items-center gap-1 text-[11px] font-semibold rounded px-2 py-1 border disabled:opacity-40 ${activo ? "bg-purple-600 text-white border-purple-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`;
+                    const abrir = () => { if (!otra && !it.procesada) onAbrir?.(it); };
+                    const celdaAcciones = (rowSpan) => (
+                      <>
+                        <td rowSpan={rowSpan} className="py-1 pr-1 whitespace-nowrap align-top">
+                          <button type="button" onClick={(e) => abrirExtra(e, clave, "correo")} className={btnExtra(extraEsta === "correo")}>
+                            <Mail size={12} /> Correo
+                          </button>
                         </td>
-                        <td className="py-1 pr-2 whitespace-nowrap">
-                          {it.empresaId ? (
-                            <span className={`text-[10px] font-semibold rounded px-1.5 py-0.5 ${otra ? "bg-slate-100 text-slate-500" : "bg-emerald-100 text-emerald-800"}`}>{it.empresaNombre} · {it.cif}</span>
-                          ) : (
-                            <span className="text-[10px] font-semibold rounded px-1.5 py-0.5 bg-amber-100 text-amber-800" title={it.sinTexto ? "PDF escaneado: no se puede leer el CIF automáticamente" : "No aparece ningún CIF de las empresas"}>
-                              {it.variosCif ? `Varios CIF (${it.cif}) · revisar` : it.sinTexto ? "Escaneado · revisar CIF" : "CIF no encontrado"}
-                            </span>
-                          )}
+                        <td rowSpan={rowSpan} className="py-1 pr-2 whitespace-nowrap align-top">
+                          <button type="button" onClick={(e) => abrirExtra(e, clave, "notas")} disabled={!tieneLectura} title={tieneLectura ? "Notas del pedido" : "Las notas aparecen cuando la factura está leída"} className={btnExtra(extraEsta === "notas")}>
+                            <StickyNote size={12} /> Notas{cuentaNotas > 0 ? ` ${cuentaNotas}` : ""}
+                          </button>
                         </td>
-                        <td className="py-1 text-right whitespace-nowrap">
+                        <td rowSpan={rowSpan} className="py-1 text-right whitespace-nowrap align-top">
                           {it.procesada ? (
                             <button onClick={(e) => { e.stopPropagation(); marcar(it, true); }} className="text-[11px] text-slate-500 hover:underline" title="Volver a mostrarla">ocultada · mostrar</button>
                           ) : otra ? (
@@ -2978,28 +3156,117 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
                             <button onClick={(e) => { e.stopPropagation(); marcar(it); }} className="text-[11px] text-slate-500 hover:underline" title="No mostrar esta factura">descartar</button>
                           )}
                         </td>
-                      </tr>
-                      {panel && (
-                        <tr ref={abierta ? filaRef : null} className="bg-purple-50">
-                          <td colSpan={5} className="p-0 border-l-4 border-purple-500">
-                            <div className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
-                              {errorEsta && (
-                                <div className="text-[13px] text-red-700">Error leyendo el documento: {errorEsta}</div>
-                              )}
-                              {deEsta.length > 0 && (
-                                <div className="space-y-3">
-                                  {deEsta.map((f, i) => renderFactura(f, i))}
-                                </div>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
+                      </>
+                    );
+                    return (
+                      <Fragment key={clave}>
+                        {lineas.map((f, idx) => {
+                          const ultima = idx === lineas.length - 1;
+                          const clase = `${panel || extraEsta || !ultima ? "" : "border-b border-slate-100"} ${it.procesada ? "opacity-60" : ""} ${estaAbierta || leyendoEsta ? "bg-purple-50" : ""} ${otra || it.procesada ? "" : "cursor-pointer hover:bg-purple-50"}`;
+                          if (!f) {
+                            return (
+                              <tr key={`${clave}-sin`} onClick={abrir} className={clase}>
+                                <td colSpan={4} className={`py-1 pr-2 ${estaAbierta || leyendoEsta ? "border-l-4 border-purple-500 pl-2" : ""}`}>
+                                  <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                                    <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Sin leer</span>
+                                    <span className="text-slate-500 whitespace-nowrap">{new Date(it.fecha).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</span>
+                                    <span className="truncate max-w-[180px]" title={it.de}>{it.deNombre || it.de}</span>
+                                    <span className="truncate max-w-[320px]" title={it.asunto}>{it.asunto}</span>
+                                    <span className="text-[10px] text-slate-400 truncate max-w-[220px]">{it.nombre}</span>
+                                    {it.empresaId ? (
+                                      <span className={`text-[10px] font-semibold rounded px-1.5 py-0.5 ${otra ? "bg-slate-100 text-slate-500" : "bg-emerald-100 text-emerald-800"}`}>{it.empresaNombre} · {it.cif}</span>
+                                    ) : (
+                                      <span className="text-[10px] font-semibold rounded px-1.5 py-0.5 bg-amber-100 text-amber-800" title={it.sinTexto ? "PDF escaneado: no se puede leer el CIF automáticamente" : "No aparece ningún CIF de las empresas"}>
+                                        {it.variosCif ? `Varios CIF (${it.cif}) · revisar` : it.sinTexto ? "Escaneado · revisar CIF" : "CIF no encontrado"}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {leyendoEsta && (
+                                    <div className="mt-0.5 flex items-center gap-1 text-[11px] font-medium text-purple-800">
+                                      <Loader2 size={12} className="animate-spin" /> {leyendoEsta} · sigue en segundo plano
+                                    </div>
+                                  )}
+                                  {!leyendoEsta && errorEsta && !estaAbierta && (
+                                    <div className="mt-0.5 text-[11px] text-red-700">No se ha podido leer: {errorEsta}</div>
+                                  )}
+                                </td>
+                                <td className="py-1 pr-2 whitespace-nowrap text-slate-400">Sin leer</td>
+                                <td colSpan={3}></td>
+                                {celdaAcciones(1)}
+                              </tr>
+                            );
+                          }
+                          const estado = estadoLectura(f);
+                          const entrada = marcaEntrada(f);
+                          return (
+                            <tr key={`${clave}-${idx}-${f.factura || "fac"}`} onClick={abrir} className={clase}>
+                              <td className={`py-1 pr-2 whitespace-nowrap text-slate-800 ${idx === 0 && (estaAbierta || leyendoEsta) ? "border-l-4 border-purple-500 pl-2" : ""}`}>{fmtFechaFactura(f.fecha)}</td>
+                              <td className="py-1 pr-2 whitespace-nowrap font-medium text-slate-800" title={f.factura || ""}>{f.factura || "—"}</td>
+                              <td className="py-1 pr-2 max-w-[200px] truncate text-slate-800" title={f.proveedor || ""}>{f.proveedor || "—"}</td>
+                              <td className={`py-1 pr-2 max-w-[280px] ${estado.tono}`} title={estado.texto}>
+                                {estado.texto}
+                                {idx === 0 && leyendoEsta && (
+                                  <div className="mt-0.5 flex items-center gap-1 text-[11px] font-medium text-purple-800">
+                                    <Loader2 size={12} className="animate-spin" /> {leyendoEsta}
+                                  </div>
+                                )}
+                                {idx === 0 && !leyendoEsta && errorEsta && !estaAbierta && (
+                                  <div className="mt-0.5 text-[11px] font-normal text-red-700">No se ha podido leer: {errorEsta}</div>
+                                )}
+                              </td>
+                              <td className={`py-1 pr-2 whitespace-nowrap ${entrada.tono}`}>{entrada.texto}</td>
+                              <td className="py-1 pr-2 text-right whitespace-nowrap text-slate-800">{moneyFactura(f.baseImponible)}</td>
+                              <td className="py-1 pr-2 text-right whitespace-nowrap text-slate-800">{moneyFactura(ivaFactura(f))}</td>
+                              <td className="py-1 pr-2 text-right whitespace-nowrap font-semibold text-slate-800">{moneyFactura(f.importeTotal)}</td>
+                              {idx === 0 ? celdaAcciones(lineas.length) : null}
+                            </tr>
+                          );
+                        })}
+                        {extraEsta && (
+                          <tr className="bg-slate-50">
+                            <td colSpan={11} className="px-3 py-2 border-l-4 border-purple-200">
+                              <div onClick={(e) => e.stopPropagation()}>
+                                {extraEsta === "correo" && <PanelCorreoFila it={it} />}
+                                {extraEsta === "notas" && (
+                                  <>
+                                    {notasFallo && <div className="text-[12px] text-red-700 mb-1">{notasFallo}</div>}
+                                    {notasCargando && !notasMap ? (
+                                      <div className="text-[12px] text-slate-400">Cargando notas…</div>
+                                    ) : (
+                                      <PanelNotasFila
+                                        pedidos={pedidosNotas}
+                                        notasMap={notasMap || {}}
+                                        onGuardada={(pedido, lista) => setNotasMap((prev) => ({ ...(prev || {}), [pedido]: lista }))}
+                                      />
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        {panel && (
+                          <tr ref={estaAbierta ? filaRef : null} className="bg-purple-50">
+                            <td colSpan={11} className="p-0 border-l-4 border-purple-500">
+                              <div className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+                                {errorEsta && (
+                                  <div className="text-[13px] text-red-700">Error leyendo el documento: {errorEsta}</div>
+                                )}
+                                {deEsta.length > 0 && (
+                                  <div className="space-y-3">
+                                    {deEsta.map((f, i) => renderFactura(f, i))}
+                                  </div>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       )}

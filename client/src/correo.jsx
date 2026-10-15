@@ -125,6 +125,10 @@ export default function Correo({ onCrearTarea, usuario = null }) {
   const [aviso, setAviso] = useState(null);
   const [accionBc, setAccionBc] = useState("");
   const [errorAccion, setErrorAccion] = useState(null);
+  const [accionFallida, setAccionFallida] = useState(null);
+  const [pistaCliente, setPistaCliente] = useState("");
+  const [avisoImporte, setAvisoImporte] = useState("");
+  const [importeOk, setImporteOk] = useState(false);
 
   useEffect(() => {
     fetch("/api/correo/remitente")
@@ -181,21 +185,36 @@ export default function Correo({ onCrearTarea, usuario = null }) {
     }
   };
 
-  const prepararDocumentBc = async (accion, clave) => {
-    setAccionBc(clave); setErrorAccion(null);
+  const prepararDocumentBc = async (accion, clave, pista) => {
+    setAccionBc(clave); setErrorAccion(null); setAvisoImporte(""); setImporteOk(false);
     try {
       const r = await fetch("/api/correo/accion-bc", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tipo: accion.tipo, factura: accion.factura || "", cliente: accion.cliente || "" }),
+        body: JSON.stringify({
+          tipo: accion.tipo,
+          factura: accion.factura || "",
+          cliente: accion.cliente || "",
+          pista: pista || "",
+        }),
       });
       const d = await r.json().catch(() => ({}));
-      if (!r.ok) { setErrorAccion(d.error || "No he pogut preparar el document."); return; }
+      if (!r.ok) {
+        setAccionFallida({ accion, clave });
+        setErrorAccion(d.error || "No he pogut preparar el document.");
+        return;
+      }
+      setAccionFallida(null);
+      setPistaCliente("");
+      setAvisoImporte(d.avisoImporte || "");
+      setImporteOk(!!d.importeOk);
       const que = accion.tipo === "abono" ? "Abonament" : "Factura";
+      const quien = d.cliente ? " Client: " + d.cliente + "." : "";
       const extra = (d.avisos || []).length ? " Revisa les línies: " + d.avisos[0] : " El registres tu a BC.";
-      setAviso(que + (d.numero ? " " + d.numero : "") + " preparat." + extra);
+      setAviso(que + (d.numero ? " " + d.numero : "") + " preparat." + quien + extra);
       if (d.enlace) window.open(d.enlace, "_blank", "noopener");
     } catch {
+      setAccionFallida({ accion, clave });
       setErrorAccion("No he pogut connectar amb el servidor.");
     } finally {
       setAccionBc("");
@@ -203,7 +222,8 @@ export default function Correo({ onCrearTarea, usuario = null }) {
   };
 
   useEffect(() => {
-    if (!abierto?.id) { setRecomendacion(null); setErrorRec(null); setRecDescartada(false); return; }
+    if (!abierto?.id) { setRecomendacion(null); setErrorRec(null); setRecDescartada(false); setErrorAccion(null); setAccionFallida(null); setPistaCliente(""); setAvisoImporte(""); setImporteOk(false); return; }
+    setErrorAccion(null); setAccionFallida(null); setPistaCliente(""); setAvisoImporte(""); setImporteOk(false);
     const guardada = leerRecomendacionLocal(abierto.id);
     if (guardada && typeof guardada.queHacer === "string") {
       setRecDescartada(false); setErrorRec(null); setCargandoRec(false); setRecomendacion(guardada);
@@ -501,7 +521,37 @@ export default function Correo({ onCrearTarea, usuario = null }) {
                       </button>
                     );
                   })}
-                  {errorAccion && <div className="text-[12px] text-red-700">{errorAccion}</div>}
+                  {avisoImporte && <div className={"text-[12px] font-semibold rounded px-2 py-1 border " + (importeOk ? "text-green-800 bg-green-50 border-green-200" : "text-red-800 bg-red-50 border-red-200")}>{avisoImporte}</div>}
+                  {errorAccion && (
+                    <div className="space-y-2">
+                      <div className="text-[12px] text-red-700">{errorAccion}</div>
+                      {accionFallida && (
+                        <form
+                          className="flex gap-1"
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            const texto = pistaCliente.trim();
+                            if (!texto || accionBc) return;
+                            prepararDocumentBc(accionFallida.accion, accionFallida.clave, texto);
+                          }}
+                        >
+                          <input
+                            value={pistaCliente}
+                            onChange={(e) => setPistaCliente(e.target.value)}
+                            placeholder="DNI, número de client o nom"
+                            className="flex-1 min-w-0 text-[12px] border border-red-200 rounded px-2 py-1"
+                          />
+                          <button
+                            type="submit"
+                            disabled={!pistaCliente.trim() || !!accionBc}
+                            className="text-[12px] font-semibold text-white bg-slate-800 rounded px-2 py-1 disabled:opacity-50"
+                          >
+                            Buscar
+                          </button>
+                        </form>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
               <p className="text-[13px] text-slate-700 leading-relaxed">{recomendacion.recomendacion}</p>

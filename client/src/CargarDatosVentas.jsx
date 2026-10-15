@@ -150,6 +150,17 @@ const SOURCES = [
     },
   },
   {
+    id: "abonos_venta",
+    name: "Notas de abono de venta",
+    desc: "Cabeceras de las notas de abono de venta registradas: número, fecha, cliente e importe.",
+    origin: {
+      page: "Histórico de notas de abono de venta (Posted Sales Credit Memos)",
+      pageNo: "144",
+      table: "Sales Cr.Memo Header (114)",
+      endpoint: "salesCreditMemos",
+    },
+  },
+  {
     id: "lineas_compra_reg",
     name: "Líneas Compra REGISTRADAS",
     desc: "Histórico de COMPRAS registradas línea a línea (con Nº de OT): coste real por trabajo. Conecta con el servicio ya publicado en vuestro BC (Hist. líns. facturas compra).",
@@ -3970,11 +3981,23 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     setCargandoBC(false);
   };
 
-  // VENDIDO (material): líneas ya en la ficha (facturas PDF / rangos cargados) + BC bajo demanda
+  // VENDIDO (material): líneas ya en la ficha + BC bajo demanda.
+  // La copia guardada y la recién leída pueden no coincidir en importe
+  // (el precio se actualizó después). Si se suman, las unidades del correo
+  // salen dobladas. Si el mismo artículo del mismo documento ya viene en
+  // la lectura de BC, manda esa lectura y la copia guardada no se cuenta.
   const ventaMaterial = useMemo(() => {
-    const base = [...ficha.venta.materiales.lineas];
-    if (lineasBC) base.push(...lineasBC.venta.filter((l) => clasificarLineaVenta(l) === "material"));
-    return base;
+    const memoria = [...(ficha.venta.materiales.lineas || [])];
+    const deBC = lineasBC ? lineasBC.venta.filter((l) => clasificarLineaVenta(l) === "material") : [];
+    if (!deBC.length) return memoria;
+    const clave = (l) => {
+      const doc = l.numeroDocumento ?? l["Nº documento"] ?? "";
+      const art = (l.numero ?? l["Nº"] ?? "").toString().trim()
+        || String(l.descripcion ?? l["Descripción"] ?? "").trim().toLowerCase();
+      return `${doc}|${art}`;
+    };
+    const enBC = new Set(deBC.map(clave));
+    return [...memoria.filter((l) => !enBC.has(clave(l))), ...deBC];
   }, [ficha, lineasBC]);
 
   // PEDIDO (compras reales, PC/Order — las ofertas OC no cuentan como pedido).
@@ -4108,6 +4131,17 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         const resultado = margenBruto - estructura;
         const pct = ingresos > 0 ? Math.round((resultado / ingresos) * 100) : null;
         const col = (v) => (v < 0 ? "text-red-600" : "text-emerald-600");
+        const coste = (materiales - compradoNoVendido) + costeTaller + manoObra + estructura;
+        const gana = resultado > 0.5;
+        const pierde = resultado < -0.5;
+        const tope = Math.max(ingresos, coste, 1);
+        const anchoVenta = Math.min(100, Math.round((Math.max(ingresos, 0) / tope) * 100));
+        const anchoCoste = Math.min(100, Math.round((Math.max(coste, 0) / tope) * 100));
+        const tono = gana
+          ? { caja: "bg-emerald-50 border-emerald-300", texto: "text-emerald-800", barra: "bg-emerald-500", verbo: "Es guanya" }
+          : pierde
+            ? { caja: "bg-red-50 border-red-300", texto: "text-red-800", barra: "bg-red-500", verbo: "Es perd" }
+            : { caja: "bg-slate-50 border-slate-200", texto: "text-slate-600", barra: "bg-slate-400", verbo: "Ni guanya ni perd" };
         const Metrica = ({ label, valor, sub, colorClase = "text-slate-800", signo }) => (
           <div className="flex-1 min-w-[105px] px-3 py-2">
             <div className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider whitespace-nowrap">{label}</div>
@@ -4120,6 +4154,31 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         );
         return (
           <div className="mb-3">
+            <div className={`mb-2 rounded-lg border px-4 py-3 ${tono.caja}`}>
+              <div className="flex items-baseline justify-between gap-3">
+                <div className={`text-sm font-extrabold uppercase tracking-wide ${tono.texto}`}>{tono.verbo}</div>
+                <div className={`text-3xl font-extrabold tabular-nums leading-none ${tono.texto}`}>
+                  {eur(Math.abs(resultado))}
+                  {pct != null && <span className="text-base font-bold ml-2">{Math.abs(pct)}%</span>}
+                </div>
+              </div>
+              <div className="mt-3 space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <span className="w-12 text-[10px] font-semibold text-slate-500">Venda</span>
+                  <div className="flex-1 h-2.5 bg-white/80 rounded-full overflow-hidden">
+                    <div className="h-2.5 bg-blue-500 rounded-full" style={{ width: `${anchoVenta}%` }} />
+                  </div>
+                  <span className="w-16 text-right text-[11px] font-bold text-slate-700 tabular-nums">{eur(ingresos)}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="w-12 text-[10px] font-semibold text-slate-500">Cost</span>
+                  <div className="flex-1 h-2.5 bg-white/80 rounded-full overflow-hidden">
+                    <div className={`h-2.5 rounded-full ${tono.barra}`} style={{ width: `${anchoCoste}%` }} />
+                  </div>
+                  <span className="w-16 text-right text-[11px] font-bold text-slate-700 tabular-nums">{eur(coste)}</span>
+                </div>
+              </div>
+            </div>
             <div className="flex items-stretch bg-gradient-to-r from-slate-50 to-white border border-slate-200 rounded-lg divide-x divide-slate-100 overflow-x-auto">
               <Metrica label="Ingresos" valor={eur(ingresos)} sub={conBC ? "líneas de venta BC" : "⚠ memoria (parcial)"} colorClase="text-blue-700" />
               <Metrica label="Materiales" valor={eur(materiales)} sub="compras PC" />
@@ -4495,6 +4554,44 @@ const FACTURA_COLS_LS = "agente_ventas_factura_cols_v1";
 const FACTURA_COLS_DEF = { documento: 80, tipo: 48, numero: 96, cantidad: 40, precio: 56, dto: 40, importe: 64 };
 
 function FacturaOT({ lineasRaw, ficha, noBC }) {
+  const [creandoFactura, setCreandoFactura] = useState(false);
+  const [confirmarFactura, setConfirmarFactura] = useState(false);
+  const [avisoFactura, setAvisoFactura] = useState(null);
+  const clienteNumero = (lineasRaw || []).map((r) => r["Sell_to_Customer_No"]).find(Boolean) || "";
+  const clienteNombre = ficha?.general?.cliente || "";
+
+  const crearFacturaBC = async () => {
+    setCreandoFactura(true);
+    setAvisoFactura(null);
+    try {
+      const r = await fetch("/api/bc/factura-venta-borrador", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clienteNumero,
+          cliente: clienteNombre,
+          ot: noBC || "",
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setAvisoFactura({ tipo: "error", texto: d.error || "No he podido crear la factura." });
+        return;
+      }
+      setConfirmarFactura(false);
+      const extra = (d.avisos || [])[0] ? " " + d.avisos[0] : "";
+      setAvisoFactura({
+        tipo: "ok",
+        texto: `Factura ${d.numero || ""} creada, sense línies.${extra} Obre-la a Business Central i porta les línies de l'albarà.`,
+      });
+      if (d.enlace) window.open(d.enlace, "_blank", "noopener");
+    } catch {
+      setAvisoFactura({ tipo: "error", texto: "No he podido conectar con el servidor." });
+    } finally {
+      setCreandoFactura(false);
+    }
+  };
+
   const [anchos, setAnchos] = useState(() => {
     try {
       const g = JSON.parse(localStorage.getItem(FACTURA_COLS_LS) || "null");
@@ -4585,7 +4682,16 @@ function FacturaOT({ lineasRaw, ficha, noBC }) {
     <div className="bg-white border border-slate-200 rounded-lg p-3 mt-3">
       <div className="flex items-center justify-between mb-2">
         <div className="text-xs font-bold text-slate-800">🧾 Factura — línies de venda de l'OT</div>
-        {filas.length > 0 && (
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => { setAvisoFactura(null); setConfirmarFactura(true); }}
+            disabled={creandoFactura || (!clienteNumero && !clienteNombre)}
+            title="Crea una factura de venta vacía en Business Central. Las líneas las traes tú con «Traer líneas alb. venta»."
+            className="flex items-center gap-1.5 text-[11px] font-semibold text-white bg-blue-700 border border-blue-700 rounded-md px-2.5 py-1 hover:bg-blue-800 disabled:opacity-50"
+          >
+            Crear factura a BC
+          </button>
+          {filas.length > 0 && (
           <button
             onClick={() => {
               // % dto numèric per línia (camp BC o calculat), pel PDF
@@ -4619,8 +4725,35 @@ function FacturaOT({ lineasRaw, ficha, noBC }) {
           >
             <FileText size={12} /> Borrador PDF
           </button>
-        )}
+          )}
+        </div>
       </div>
+      {confirmarFactura && (
+        <div className="mb-2 text-[11px] text-slate-700 bg-blue-50 border border-blue-200 rounded-md px-2.5 py-2">
+          Es crearà una factura de venda buida{clienteNombre ? ` de ${clienteNombre}` : ""}{noBC ? ` (OT ${noBC})` : ""}. Les línies les completes tu a Business Central amb «Traer líneas alb. venta». No es registra.
+          <div className="flex gap-2 mt-1.5">
+            <button
+              onClick={crearFacturaBC}
+              disabled={creandoFactura}
+              className="text-[11px] font-semibold text-white bg-blue-700 rounded px-2 py-1 hover:bg-blue-800 disabled:opacity-50"
+            >
+              {creandoFactura ? "Creant..." : "Crear"}
+            </button>
+            <button
+              onClick={() => setConfirmarFactura(false)}
+              disabled={creandoFactura}
+              className="text-[11px] font-semibold text-slate-600 bg-white border border-slate-300 rounded px-2 py-1 hover:bg-slate-50 disabled:opacity-50"
+            >
+              Cancel·lar
+            </button>
+          </div>
+        </div>
+      )}
+      {avisoFactura && (
+        <div className={`mb-2 text-[11px] ${avisoFactura.tipo === "error" ? "text-red-700" : "text-emerald-700"}`}>
+          {avisoFactura.texto}
+        </div>
+      )}
       {filas.length === 0 && (
         <div className="text-[11px] text-slate-400">
           Pulsa «Cargar líneas desde BC» (arriba) para traer las líneas de venta de esta OT y montar aquí la factura.
