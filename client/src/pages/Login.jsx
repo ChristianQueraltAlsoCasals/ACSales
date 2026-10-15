@@ -1,16 +1,9 @@
 import { useEffect, useState } from "react";
 import { api, urlPublic } from "../api";
 
-const EMPRESAS = [
-  ["0001", "Also Casals"],
-  ["0002", "FerrosCA"],
-  ["0003", "Quimlab"],
-];
-
 export default function Login({ alEntrar }) {
   const [usuario, setUsuario] = useState("");
   const [password, setPassword] = useState("");
-  const [empresa, setEmpresa] = useState("0001");
   const [error, setError] = useState("");
   const [enviando, setEnviando] = useState(false);
   const [portal, setPortal] = useState({ url: null });
@@ -27,7 +20,7 @@ export default function Login({ alEntrar }) {
     setError("");
     setEnviando(true);
     try {
-      const dades = await api.post("/api/auth/login", { usuario, password, empresa });
+      const dades = await api.post("/api/auth/login", { usuario, password });
       alEntrar(dades);
     } catch (err) {
       setError(err.esRed ? "Sin conexión con el servidor" : err.message);
@@ -59,16 +52,6 @@ export default function Login({ alEntrar }) {
           </p>
         )}
 
-        <label>
-          Empresa
-          <select value={empresa} onChange={(e) => setEmpresa(e.target.value)}>
-            {EMPRESAS.map(([valor, texto]) => (
-              <option key={valor} value={valor}>
-                {texto}
-              </option>
-            ))}
-          </select>
-        </label>
         <label>
           Usuario
           <input

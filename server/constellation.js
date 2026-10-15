@@ -171,20 +171,18 @@ async function validarCredencial({ username, password, empresa }) {
     return { ok: false, status: 503, error: "Portal no configurado" };
   }
   try {
+    const body = { username, password, app: APP_CLAU };
+    if (empresa) body.empresa = empresa;
     const { ok, status, cos } = await crida("/api/intern/validar-credencial", {
       method: "POST",
-      body: {
-        username,
-        password,
-        empresa: empresa || "0001",
-        app: APP_CLAU,
-      },
+      body,
     });
     if (!ok) {
       return {
         ok: false,
         status,
         error: cos.error || "Usuario o contraseña incorrectos",
+        duplicado: !!cos.duplicado,
         cos,
       };
     }

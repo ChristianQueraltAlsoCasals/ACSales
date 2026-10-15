@@ -5,8 +5,8 @@ const jwt = require("jsonwebtoken");
 const { pool, sembrarUsuario } = require("./db");
 const { erpConfigurado, esErrorConectividadErp, resetPool } = require("./erp-db");
 const {
-  verificarPasswordAcapp,
-  buscarUsuarioErp,
+  resolverUsuarioErpPorCredenciales,
+  MSG_USUARIO_DUPLICADO,
   asegurarUsuarioLocal,
   normalizarUsuario,
 } = require("./erp-auth");
@@ -257,7 +257,6 @@ async function requiereSesion(req, res, next) {
 router.post("/login", async (req, res) => {
   const login = normalizarUsuario(req.body?.usuario);
   const password = String(req.body?.password || "");
-  const empresa = String(req.body?.empresa || EMPRESA_DEFECTE).trim();
   if (!login || !password) {
     return res.status(400).json({ error: "Falta el usuario o la contraseña" });
   }
@@ -265,8 +264,12 @@ router.post("/login", async (req, res) => {
     let erpCaido = !erpConfigurado();
     if (erpConfigurado()) {
       try {
-        const erpUser = await buscarUsuarioErp(login, empresa);
-        if (erpUser && verificarPasswordAcapp(password, erpUser.salt, erpUser.password)) {
+        const resolt = await resolverUsuarioErpPorCredenciales(login, password);
+        if (resolt.duplicado) {
+          return res.status(403).json({ error: MSG_USUARIO_DUPLICADO });
+        }
+        if (resolt.ok && resolt.user) {
+          const erpUser = resolt.user;
           const local0 = await asegurarUsuarioLocal(erpUser);
           if (local0?.bloqueado) {
             return res.status(403).json({
@@ -291,8 +294,12 @@ router.post("/login", async (req, res) => {
       const portalCache = await validarCredencial({
         username: login,
         password,
-        empresa,
       });
+      if (!portalCache.ok && (portalCache.duplicado || portalCache.status === 403)) {
+        return res.status(403).json({
+          error: portalCache.error || MSG_USUARIO_DUPLICADO,
+        });
+      }
       if (portalCache.ok && portalCache.acces && portalCache.usuari) {
         const local0 = await asegurarDesdePortal(portalCache.usuari, portalCache.nivell);
         if (!local0) {
