@@ -15,6 +15,7 @@
  * Cada cambio aplicado queda anotado en Postgres (clave cambios_bc).
  */
 module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, db }) {
+  const acfactory = require("./acfactory-client.cjs");
   const RAIZ = () => `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}`;
   const RE_EMPRESAS = () => new RegExp(process.env.IA_BC_EMPRESAS || "also|ferros|quimlab", "i");
   const pendientes = new Map();
@@ -171,7 +172,7 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
     {
       name: "proponer_cambio",
       description:
-        "PROPONE un cambio en BC: 'modificar' campos de un registro existente (necesita clave) o 'crear' un registro nuevo (p.ej. una línea de pedido: recurso purchaseOrderLines con documentId, lineType, lineObjectNumber, quantity, directUnitCost…). NO se aplica: la usuaria verá una tarjeta y decidirá. Antes de proponer, CONSULTA el registro para usar la clave y nombres de campo exactos. Un cambio por llamada; puedes proponer varios. No se puede borrar ni registrar documentos.",
+        "PROPONE un cambio en BC: 'modificar' campos de un registro existente (necesita clave) o 'crear' un registro nuevo (p.ej. una línea de pedido: recurso purchaseOrderLines con documentId, lineType, lineObjectNumber, quantity, directUnitCost…). NO se aplica: la usuaria verá una tarjeta y decidirá. Antes de proponer, CONSULTA el registro para usar la clave y nombres de campo exactos. Un cambio por llamada; puedes proponer varios. No se puede borrar ni registrar documentos. PROHIBIDO crear o modificar productos/artículos (items / Ficha_producto): eso solo con proponer_producto vía ACFactory.",
       input_schema: {
         type: "object",
         properties: {
@@ -186,7 +187,56 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
         required: ["empresa", "origen", "recurso", "operacion", "datos", "descripcion"],
       },
     },
+    {
+      name: "buscar_gocatalog",
+      description:
+        "Busca categorías GoCatalog (código o nombre) en ACFactory/App. Úsala cuando el mensaje diga una ruta tipo «Climatizacion > Conductos y ventilación > Extractores industriales» y necesites confirmar códigos. nivel=1|2|3; para hijos pasa padre (y abuelo en nivel 3).",
+      input_schema: {
+        type: "object",
+        properties: {
+          q: { type: "string", description: "Texto a buscar (nombre o código)" },
+          nivel: { type: "integer", description: "1, 2 o 3" },
+          padre: { type: "string", description: "Código padre (nivel 2/3)" },
+          abuelo: { type: "string", description: "Código abuelo (nivel 3)" },
+          top: { type: "integer" },
+        },
+      },
+    },
+    {
+      name: "proponer_producto",
+      description:
+        "PROPONE crear un PRODUCTO nuevo vía ACFactory (Also + Ferros + App). Única vía de alta. Con título + 3 categorías GoCatalog LLAMA YA a esta tool; NO preguntes fabricante, precio, foto ni otros opcionales. Título LITERAL del mensaje. Si hay foto en el chat, adjuntar_imagen=true; si no hay, crea igual. UdM por defecto UD. Maria confirma solo con el botón Aplicar de la tarjeta.",
+      input_schema: {
+        type: "object",
+        properties: {
+          displayName: { type: "string", description: "Título EXACTO (texto antes de «:» o de la ruta Cat1 > Cat2 > Cat3)" },
+          cat1: { type: "string", description: "Categoría GoCatalog nivel 1 (nombre o código)" },
+          cat2: { type: "string", description: "Categoría GoCatalog nivel 2 (nombre o código)" },
+          cat3: { type: "string", description: "Categoría GoCatalog nivel 3 (nombre o código)" },
+          baseUnitOfMeasureCode: { type: "string", description: "Por defecto UD; no preguntar" },
+          vatProductPostingGroupCode: { type: "string", description: "SOLO si Maria lo da; nunca pedirlo" },
+          unitPrice: { type: "number", description: "SOLO si Maria lo da; nunca pedirlo" },
+          fabricant: { type: "string", description: "SOLO si Maria lo da; nunca pedirlo" },
+          refFabricant: { type: "string", description: "SOLO si Maria lo da; nunca pedirlo" },
+          codEnApp: { type: "string", description: "SOLO si Maria lo da; nunca pedirlo" },
+          adjuntar_imagen: { type: "boolean", description: "true si hay foto en el mensaje; no pedir foto" },
+          descripcion: { type: "string", description: "Frase corta para la tarjeta" },
+        },
+        required: ["displayName", "cat1", "cat2", "cat3", "descripcion"],
+      },
+    },
   ];
+
+  function esRecursoProducto(recurso) {
+    const r = String(recurso || "").toLowerCase();
+    return (
+      r === "items" ||
+      r.includes("ficha_producto") ||
+      r.includes("item_card") ||
+      r.includes("itemcard") ||
+      r === "item"
+    );
+  }
 
   // ---------- API v2.0: códigos → GUID (24/09/2026) ----------
   // En la API v2.0 los campos «…Id» (paymentTermsId, paymentMethodId…) son
@@ -241,9 +291,9 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
 
   // 24/09/2026: la conversación trabaja SIEMPRE en UNA empresa (la del
   // botón seleccionado). Cualquier otra empresa que pida la IA se rechaza.
-  async function ejecutarHerramienta(nombre, entradaOriginal, empresaFija) {
+  async function ejecutarHerramienta(nombre, entradaOriginal, empresaFija, ctx = {}) {
     const entrada = { ...(entradaOriginal || {}) };
-    if (empresaFija) {
+    if (empresaFija && nombre !== "buscar_gocatalog" && nombre !== "proponer_producto") {
       if (entrada.empresa) {
         const pedida = await resolverEmpresa(entrada.empresa).catch(() => null);
         if (!pedida || pedida.id !== empresaFija.id) {
@@ -303,8 +353,110 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
         return { registros: filas.length, valor: filas };
       }
 
+      case "buscar_gocatalog": {
+        if (!acfactory.configurado()) {
+          throw new Error("ACFactory no está configurado en este servidor (ACFACTORY_URL + secreto).");
+        }
+        const items = await acfactory.buscarGoCatalog(
+          {
+            q: entradaOriginal?.q,
+            nivel: entradaOriginal?.nivel,
+            padre: entradaOriginal?.padre,
+            abuelo: entradaOriginal?.abuelo,
+            top: entradaOriginal?.top || 40,
+          },
+          fetchConReintento
+        );
+        return {
+          registros: items.length,
+          items: items.map((x) => ({
+            code: x.code,
+            name: x.name,
+            nivel: x.nivel,
+            padre: x.padre,
+            abuelo: x.abuelo,
+            label: x.label,
+          })),
+        };
+      }
+
+      case "proponer_producto": {
+        if (!acfactory.configurado()) {
+          throw new Error("ACFactory no está configurado en este servidor (ACFACTORY_URL + secreto).");
+        }
+        const displayName = String(entradaOriginal?.displayName || "").trim();
+        if (!displayName) throw new Error("Falta displayName (título exacto del producto).");
+        const cat1 = String(entradaOriginal?.cat1 || "").trim();
+        const cat2 = String(entradaOriginal?.cat2 || "").trim();
+        const cat3 = String(entradaOriginal?.cat3 || "").trim();
+        if (!cat1 || !cat2 || !cat3) throw new Error("Hacen falta las 3 categorías GoCatalog (cat1, cat2, cat3).");
+        const resolved = await acfactory.resolverGoCatalog({ cat1, cat2, cat3 }, fetchConReintento);
+        let imagenBase64;
+        const adjuntar = entradaOriginal?.adjuntar_imagen !== false;
+        if (adjuntar && Array.isArray(ctx.imagenesChat) && ctx.imagenesChat.length) {
+          const im = ctx.imagenesChat[0];
+          imagenBase64 = `data:${im.media_type};base64,${im.data}`;
+        }
+        const uom = String(entradaOriginal?.baseUnitOfMeasureCode || "UD").trim() || "UD";
+        const datos = {
+          displayName,
+          type: "Inventory",
+          baseUnitOfMeasureCode: uom,
+          cat1: resolved.cat1,
+          cat2: resolved.cat2,
+          cat3: resolved.cat3,
+        };
+        if (entradaOriginal?.vatProductPostingGroupCode) {
+          datos.vatProductPostingGroupCode = String(entradaOriginal.vatProductPostingGroupCode).trim();
+        }
+        if (entradaOriginal?.unitPrice != null && entradaOriginal.unitPrice !== "") {
+          datos.unitPrice = Number(entradaOriginal.unitPrice);
+        }
+        if (entradaOriginal?.fabricant) datos.fabricant = String(entradaOriginal.fabricant).trim();
+        if (entradaOriginal?.refFabricant) datos.refFabricant = String(entradaOriginal.refFabricant).trim();
+        if (entradaOriginal?.codEnApp) datos.codEnApp = String(entradaOriginal.codEnApp).trim();
+        if (imagenBase64) datos.imagenBase64 = imagenBase64;
+
+        const cambio = {
+          id: `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`,
+          ts: new Date().toISOString(),
+          empresa: "Also + Ferros + App",
+          empresaId: empresaFija?.id || null,
+          origen: "acfactory",
+          recurso: "productos",
+          operacion: "crear",
+          clave: null,
+          datos,
+          legible: {
+            displayName,
+            baseUnitOfMeasureCode: uom,
+            cat1: resolved.labels?.cat1 || resolved.cat1,
+            cat2: resolved.labels?.cat2 || resolved.cat2,
+            cat3: resolved.labels?.cat3 || resolved.cat3,
+            imagen: imagenBase64 ? "sí (foto del chat)" : "(sin foto)",
+          },
+          descripcion: entradaOriginal?.descripcion || `Crear producto: ${displayName}`,
+          antes: null,
+          estado: "pendiente",
+          via: "acfactory",
+        };
+        pendientes.set(cambio.id, cambio);
+        return {
+          pendiente: true,
+          id: cambio.id,
+          cats: resolved,
+          conImagen: !!imagenBase64,
+          mensaje: "Producto preparado vía ACFactory. Maria debe pulsar Aplicar. No digas que está creado.",
+        };
+      }
+
       case "proponer_cambio": {
         validarRecurso(entrada.recurso);
+        if (esRecursoProducto(entrada.recurso)) {
+          throw new Error(
+            "Los productos/artículos solo se crean vía ACFactory con la herramienta proponer_producto (Also+Ferros+App). No uses proponer_cambio sobre items. La edición de productos se hace en ACFactory, no desde esta IA."
+          );
+        }
         if (!["modificar", "crear"].includes(entrada.operacion)) throw new Error("Operación no permitida (solo modificar o crear).");
         if (!entrada.datos || typeof entrada.datos !== "object" || !Object.keys(entrada.datos).length) throw new Error("Faltan 'datos'.");
         const { e, base } = await urlBase(entrada.origen, entrada.empresa);
@@ -384,8 +536,9 @@ Respondes en castellano, claro y breve. Hablas con Maria (compras, administraci�
 
 Qué puedes hacer:
 - Consultar cualquier dato de BC con las herramientas.${empresaFija ? `
-- EMPRESA DE ESTA CONVERSACIÓN: ${empresaFija.nombre}. SOLO puedes consultar y modificar esta empresa. Si te piden algo de otra empresa (ALSO CASALS, FERROSCA o QUIMLAB), di que cambie de empresa con los botones de abajo de la pantalla.` : " Si no te dicen empresa, usa ALSO CASALS."}
+- EMPRESA DE ESTA CONVERSACIÓN: ${empresaFija.nombre}. SOLO puedes consultar y modificar esta empresa (excepto altas de producto, que van a Also+Ferros+App vía ACFactory). Si te piden algo de otra empresa (ALSO CASALS, FERROSCA o QUIMLAB), di que cambie de empresa con los botones de abajo de la pantalla.` : " Si no te dicen empresa, usa ALSO CASALS."}
 - Proponer cambios (modificar campos o crear registros/líneas) con proponer_cambio. NUNCA se aplican solos: Maria verá una tarjeta y pulsará «Aplicar». Por eso, tras proponer, di "te he preparado el cambio, revísalo y pulsa Aplicar" — nunca digas que ya está hecho.
+- CREAR PRODUCTOS/ARTÍCULOS: SOLO con proponer_producto (ACFactory → Also + Ferros + App). NUNCA uses proponer_cambio ni crees en 'items'. NO edites ni borres productos desde aquí (eso es ACFactory).
 - NO puedes borrar registros, ni registrar/postear documentos, ni lanzar acciones de BC. Si te lo piden, explica que eso se hace en BC directamente.
 
 ${bloqueReglas}Aprender: cuando Maria te enseñe una forma de hacer algo que se repite («a partir de ahora…», «siempre…», «recuerda…», o te corrija algo que seguramente querrá igual la próxima vez), guárdalo con guardar_regla y díselo en una frase («📌 Apuntado: …»). Si solo es para este caso, no lo guardes.
@@ -393,8 +546,14 @@ ${bloqueReglas}Aprender: cuando Maria te enseñe una forma de hacer algo que se 
 Cómo trabajar:
 - Antes de proponer un cambio, consulta el registro para tener la clave exacta y los nombres de campo reales. En la API v2.0 la clave es (id-guid). En los web services OData la clave suele ser compuesta, p.ej. Pedido_compra_Excel(Document_Type='Order',No='PC26-003403') o PurchaseLines(Document_Type='Order',Document_No='PC26-003403',Line_No=20000).
 - Convenciones de ALSO CASALS: pedidos de compra PCaa-nnnnnn, ofertas de compra OCaa-nnnnnn, pedidos de venta PVaa-nnnnnn; OT = Shortcut_Dimension_2_Code (formato AC015129/2026); departamento/unidad de negocio = Shortcut_Dimension_1_Code (MAN, INS, CON, AMT, AUT…). Nº albarán del proveedor en la cabecera de compra = Vendor_Shipment_No.
-- IMÁGENES: Maria puede pegar capturas (fichas de cliente o proveedor de otro programa, albaranes, pedidos…). Léelas con cuidado, campo a campo. Si algún dato no se lee bien o es ambiguo, pregúntalo antes de proponer el cambio. No inventes datos que no salgan en la imagen.
+- IMÁGENES: Maria puede pegar capturas (fichas de cliente o proveedor de otro programa, albaranes, pedidos…). Léelas con cuidado, campo a campo. Si algún dato no se lee bien o es ambiguo, pregúntalo antes de proponer el cambio. No inventes datos que no salgan en la imagen. EXCEPCIÓN productos: la foto del producto es opcional; si no hay foto, crea igual sin pedirla.
 - CREAR UN CLIENTE: 1) comprueba que no exista ya. El campo taxRegistrationNumber NO se puede filtrar: busca por number (el código) y por displayName parecido. 2) Consulta un cliente parecido existente para ver cómo se rellenan los campos en esta empresa. 3) Propón crear en recurso 'customers' (origen api) con: number, displayName, addressLine1 (y addressLine2 si hace falta), city, state (provincia), postalCode, country ('ES'), phoneNumber, email, taxRegistrationNumber. En ALSO CASALS, FERROS y QUIMLAB el código del cliente ES el NIF/CIF/NIE: number y taxRegistrationNumber iguales, en mayúsculas y SIN guiones ni espacios (Y9583277-L se envía como Y9583277L). La serie de BC no numera sola; si omites number, el alta falla. El «Código» de una captura de otro programa no lo uses si no es el NIF. Términos y forma de pago: en la API van como paymentTermsId / paymentMethodId — puedes poner el CÓDIGO (p.ej. «0D», «TRANSF») y el sistema lo traduce solo. La API v2.0 de customers/vendors NO tiene grupos contables (genBusPostingGroup, vatBusPostingGroup, customerPostingGroup…): no los pongas en el alta; después del alta busca un web service OData de ficha de cliente/proveedor (listar_recursos origen odata) y propón ahí un segundo cambio con los grupos. Datos como persona de contacto, forma de pago o tarifa: menciónalos y, tras crear el cliente, ofrece ponerlos con un segundo cambio si hay un campo en BC para ello (consúltalo). Un proveedor igual con 'vendors' (el código también es el NIF).
+- CREAR UN PRODUCTO (peticiones del grupo de material) — OBLIGATORIO seguir esto:
+  1) Formato típico: «Título»: Cat1 > Cat2 > Cat3  (también título en una línea y cats en otra, o con frase «necesito que se cree…»). El TÍTULO es TODO el texto antes de «:» o, si no hay «:», el texto de producto ANTES de la ruta con «>». Ejemplo: «TEST CREACIÓN IA: Climatizacion > Conductos y ventilación > Extractores industriales» → displayName = «TEST CREACIÓN IA», cats = esas tres. No preguntes si el título es literal: ÚSALO TAL CUAL.
+  2) Obligatorios solo: título + 3 categorías. UdM = UD. Con eso LLAMA YA a proponer_producto (nombres de cat valen). No uses buscar_gocatalog salvo que proponer_producto falle por categoría ambigua.
+  3) PROHIBIDO pedir: fabricante, ref. fabricante, precio, foto, cód. App, IVA u otros opcionales. Si vienen en el mensaje, inclúyelos; si no, omítelos. Sin foto → crea igual.
+  4) Pregunta SOLO si falta el título, faltan las 3 cats, o la tool falla al resolver categorías. La confirmación humana es el botón Aplicar de la tarjeta — no pidas otra confirmación en el chat.
+  5) Tras proponer: di en una frase que revise la tarjeta y pulse Aplicar. El Nº lo asigna Also automáticamente.
 - Si una consulta devuelve demasiado, acota con filtro/select/top. Si algo falla, explica el error de BC en palabras sencillas y propone alternativa.
 - Resume los resultados en tablas o listas cortas; no vuelques JSON en bruto.`;
   };
@@ -460,8 +619,18 @@ Cómo trabajar:
         for (const u of usos) {
           let contenido, esError = false;
           try {
-            const salida = await ejecutarHerramienta(u.name, u.input || {}, empresaFija);
-            if (u.name === "proponer_cambio" && salida?.id) propuestos.push(pendientes.get(salida.id));
+            const salida = await ejecutarHerramienta(u.name, u.input || {}, empresaFija, { imagenesChat: imagenes });
+            if ((u.name === "proponer_cambio" || u.name === "proponer_producto") && salida?.id) {
+              const c = pendientes.get(salida.id);
+              if (c) {
+                // No enviar base64 enorme al frontend
+                const publico = { ...c, datos: { ...c.datos } };
+                if (publico.datos?.imagenBase64) {
+                  publico.datos = { ...publico.datos, imagenBase64: "(adjuntada)" };
+                }
+                propuestos.push(publico);
+              }
+            }
             contenido = recortar(salida);
             pasos.push({ herramienta: u.name, entrada: u.input, ok: true });
           } catch (e) {
@@ -487,11 +656,33 @@ Cómo trabajar:
     const cambio = pendientes.get(String(req.body?.id || ""));
     if (!cambio) return res.status(404).json({ error: "Ese cambio ya no está pendiente (¿se reinició el backend?). Pídeselo otra vez a la IA." });
     if (cambio.estado !== "pendiente") return res.status(409).json({ error: `Ese cambio ya está ${cambio.estado}.` });
-    if (req.body?.empresa) {
+    if (cambio.origen !== "acfactory" && req.body?.empresa) {
       const sel = await resolverEmpresa(req.body.empresa).catch(() => null);
       if (!sel || sel.id !== cambio.empresaId) return res.status(403).json({ error: `Este cambio es de ${cambio.empresa} y ahora tienes seleccionada otra empresa. Vuelve a ${cambio.empresa} para aplicarlo.` });
     }
     try {
+      // Alta de producto: ACSales → ACFactory → BC Also+Ferros + App
+      if (cambio.origen === "acfactory" && cambio.recurso === "productos") {
+        const usuario = {
+          id: req.usuario?.id,
+          username: req.usuario?.username,
+          nombre:
+            req.usuario?.nom_treballador ||
+            req.usuario?.nombre ||
+            req.usuario?.username ||
+            "desconocido",
+        };
+        const body = { ...cambio.datos, usuario };
+        delete body.number;
+        const data = await acfactory.crearProducto(body, fetchConReintento);
+        cambio.estado = "aplicado";
+        cambio.resultado = data;
+        cambio.aplicadoTs = new Date().toISOString();
+        cambio.aplicadoPor = usuario.nombre || usuario.username;
+        await anotar(cambio);
+        return res.json({ ok: true, cambio: { ...cambio, datos: { ...cambio.datos, imagenBase64: cambio.datos?.imagenBase64 ? "(adjuntada)" : undefined } } });
+      }
+
       const base = cambio.origen === "odata"
         ? `${RAIZ()}/ODataV4/Company('${encodeURIComponent(cambio.empresa)}')`
         : `${RAIZ()}/api/v2.0/companies(${cambio.empresaId})`;
@@ -506,6 +697,9 @@ Cómo trabajar:
           body: JSON.stringify(cambio.datos),
         });
       } else {
+        if (esRecursoProducto(cambio.recurso)) {
+          throw new Error("Los productos solo se crean vía ACFactory (proponer_producto).");
+        }
         if (cambio.origen === "api") cambio.datos = completarAltaFicha(cambio.recurso, cambio.datos);
         r = await pedir(`${base}/${encodeURIComponent(cambio.recurso)}`, {
           method: "POST",
@@ -521,9 +715,13 @@ Cómo trabajar:
       res.json({ ok: true, cambio });
     } catch (err) {
       cambio.estado = "error";
-      cambio.resultado = { error: String(err.message || err) };
+      cambio.resultado = { error: String(err.message || err), detalle: err.detalle || undefined };
       await anotar(cambio);
-      res.status(500).json({ error: "No se pudo aplicar el cambio.", detalle: String(err.message || err), cambio });
+      res.status(err.status && err.status >= 400 ? err.status : 500).json({
+        error: String(err.message || err),
+        detalle: err.detalle || String(err.message || err),
+        cambio,
+      });
     }
   });
 
@@ -573,6 +771,26 @@ Cómo trabajar:
     if (!cambio) return res.status(404).json({ error: "No encuentro ese cambio." });
     if (cambio.estado !== "aplicado") return res.status(409).json({ error: "Ese cambio no se ha aplicado." });
     try {
+      if (cambio.origen === "acfactory") {
+        const num = cambio.resultado?.number || "";
+        const registro = {
+          number: num,
+          displayName: cambio.datos?.displayName || cambio.resultado?.also?.displayName || "",
+          cat1: cambio.datos?.cat1,
+          cat2: cambio.datos?.cat2,
+          cat3: cambio.datos?.cat3,
+          creadoPor: cambio.aplicadoPor || cambio.resultado?.creadoPor || "",
+          via: "ACFactory (Also + Ferros + App)",
+        };
+        const enlace = num
+          ? urlClienteWeb("Also Casals", 30, num)
+          : null;
+        return res.json({
+          registro,
+          enlace,
+          etiqueta: num ? `Abrir artículo ${num} en BC (Also)` : null,
+        });
+      }
       const base = cambio.origen === "odata"
         ? `${RAIZ()}/ODataV4/Company('${encodeURIComponent(cambio.empresa)}')`
         : `${RAIZ()}/api/v2.0/companies(${cambio.empresaId})`;
@@ -907,11 +1125,23 @@ Cómo trabajar:
     try {
       let lista = await db.getDoc("cambios_bc", []);
       if (!Array.isArray(lista)) lista = [];
-      lista.push({ ...cambio });
+      const copia = { ...cambio, datos: { ...(cambio.datos || {}) } };
+      if (copia.datos.imagenBase64) copia.datos.imagenBase64 = "(adjuntada)";
+      if (copia.resultado?.also) {
+        // Evitar volcar objetos BC enormes en el log persistente
+        copia.resultado = {
+          number: copia.resultado.number,
+          creadoPor: copia.resultado.creadoPor,
+          avisos: copia.resultado.avisos,
+        };
+      }
+      lista.push(copia);
       await db.setDoc("cambios_bc", lista);
     } catch (e) {
       console.warn("[ia-bc] No se pudo anotar el cambio:", e.message);
     }
-    console.log(`[ia-bc] ${cambio.estado.toUpperCase()} · ${cambio.empresa} · ${cambio.operacion} ${cambio.recurso}${cambio.clave || ""} · ${JSON.stringify(cambio.datos).slice(0, 200)}`);
+    const datosLog = { ...(cambio.datos || {}) };
+    if (datosLog.imagenBase64) datosLog.imagenBase64 = "(adjuntada)";
+    console.log(`[ia-bc] ${cambio.estado.toUpperCase()} · ${cambio.empresa} · ${cambio.operacion} ${cambio.recurso}${cambio.clave || ""} · ${JSON.stringify(datosLog).slice(0, 200)}`);
   }
 };

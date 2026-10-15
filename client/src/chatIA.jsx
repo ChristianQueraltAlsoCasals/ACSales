@@ -331,6 +331,7 @@ export function PanelResultado({ cambio, info }) {
 }
 
 export function TarjetaCambio({ cambio, onAplicado, empresaId }) {
+  const esProducto = cambio.origen === "acfactory" || cambio.recurso === "productos";
   const [estado, setEstado] = useState(cambio.estado || "pendiente");
   const [trabajando, setTrabajando] = useState(false);
   const [error, setError] = useState(null);
@@ -369,12 +370,15 @@ export function TarjetaCambio({ cambio, onAplicado, empresaId }) {
 
   const color =
     estado === "aplicado" ? "border-emerald-300 bg-emerald-50" : estado === "descartado" ? "border-slate-200 bg-slate-50 opacity-70" : estado === "error" ? "border-red-300 bg-red-50" : "border-amber-300 bg-amber-50";
-  const campos = Object.keys(cambio.datos || {});
+  const campos = Object.keys(cambio.datos || {}).filter((k) => k !== "imagenBase64");
+  if (esProducto && cambio.legible?.imagen) campos.push("imagen");
   return (
     <div className={`border rounded-lg p-3 text-[12px] ${color}`}>
       <div className="flex items-center justify-between mb-1">
         <div className="font-semibold text-slate-800">
-          {cambio.operacion === "crear" ? "➕ Crear registro" : "✏️ Modificar"} · {cambio.recurso}
+          {esProducto
+            ? "➕ Crear producto (ACFactory)"
+            : `${cambio.operacion === "crear" ? "➕ Crear registro" : "✏️ Modificar"} · ${cambio.recurso}`}
         </div>
         <div className="text-[10px] text-slate-500">{cambio.empresa}</div>
       </div>
@@ -387,16 +391,16 @@ export function TarjetaCambio({ cambio, onAplicado, empresaId }) {
         <thead>
           <tr className="bg-slate-50 text-slate-500 text-left">
             <th className="px-2 py-1">Campo</th>
-            {cambio.operacion === "modificar" && <th className="px-2 py-1">Ahora</th>}
-            <th className="px-2 py-1">{cambio.operacion === "modificar" ? "Pasará a" : "Valor"}</th>
+            {cambio.operacion === "modificar" && !esProducto && <th className="px-2 py-1">Ahora</th>}
+            <th className="px-2 py-1">{cambio.operacion === "modificar" && !esProducto ? "Pasará a" : "Valor"}</th>
           </tr>
         </thead>
         <tbody>
           {campos.map((k) => (
             <tr key={k} className="border-t border-slate-100">
               <td className="px-2 py-1 font-mono">{k}</td>
-              {cambio.operacion === "modificar" && <td className="px-2 py-1 text-slate-500">{fmtValor(cambio.antes?.[k])}</td>}
-              <td className="px-2 py-1 font-semibold text-slate-800" title={cambio.legible?.[k] ? `Id en BC: ${cambio.datos[k]}` : undefined}>
+              {cambio.operacion === "modificar" && !esProducto && <td className="px-2 py-1 text-slate-500">{fmtValor(cambio.antes?.[k])}</td>}
+              <td className="px-2 py-1 font-semibold text-slate-800" title={cambio.legible?.[k] && k !== "imagen" ? `Código: ${cambio.datos[k]}` : undefined}>
                 {cambio.legible?.[k] || fmtValor(cambio.datos[k])}
               </td>
             </tr>
@@ -406,7 +410,8 @@ export function TarjetaCambio({ cambio, onAplicado, empresaId }) {
       {estado === "pendiente" && (
         <div className="flex gap-2">
           <button onClick={aplicar} disabled={trabajando} className="flex items-center gap-1 text-[12px] font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded px-3 py-1.5">
-            {trabajando ? <RefreshCw size={13} className="animate-spin" /> : <CheckCircle2 size={13} />} Aplicar en BC
+            {trabajando ? <RefreshCw size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
+            {esProducto ? "Aplicar (Also + Ferros + App)" : "Aplicar en BC"}
           </button>
           <button onClick={descartar} disabled={trabajando} className="flex items-center gap-1 text-[12px] text-slate-600 border border-slate-300 bg-white hover:bg-slate-50 rounded px-3 py-1.5">
             <X size={13} /> Descartar
@@ -415,7 +420,9 @@ export function TarjetaCambio({ cambio, onAplicado, empresaId }) {
       )}
       {estado === "aplicado" && (
         <div>
-          <div className="text-emerald-700 font-semibold">✓ Aplicado en BC</div>
+          <div className="text-emerald-700 font-semibold">
+            {esProducto ? "✓ Producto creado en Also, Ferros y App" : "✓ Aplicado en BC"}
+          </div>
           <div className="mt-2 bg-white border border-emerald-200 rounded p-2">
             <div className="text-slate-700 mb-1.5">¿Desea ver los cambios?</div>
             <div className="flex flex-wrap gap-2">
@@ -633,11 +640,12 @@ export default function ChatIA() {
 
   // Tras aplicar un cambio, se le cuenta a la IA para que lo sepa en la conversación
   const onAplicado = (cambio, ok, detalle) => {
+    const esProducto = cambio.origen === "acfactory" || cambio.recurso === "productos";
     const nota = ok
-      ? `[Aviso del sistema] Maria ha pulsado «Aplicar»: el cambio ${cambio.id} (${cambio.descripcion}) se ha APLICADO en BC correctamente.${detalle && typeof detalle === "object" ? ` Respuesta de BC: ${JSON.stringify(detalle).slice(0, 600)}` : ""}`
-      : `[Aviso del sistema] Maria ha pulsado «Aplicar» pero BC RECHAZÓ el cambio ${cambio.id} (${cambio.descripcion}): ${detalle}. Explícale el motivo en palabras sencillas y, si se puede, propone una corrección.`;
+      ? `[Aviso del sistema] Maria ha pulsado «Aplicar»: el cambio ${cambio.id} (${cambio.descripcion}) se ha APLICADO ${esProducto ? "vía ACFactory (Also+Ferros+App)" : "en BC"} correctamente.${detalle && typeof detalle === "object" ? ` Respuesta: ${JSON.stringify(detalle).slice(0, 600)}` : ""}`
+      : `[Aviso del sistema] Maria ha pulsado «Aplicar» pero se RECHAZÓ el cambio ${cambio.id} (${cambio.descripcion}): ${detalle}. Explícale el motivo en palabras sencillas y, si se puede, propone una corrección.`;
     const nuevoNum = ok && detalle && typeof detalle === "object" ? detalle.number || detalle.No || detalle.documentNumber || "" : "";
-    setMensajes((m) => [...m, { rol: "sistema", texto: ok ? `✓ Aplicado: ${cambio.descripcion}${nuevoNum ? ` (Nº en BC: ${nuevoNum})` : ""}` : `✗ BC rechazó: ${cambio.descripcion}` }]);
+    setMensajes((m) => [...m, { rol: "sistema", texto: ok ? `✓ Aplicado: ${cambio.descripcion}${nuevoNum ? ` (Nº: ${nuevoNum})` : ""}` : `✗ Rechazado: ${cambio.descripcion}` }]);
     if (!ok) enviarTexto(nota, false);
     else setHistorial((h) => [...h, { role: "user", content: nota }, { role: "assistant", content: [{ type: "text", text: "Entendido, cambio aplicado." }] }]);
   };

@@ -34,6 +34,8 @@ services:
       TZ: Europe/Madrid
       # Playwright (servicio_registro.py) sigue en el host
       BC_REGISTRO_URL: ${BC_REGISTRO_URL:-http://host.docker.internal:5055}
+      # ACFactory (alta productos IA): desde el contenedor, no usar localhost
+      ACFACTORY_URL: ${ACFACTORY_URL:-http://host.docker.internal:8103}
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     ports:

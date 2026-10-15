@@ -3123,7 +3123,7 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
   const registrar = req.body?.registrar !== false; // «Subir este pedido en BC» = subir sin registrar
   if (!pedido) return res.status(400).json({ error: "Falta el Nº de pedido." });
 
-  const resultado = { pedido, version: "subir-bc-v6-referencia", albaran: { ok: false }, referencia: null, adjunto: { ok: false }, lineas: [] };
+  const resultado = { pedido, version: "subir-bc-v7-registro-api", albaran: { ok: false }, referencia: null, adjunto: { ok: false }, lineas: [] };
 
   try {
     const token = await obtenerTokenBC();
@@ -3472,39 +3472,65 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
       return res.json(resultado);
     }
 
-    // 4) REGISTRAR — servicio Playwright (BC_REGISTRO_URL)
+    // 4) REGISTRAR — API v2 Microsoft.NAV.receive (= «Recibir», no facturar).
+    // Las cantidades a recibir ya están fijadas en los pasos 3 / 3-bis;
+    // NO se vuelve a marcar todo el pedido a recibir (eso rompería el parcial).
+    // Si la acción API no existe o falla, respaldo opcional Playwright (BC_REGISTRO_URL).
     resultado.registro = { ok: false };
     if (fallaNuevaLinea) {
       resultado.registro.error = "No se ha registrado: alguna línea nueva (cargo) no se pudo crear. Corrígelo y vuelve a confirmar, o regístralo desde BC.";
       return res.json(resultado);
     }
+    if (!purchaseOrderId) {
+      resultado.registro.error = "No se ha registrado: pedido no localizado en purchaseOrders (api/v2.0).";
+      return res.json(resultado);
+    }
+
+    const anotarRegistrado = async () => {
+      try {
+        const d = await leerRecep();
+        d.registrados = d.registrados || {};
+        const clave = `${pedido.toUpperCase()}|${String(albaran || "").trim().toUpperCase()}`;
+        d.registrados[clave] = { ts: new Date().toISOString(), archivo: nombreArchivo || null, via: resultado.registro.via || "api" };
+        await escribirRecep(d);
+      } catch (e) {
+        console.warn("[subir-bc] No se pudo anotar el registro:", e.message);
+      }
+    };
+
     try {
-      const rRegistro = await fetch(
-        (process.env.BC_REGISTRO_URL || "http://localhost:5055").replace(/\/$/, "") + "/registrar",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: AbortSignal.timeout(90000),
-          body: JSON.stringify({ numero_pedido: pedido, empresa: EMPRESA_NOMBRE() }),
-        }
-      );
-      const datosRegistro = await rRegistro.json().catch(() => ({}));
-      if (rRegistro.ok && datosRegistro.ok) {
-        resultado.registro.ok = true;
-        try {
-          const d = await leerRecep();
-          d.registrados = d.registrados || {};
-          const clave = `${pedido.toUpperCase()}|${String(albaran || "").trim().toUpperCase()}`;
-          d.registrados[clave] = { ts: new Date().toISOString(), archivo: nombreArchivo || null };
-          await escribirRecep(d);
-        } catch (e) {
-          console.warn("[subir-bc] No se pudo anotar el registro:", e.message);
-        }
+      const recibo = await registrarRecepcionPorApi(purchaseOrderId, token, pedido);
+      if (recibo.ok) {
+        resultado.registro = { ok: true, via: "api", accion: recibo.accion, viaApi: recibo.viaApi };
+        await anotarRegistrado();
       } else {
-        resultado.registro.error = datosRegistro.error || `El servicio de registro respondió ${rRegistro.status}.`;
+        console.warn(
+          `[subir-bc] Registro API falló (${recibo.accion} ${recibo.status}): ${(recibo.texto || "").slice(0, 200)} — intento Playwright`
+        );
+        const fb = await registrarPedidoPorServicio(pedido);
+        if (fb.ok) {
+          resultado.registro = {
+            ok: true,
+            via: "playwright",
+            avisoApi: `API ${recibo.accion} ${recibo.status}: ${(recibo.texto || "").slice(0, 180)}`,
+          };
+          await anotarRegistrado();
+        } else {
+          resultado.registro = {
+            ok: false,
+            via: "ninguna",
+            error: [
+              `API ${recibo.accion} (${recibo.status}): ${(recibo.texto || "sin detalle").slice(0, 280)}`,
+              recibo.hint || "",
+              fb.error || "Playwright no disponible (BC_REGISTRO_URL)",
+            ]
+              .filter(Boolean)
+              .join(" · "),
+          };
+        }
       }
     } catch (e) {
-      resultado.registro.error = `No se pudo contactar con el servicio de registro — ¿está arrancado 'python servicio_registro.py'? (${String(e.message || e)})`;
+      resultado.registro.error = `Error al registrar por API: ${String(e.message || e)}`;
     }
 
     res.json(resultado);
@@ -4667,6 +4693,11 @@ function urlApiComprasBC() {
   return `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
 }
 
+/** Extensión AlsoCasals Remesas: si publica purchaseOrders + receive / receiveByNumber. */
+function urlApiRemesasBC() {
+  return `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/alsocasals/remesas/v1.0/companies(${EMPRESA_ID()})`;
+}
+
 async function marcarCantidadARecibir(idPedido, token) {
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" };
   const r = await fetchConReintento(`${urlApiComprasBC()}/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${idPedido}`)}`, { headers });
@@ -4683,14 +4714,117 @@ async function marcarCantidadARecibir(idPedido, token) {
   }
 }
 
-async function accionPedidoCompra(idPedido, accion, token) {
-  const r = await fetchConReintento(`${urlApiComprasBC()}/purchaseOrders(${idPedido})/Microsoft.NAV.${accion}`, {
+async function postAccionPedido(base, pathSuffix, token, bodyObj) {
+  const r = await fetchConReintento(`${base}${pathSuffix}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" },
-    body: "{}",
+    body: JSON.stringify(bodyObj != null ? bodyObj : {}),
   });
   const texto = r.ok ? "" : (await r.text().catch(() => "")).slice(0, 400);
   return { ok: r.ok, status: r.status, texto };
+}
+
+/** Acciones bound en API v2 o remesas (mismo id de pedido). */
+async function accionPedidoCompra(idPedido, accion, token, origen = "v2") {
+  const base = origen === "remesas" ? urlApiRemesasBC() : urlApiComprasBC();
+  const r = await postAccionPedido(base, `/purchaseOrders(${idPedido})/Microsoft.NAV.${accion}`, token, {});
+  return { ...r, accion, origen };
+}
+
+function permitirReceiveAndInvoice() {
+  const accion = String(process.env.BC_REGISTRO_ACCION || "").trim().toLowerCase();
+  if (accion === "receiveandinvoice" || accion === "receive_and_invoice") return true;
+  return String(process.env.BC_ALLOW_RECEIVE_AND_INVOICE || "").toLowerCase() === "true";
+}
+
+function esAccionAusente(status, texto) {
+  return (
+    status === 404 ||
+    /No HTTP resource|does not support|Resource not found|BadRequest_ResourceNotFound|UnknownAction/i.test(
+      String(texto || "")
+    )
+  );
+}
+
+/**
+ * Registrar recepción por API (= «Recibir», no facturar).
+ * Orden: remesas receive → remesas receiveByNumber → v2 receive → (opcional) receiveAndInvoice.
+ * Si remesas aún no expone purchaseOrders/receive → 404 y cae a Playwright (BC_REGISTRO_URL).
+ */
+async function registrarRecepcionPorApi(idPedido, token, numeroPedido) {
+  const num = String(numeroPedido || "").trim();
+  const intentos = [];
+
+  // 1) Extensión remesas — bound receive por id
+  if (idPedido) {
+    let recibo = await accionPedidoCompra(idPedido, "receive", token, "remesas");
+    intentos.push(`remesas.receive(${recibo.status})`);
+    if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "remesas" };
+
+    if (!esAccionAusente(recibo.status, recibo.texto) && /release|liberar|lanzad|open/i.test(recibo.texto || "")) {
+      const lanzar = await accionPedidoCompra(idPedido, "release", token, "remesas");
+      intentos.push(`remesas.release(${lanzar.status})`);
+      if (lanzar.ok || /already|ya.*lanzad|released/i.test(lanzar.texto || "")) {
+        recibo = await accionPedidoCompra(idPedido, "receive", token, "remesas");
+        intentos.push(`remesas.receive2(${recibo.status})`);
+        if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "remesas" };
+      }
+    }
+  }
+
+  // 2) Extensión remesas — receiveByNumber (unbound / por número)
+  if (num) {
+    const cuerpos = [
+      { number: num },
+      { orderNumber: num },
+      { no: num },
+      { purchaseOrderNumber: num },
+    ];
+    for (const cuerpo of cuerpos) {
+      const r = await postAccionPedido(
+        urlApiRemesasBC(),
+        "/purchaseOrders/Microsoft.NAV.receiveByNumber",
+        token,
+        cuerpo
+      );
+      intentos.push(`remesas.receiveByNumber(${Object.keys(cuerpo)[0]}:${r.status})`);
+      if (r.ok) return { ...r, accion: "receiveByNumber", viaApi: "remesas" };
+      // 400 por campo incorrecto → probar siguiente cuerpo; 404 acción → salir
+      if (esAccionAusente(r.status, r.texto)) break;
+      if (r.status !== 400 && r.status !== 422) break;
+    }
+  }
+
+  // 3) API v2 estándar (por si Microsoft o otra capa lo expone)
+  if (idPedido) {
+    let recibo = await accionPedidoCompra(idPedido, "receive", token, "v2");
+    intentos.push(`v2.receive(${recibo.status})`);
+    if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "v2" };
+
+    if (!esAccionAusente(recibo.status, recibo.texto) && /release|liberar|lanzad|open/i.test(recibo.texto || "")) {
+      const lanzar = await accionPedidoCompra(idPedido, "release", token, "v2");
+      intentos.push(`v2.release(${lanzar.status})`);
+      if (lanzar.ok || /already|ya.*lanzad|released/i.test(lanzar.texto || "")) {
+        recibo = await accionPedidoCompra(idPedido, "receive", token, "v2");
+        intentos.push(`v2.receive2(${recibo.status})`);
+        if (recibo.ok) return { ...recibo, accion: "receive", viaApi: "v2" };
+      }
+    }
+
+    if (permitirReceiveAndInvoice()) {
+      const rai = await accionPedidoCompra(idPedido, "receiveAndInvoice", token, "v2");
+      intentos.push(`v2.receiveAndInvoice(${rai.status})`);
+      if (rai.ok) return { ...rai, accion: "receiveAndInvoice", viaApi: "v2" };
+    }
+  }
+
+  return {
+    ok: false,
+    status: 502,
+    accion: "receive",
+    texto: intentos.join(" → "),
+    hint: "No se pudo recibir por API (remesas receive / receiveByNumber ni v2). Revisa extensión Remesas ≥1.2.44 o usa Playwright de respaldo.",
+  };
 }
 
 async function registrarPedidoPorServicio(numero) {
@@ -4736,15 +4870,14 @@ async function registrarPedidoCompra(pedido) {
   }
   if (!id) return registrarPedidoPorServicio(pedido.numero);
   await marcarCantidadARecibir(id, token);
-  let recibo = await accionPedidoCompra(id, "receive", token);
-  if (!recibo.ok && /release|liberar|lanzad/i.test(recibo.texto)) {
-    await accionPedidoCompra(id, "release", token);
-    recibo = await accionPedidoCompra(id, "receive", token);
-  }
-  if (recibo.ok) return { ok: true };
-  const accionNoExiste = recibo.status === 404 || /No HTTP resource|does not support|Resource not found|BadRequest_ResourceNotFound/i.test(recibo.texto);
-  if (accionNoExiste) return registrarPedidoPorServicio(pedido.numero);
-  return { ok: false, error: `BC no registró el pedido: ${recibo.status} ${recibo.texto}`.trim() };
+  const recibo = await registrarRecepcionPorApi(id, token, pedido.numero);
+  if (recibo.ok) return { ok: true, via: "api", accion: recibo.accion, viaApi: recibo.viaApi };
+  const fb = await registrarPedidoPorServicio(pedido.numero);
+  if (fb.ok) return { ok: true, via: "playwright", avisoApi: `${recibo.accion} ${recibo.status}` };
+  return {
+    ok: false,
+    error: `BC no registró el pedido: ${recibo.status} ${recibo.texto}${recibo.hint ? ` — ${recibo.hint}` : ""} · ${fb.error || ""}`.trim(),
+  };
 }
 
 const pedidosCreandose = new Map();
