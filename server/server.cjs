@@ -190,7 +190,8 @@ const fsEstado = require("fs"); // aún usado en otros sitios del archivo
 
 app.get("/api/estado", async (req, res) => {
   try {
-    res.json(await db.getEstado());
+    // Also Casals → prefijo "estado" (claves actuales). Otras → estado_<slug>.
+    res.json(await db.getEstado(claveEmpresa("estado")));
   } catch (err) {
     console.error("Error leyendo estado:", err);
     res.status(500).json({ error: "No se pudo leer el estado." });
@@ -199,8 +200,9 @@ app.get("/api/estado", async (req, res) => {
 
 app.post("/api/estado", async (req, res) => {
   try {
-    const claves = await db.mergeEstado(req.body || {});
-    console.log(`[estado] Guardado en Postgres: ${claves.join(", ")}`);
+    const pref = claveEmpresa("estado");
+    const claves = await db.mergeEstado(req.body || {}, pref);
+    console.log(`[estado] Guardado en Postgres (${pref}): ${claves.join(", ")}`);
     res.json({ guardado: claves });
   } catch (err) {
     console.error("Error guardando estado:", err);
@@ -210,7 +212,7 @@ app.post("/api/estado", async (req, res) => {
 
 app.delete("/api/estado", async (req, res) => {
   try {
-    await db.deleteEstado();
+    await db.deleteEstado(claveEmpresa("estado"));
     res.json({ borrado: true });
   } catch (err) {
     res.status(500).json({ error: "No se pudo borrar el estado." });
@@ -750,7 +752,7 @@ Retorna NOMÉS el text del correu (sense assumpte tret que sigui imprescindible,
 
 // Recomendación de respuesta al abrir un correo. Usa las fichas de OT de la
 // app y, si responde a tiempo, la ficha de cliente o proveedor en BC.
-let cacheFichasCorreo = { ts: 0, lista: [] };
+let cacheFichasCorreo = { ts: 0, lista: [], pref: null };
 function pistasDeCorreo(texto) {
   const t = String(texto || "");
   const unicos = (arr) => [...new Set(arr)];
@@ -788,10 +790,13 @@ function resumenFichaCorreo(f) {
   };
 }
 async function fichasParaCorreo() {
-  if (Date.now() - cacheFichasCorreo.ts < 120000) return cacheFichasCorreo.lista;
-  const raw = await db.getDoc("estado.fichas", []);
+  const pref = claveEmpresa("estado");
+  if (cacheFichasCorreo.pref === pref && Date.now() - cacheFichasCorreo.ts < 120000) {
+    return cacheFichasCorreo.lista;
+  }
+  const raw = await db.getDoc(`${pref}.fichas`, []);
   const lista = (Array.isArray(raw) ? raw : []).map((par) => (Array.isArray(par) ? par[1] : par)).filter(Boolean);
-  cacheFichasCorreo = { ts: Date.now(), lista };
+  cacheFichasCorreo = { ts: Date.now(), lista, pref };
   return lista;
 }
 async function bcPorEmail(email) {
@@ -1908,7 +1913,8 @@ const FUENTES_BC = {
   pedidos_venta: { entidad: "salesOrders", campoFecha: "orderDate" },
   lineas_venta: { entidad: "salesInvoiceLines", campoFecha: "postingDate" },
   lineas_compra: { entidad: "purchaseInvoiceLines", campoFecha: "postingDate" },
-  movs_contabilidad: { entidad: "generalLedgerEntries", campoFecha: "postingDate" },
+  // movs_contabilidad va por FUENTES_WS (página 25): la API v2.0 generalLedgerEntries
+  // no expone OT ni línea de negocio; el web service sí (Global/Shortcut Dimension 2).
   // tarifas_venta va por FUENTES_WS: salesPrices NO existe en la API v2.0 estándar
   facturas_venta: { entidad: "salesInvoices", campoFecha: "invoiceDate" },
   abonos_venta: { entidad: "salesCreditMemos", campoFecha: "creditMemoDate" },
@@ -1992,6 +1998,27 @@ const FUENTES_WS = {
     permitirSinFecha: true,
     descubrir: [/sales.?order.?line/i, /l[ií]n.*venda|l[ií]n.*venta/i],
   },
+  // Movimientos CONTABILIDAD (G/L Entry, pág. 20 → Movs_contabilidad_Excel).
+  // Metadata: Global_Dimension_2_Code = OT · Global_Dimension_1_Code = LN.
+  movs_contabilidad: {
+    servicios: [
+      process.env.BC_WS_MOVSCONTAB,
+      "Movs_contabilidad_Excel",
+      "Movs_contabilidad",
+      "G_LEntries",
+      "G_L_Entries",
+      "General_Ledger_Entries",
+      "GLEntries",
+    ].filter(Boolean),
+    camposFecha: [
+      process.env.BC_WS_MOVSCONTAB_FECHA,
+      "Posting_Date",
+      "Fecha_registro",
+      "Document_Date",
+    ].filter(Boolean),
+    permitirSinFecha: true,
+    descubrir: [/g.?l.?entr/i, /mov.*(contab|contabilidad)/i, /general.?ledger/i],
+  },
   // Movimientos de OT / proyecto. Preferir Movs_proyecto_Excel (pág. 92)
   // como en horas.cjs (BC_WS_MOVSPROYECTO). JobLedgerEntries (consulta 268)
   // también sirve para ingresos por OT (Job_No + Line_Amount_LCY).
@@ -2005,7 +2032,6 @@ const FUENTES_WS = {
       "JobLedgerEntries",
       "Job_Ledger_Entries",
       "Job_Ledger_Entries_Excel",
-      "Movs_contabilidad_Excel",
     ].filter(Boolean),
     camposFecha: [
       process.env.BC_WS_MOVSPROYECTO_FECHA,
@@ -2014,7 +2040,7 @@ const FUENTES_WS = {
       "Document_Date",
     ].filter(Boolean),
     permitirSinFecha: true,
-    descubrir: [/job.?ledger/i, /mov.*(proyecto|ot|contab)/i],
+    descubrir: [/job.?ledger/i, /mov.*(proyecto|ot)/i],
   },
   // Tarifas de venta: listas de precios publicadas como Excel en este BC.
   // Servicio real verificado: Price_List_Lines_Excel (NO SalesPrices / API v2.0).
@@ -2037,6 +2063,20 @@ const FUENTES_WS = {
     ].filter(Boolean),
     permitirSinFecha: true,
     descubrir: [/price.?list.?line/i, /sales.?price/i, /tarif|precio/i],
+  },
+  // Ficha / lista de recursos. No tiene fecha de movimiento: se carga
+  // entera. La unidad de negocio del trabajador es Global_Dimension_1_Code
+  // si ese campo está en la página publicada.
+  recursos: {
+    servicios: [
+      process.env.BC_WS_RECURSOS,
+      "Resource_List",
+      "Lista_recursos",
+      "Recursos",
+      "Ficha_recurso_Excel",
+    ].filter(Boolean),
+    camposFecha: [],
+    permitirSinFecha: true,
   },
 };
 
@@ -2490,6 +2530,82 @@ app.get("/api/bc/:fuente", async (req, res) => {
       let servicioUsado = null;
       let ultimoError = null;
       let huerfanosOmitidos = [];
+      // api_expand (default) = LN/OT reales · ws = revertir al orden anterior
+      const modoDim = String(process.env.BC_MOVS_DIM_MODE || "api_expand").trim().toLowerCase() === "ws" ? "ws" : "api_expand";
+
+      const cargarMovsApiExpand = async () => {
+        console.log(`[${fuente}] API generalLedgerEntries + dimensionSetLines (modo=${modoDim})`);
+        const apiBase = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0`;
+        const filtro = `postingDate ge ${from} and postingDate le ${to}`;
+        let urlApi = `${apiBase}/companies(${EMPRESA_ID()})/generalLedgerEntries?$filter=${encodeURIComponent(filtro)}&$expand=dimensionSetLines`;
+        const out = [];
+        while (urlApi) {
+          const rp = await fetchConReintento(urlApi, cabeceras);
+          if (!rp.ok) {
+            intentos.push(`API+expand → ${rp.status}`);
+            ultimoError = { status: rp.status, detalle: (await rp.text().catch(() => "")).slice(0, 300), servicio: "generalLedgerEntries+$expand" };
+            return false;
+          }
+          const pagina = await rp.json();
+          for (const e of pagina.value || []) {
+            const dims = e.dimensionSetLines || [];
+            let ln = "";
+            let ot = "";
+            for (const d of dims) {
+              const code = String(d.code || d.dimensionCode || "").trim().toUpperCase();
+              const val = String(d.valueCode || d.dimensionValueCode || "").trim();
+              if (!val) continue;
+              if (code === "OT" || code === "JOB") ot = val;
+              else if (code === "LINEA" || code === "LN" || code === "DEPARTMENT") ln = val;
+            }
+            const debe = Number(e.debitAmount) || 0;
+            const haber = Number(e.creditAmount) || 0;
+            out.push({
+              Entry_No: e.entryNumber,
+              Posting_Date: e.postingDate,
+              Document_No: e.documentNumber,
+              Document_Type: e.documentType,
+              G_L_Account_No: e.accountNumber,
+              Description: e.description,
+              Debit_Amount: debe,
+              Credit_Amount: haber,
+              Amount: debe - haber,
+              Global_Dimension_1_Code: ln,
+              Global_Dimension_2_Code: ot,
+              Shortcut_Dimension_1_Code: ln,
+              Shortcut_Dimension_2_Code: ot,
+              Job_No: ot,
+            });
+          }
+          urlApi = pagina["@odata.nextLink"] || null;
+        }
+        if (!out.length) {
+          intentos.push("API+expand → 0 filas");
+          return false;
+        }
+        filas = out;
+        servicioUsado = "generalLedgerEntries+$expand=dimensionSetLines";
+        campoUsado = "postingDate";
+        intentos.push(`API+expand → ${out.length} filas`);
+        return true;
+      };
+
+      // Movs contabilidad en modo api_expand: API primero (evita G_LEntries sin LN).
+      if (fuente === "movs_contabilidad" && modoDim === "api_expand") {
+        intentos.push(`modo=${modoDim}`);
+        try {
+          if (await cargarMovsApiExpand()) {
+            console.log(`[${fuente}] OK con "${servicioUsado}" · ${filas.length} filas`);
+            return res.json({
+              fuente, from, to, rows: filas.length, servicio: servicioUsado,
+              campoFecha: campoUsado, sinFecha: false, huerfanosOmitidos, intentos, data: filas,
+            });
+          }
+        } catch (e) {
+          intentos.push(`API+expand → error ${String(e.message || e)}`);
+          console.warn(`[${fuente}] API+expand falló, se prueba WS:`, String(e.message || e));
+        }
+      }
 
       const paginar = async (url) => {
         const out = [];
@@ -2617,9 +2733,21 @@ app.get("/api/bc/:fuente", async (req, res) => {
         }
       }
 
+      // Fallback API si el WS no dio filas (modo ws, o api_expand que ya falló antes).
+      if (!filas && fuente === "movs_contabilidad") {
+        intentos.push(`modo=${modoDim}`);
+        try { await cargarMovsApiExpand(); } catch (e) {
+          intentos.push(`API+expand → error ${String(e.message || e)}`);
+          console.warn(`[${fuente}] API+expand falló:`, String(e.message || e));
+        }
+      }
+
       if (!filas && ultimoError) {
         const pistas = [];
         if (ultimoError.status === 401 || ultimoError.status === 403) pistas.push(`${ultimoError.status}: permisos insuficientes de la App en BC`);
+        if (fuente === "movs_contabilidad") {
+          pistas.push("Si el WS da User Setup: revisar ficha de usuario de la App en BC, o se usará el plan B API+dimensiones.");
+        }
         return res.status(502).json({ error: `BC respondió ${ultimoError.status} consultando ${ultimoError.servicio}.`, intentos, pistas, detalle: ultimoError.detalle });
       }
       if (!filas) {
@@ -6304,7 +6432,7 @@ require("./macro.cjs")({ app, fetchConReintento, db });
 const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@alsocasals.com";
 require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep, escribirRecep, BUZON_PERSONAL });
 require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL });
-require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, db, claveEmpresa });
+require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa });
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)
 app.get(/^\/(?!api).*/, (req, res) => {

@@ -328,4 +328,387 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
       res.status(500).json({ error: "No se pudieron leer las facturas abiertas.", detalle: String(err.message || err) });
     }
   });
+
+  // ------------------------------------------------------------------
+  // Tasas de estructura (propia por UN + general empresa) — venta objetivo.
+  // Misma lógica que venta_objetivo_ot.py (info_estructura_por_un +
+  // pct_general_empresa + tasas del año en curso / último con ventas).
+  // Solo LECTURA. Caché 30 min por empresa + año.
+  // ------------------------------------------------------------------
+  const cacheTasas = new Map();
+
+  function codigosEstructuraEmpresa() {
+    const nom = String(EMPRESA_NOMBRE() || "").toUpperCase();
+    if (/FERROS|FCA/.test(nom)) {
+      return { general: "_EST-FCA", prefijoPropia: "_EST-FCA-", intragrupo: ["_EST-AC", "_EST-QL"], sinReparto: ["_TIE", "_I+D"], actechs: "ACTECHS" };
+    }
+    if (/QUIMLAB|QL/.test(nom)) {
+      return { general: "_EST-QL", prefijoPropia: "_EST-QL-", intragrupo: ["_EST-AC", "_EST-FCA"], sinReparto: ["_TIE", "_I+D"], actechs: "ACTECHS" };
+    }
+    return { general: "_EST-AC", prefijoPropia: "_EST-AC-", intragrupo: ["_EST-FCA", "_EST-QL"], sinReparto: ["_TIE", "_I+D"], actechs: "ACTECHS" };
+  }
+
+  function extraerActividad(codigo) {
+    if (!codigo) return "";
+    const c = String(codigo).trim();
+    if (!c) return "";
+    if (c.startsWith("_") || c === "ACTECHS") return c;
+    return c.includes("-") ? c.split("-")[0] : c;
+  }
+
+  function leerCampo(f, nombres) {
+    for (const n of nombres) {
+      if (f[n] != null && String(f[n]).trim() !== "") return f[n];
+    }
+    const keys = Object.keys(f || {});
+    for (const n of nombres) {
+      const hit = keys.find((k) => k.toLowerCase() === n.toLowerCase());
+      if (hit && f[hit] != null && String(f[hit]).trim() !== "") return f[hit];
+    }
+    return "";
+  }
+
+  function importeNatural(f) {
+    const directo = Number(leerCampo(f, ["Importe_natural", "Amount", "Importe", "amount"]));
+    if (Number.isFinite(directo) && directo !== 0) return directo;
+    const debe = Number(leerCampo(f, ["Debit_Amount", "DebitAmount", "debitAmount"])) || 0;
+    const haber = Number(leerCampo(f, ["Credit_Amount", "CreditAmount", "creditAmount"])) || 0;
+    return debe - haber;
+  }
+
+  function normalizarOt(ot) {
+    if (ot == null) return "";
+    const s = String(ot).trim();
+    if (!s || s.startsWith("_")) return "";
+    const m = s.match(/(\d{3,})/);
+    return m ? m[1].replace(/^0+/, "") || "0" : "";
+  }
+
+  function clasificarLN(ln, cfg) {
+    if (!ln || ln === "nan" || ln === "NaN" || ln === "None") return "otro";
+    if (cfg.intragrupo.includes(ln)) return "intragrupo";
+    if (ln === cfg.general || ln === "_EST") return "estructura_general";
+    if (ln.startsWith(cfg.prefijoPropia)) return "estructura_propia";
+    if (cfg.sinReparto.includes(ln)) return "sin_reparto";
+    if (ln === cfg.actechs || !ln.startsWith("_")) return "comercial";
+    return "otro";
+  }
+
+  // Debe−haber → Importe_natural (gastos +, ingresos +)
+  function importePy(f, g) {
+    const raw = importeNatural(f);
+    return g === "7" ? -raw : raw;
+  }
+
+  function infoEstructuraPorUn(filas, cfg) {
+    const ingCom = new Map();
+    const gasCom = new Map();
+    const ep6 = new Map();
+    const ep7 = new Map();
+    let estGen6 = 0;
+    let estGen7 = 0;
+    for (const f of filas) {
+      const cta = String(leerCampo(f, ["G_L_Account_No", "No", "accountNumber", "Nº cuenta", "Account_No"]) || "");
+      const g = cta.startsWith("6") ? "6" : cta.startsWith("7") ? "7" : "";
+      if (g !== "6" && g !== "7") continue;
+      const ln = String(leerCampo(f, ["Shortcut_Dimension_1_Code", "Global_Dimension_1_Code", "Cód_Línea_de_negocio", "Cod_Linea_de_negocio", "Business_Unit_Code"]) || "").trim();
+      const tipo = clasificarLN(ln, cfg);
+      const imp = importePy(f, g);
+      const act = extraerActividad(ln);
+      if (tipo === "comercial") {
+        if (g === "7") ingCom.set(act, (ingCom.get(act) || 0) + imp);
+        else gasCom.set(act, (gasCom.get(act) || 0) + imp);
+      } else if (tipo === "estructura_propia") {
+        const un = ln.replace(cfg.prefijoPropia, "").trim();
+        if (g === "6") ep6.set(un, (ep6.get(un) || 0) + imp);
+        else ep7.set(un, (ep7.get(un) || 0) + imp);
+      } else if (tipo === "estructura_general") {
+        if (g === "6") estGen6 += imp;
+        else estGen7 += imp;
+      }
+    }
+    const estGenTotal = estGen6 - estGen7;
+    const unes = [...new Set([...ingCom.keys(), ...gasCom.keys()])].filter(Boolean).sort();
+    const totalIng = unes.reduce((a, u) => a + (ingCom.get(u) || 0), 0);
+    const info = {};
+    for (const un of unes) {
+      const ing = ingCom.get(un) || 0;
+      const estP = (ep6.get(un) || 0) - (ep7.get(un) || 0);
+      const estG = (un === cfg.actechs && ing === 0) ? 0 : (totalIng ? estGenTotal * (ing / totalIng) : 0);
+      info[un] = {
+        ventas: ing,
+        total_propia: estP,
+        total_general: estG,
+        ratio_propia: ing ? estP / ing : 0,
+        ratio_general: ing ? estG / ing : 0,
+      };
+    }
+    return info;
+  }
+
+  function pctGeneralEmpresa(filas, cfg) {
+    let gastoGeneral = 0;
+    let ventas = 0;
+    for (const f of filas) {
+      const ln = String(leerCampo(f, ["Shortcut_Dimension_1_Code", "Global_Dimension_1_Code", "Cód_Línea_de_negocio", "Cod_Linea_de_negocio", "Business_Unit_Code"]) || "").trim();
+      if (cfg.intragrupo.includes(ln)) continue;
+      const cta = String(leerCampo(f, ["G_L_Account_No", "No", "accountNumber", "Nº cuenta", "Account_No"]) || "");
+      const g = cta.startsWith("6") ? "6" : cta.startsWith("7") ? "7" : "";
+      if (!g) continue;
+      const esGeneral = ln === cfg.general || ln === "_EST";
+      const esEstructura = esGeneral || ln.startsWith(cfg.prefijoPropia);
+      const cta2 = cta.slice(0, 2);
+      const cta3 = cta.slice(0, 3);
+      const cta4 = cta.slice(0, 4);
+      const esImpSoc = g === "6" && ["6300", "6301", "6330", "6380"].includes(cta4);
+      const imp = importePy(f, g);
+      if (g === "6" && esGeneral && ["60", "62", "63", "64"].includes(cta2) && !esImpSoc) gastoGeneral += imp;
+      if (g === "7" && cta2 !== "71" && cta3 !== "778") {
+        if (!esEstructura || esGeneral) ventas += imp;
+      }
+    }
+    return ventas ? gastoGeneral / ventas : 0;
+  }
+
+  // api_expand (default) = API + dimensiones LN/OT · ws = comportamiento anterior (revertir)
+  function modoMovsDim() {
+    const m = String(process.env.BC_MOVS_DIM_MODE || "api_expand").trim().toLowerCase();
+    return m === "ws" ? "ws" : "api_expand";
+  }
+
+  function muestraTieneLNRellena(filas) {
+    const n = Math.min(filas.length, 80);
+    let con = 0;
+    for (let i = 0; i < n; i++) {
+      const ln = String(leerCampo(filas[i], [
+        "Global_Dimension_1_Code", "Shortcut_Dimension_1_Code",
+        "Cód_Línea_de_negocio", "Cod_Linea_de_negocio", "Business_Unit_Code",
+      ]) || "").trim();
+      if (ln) con++;
+    }
+    return con > 0;
+  }
+
+  function aplanarGleConDims(e) {
+    const dims = e.dimensionSetLines || [];
+    let ln = "";
+    let ot = "";
+    for (const d of dims) {
+      const code = String(d.code || d.dimensionCode || "").trim().toUpperCase();
+      const val = String(d.valueCode || d.dimensionValueCode || "").trim();
+      if (!val) continue;
+      if (code === "OT" || code === "JOB") ot = val;
+      else if (code === "LINEA" || code === "LN" || code === "DEPARTMENT") ln = val;
+    }
+    const debe = Number(e.debitAmount) || 0;
+    const haber = Number(e.creditAmount) || 0;
+    return {
+      Posting_Date: e.postingDate,
+      G_L_Account_No: e.accountNumber,
+      Amount: debe - haber,
+      Debit_Amount: debe,
+      Credit_Amount: haber,
+      Global_Dimension_1_Code: ln,
+      Global_Dimension_2_Code: ot,
+      Shortcut_Dimension_1_Code: ln,
+      Shortcut_Dimension_2_Code: ot,
+      Job_No: ot,
+    };
+  }
+
+  async function traerMovsApiExpandAno(token, year, intentos) {
+    const cab = { headers: { Authorization: `Bearer ${token}` } };
+    const ini = `${year}-01-01`;
+    const fin = `${year}-12-31`;
+    const apiBase = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0`;
+    const filtro = `postingDate ge ${ini} and postingDate le ${fin}`;
+    let urlApi = `${apiBase}/companies(${EMPRESA_ID()})/generalLedgerEntries?$filter=${encodeURIComponent(filtro)}&$expand=dimensionSetLines`;
+    const out = [];
+    while (urlApi) {
+      const r = await fetchConReintento(urlApi, cab);
+      if (!r.ok) {
+        intentos.push(`API+expand → ${r.status}`);
+        return null;
+      }
+      const j = await r.json();
+      for (const e of j.value || []) out.push(aplanarGleConDims(e));
+      urlApi = j["@odata.nextLink"] || null;
+      if (out.length > 250000) break;
+    }
+    if (!out.length) {
+      intentos.push("API+expand → 0 filas");
+      return null;
+    }
+    if (!muestraTieneLNRellena(out)) {
+      intentos.push("API+expand → LN vacía en muestra");
+      return null;
+    }
+    intentos.push(`API+expand → ${out.length} filas`);
+    return { filas: out, servicio: "generalLedgerEntries+$expand", campoFecha: "postingDate", intentos };
+  }
+
+  async function traerMovsODataAno(token, year) {
+    const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+    const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+    const candidatos = [...new Set([
+      process.env.BC_WS_MOVSCONTAB,
+      "Movs_contabilidad_Excel",
+      "Movs_contabilidad",
+      "G_LEntries",
+      "G_L_Entries",
+      "General_Ledger_Entries",
+      "GLEntries",
+    ].filter(Boolean))];
+    const camposFecha = ["Posting_Date", "Fecha_registro", "postingDate", "Document_Date"];
+    const cab = { headers: { Authorization: `Bearer ${token}` } };
+    const ini = `${year}-01-01`;
+    const fin = `${year}-12-31`;
+    const intentos = [];
+    const modo = modoMovsDim();
+    intentos.push(`modo=${modo}`);
+
+    const paginar = async (url) => {
+      const out = [];
+      let next = url;
+      while (next) {
+        const r = await fetchConReintento(next, cab);
+        if (!r.ok) return { error: r.status, detalle: (await r.text()).slice(0, 200), filas: out };
+        const j = await r.json();
+        out.push(...(j.value || []));
+        next = j["@odata.nextLink"] || null;
+        if (out.length > 250000) break;
+      }
+      return { filas: out };
+    };
+
+    const traerWs = async () => {
+      for (const servicio of candidatos) {
+        for (const campo of camposFecha) {
+          const filtro = `${campo} ge ${ini} and ${campo} le ${fin}`;
+          const url = `${raiz}/${encodeURIComponent(servicio)}?$filter=${encodeURIComponent(filtro)}`;
+          const r = await fetchConReintento(url, cab);
+          intentos.push(`${servicio} · ${campo} → ${r.status}`);
+          if (r.status === 404) break;
+          if (r.status === 400) continue;
+          if (!r.ok) continue;
+          const primera = await r.json();
+          const filas = [...(primera.value || [])];
+          if (primera["@odata.nextLink"]) {
+            const resto = await paginar(primera["@odata.nextLink"]);
+            if (resto.error) {
+              intentos.push(`${servicio} paginación → ${resto.error}`);
+              continue;
+            }
+            filas.push(...resto.filas);
+          }
+          if (!filas.length) continue;
+          if (!muestraTieneLNRellena(filas)) {
+            intentos.push(`${servicio} · LN vacía en muestra (rechazado)`);
+            break;
+          }
+          return { filas, servicio, campoFecha: campo, intentos };
+        }
+      }
+      return null;
+    };
+
+    // api_expand primero (recomendado). ws = orden anterior (WS → API).
+    if (modo === "api_expand") {
+      try {
+        const pack = await traerMovsApiExpandAno(token, year, intentos);
+        if (pack) return pack;
+      } catch (e) {
+        intentos.push(`API+expand → error ${String(e.message || e)}`);
+      }
+      const ws = await traerWs();
+      if (ws) return ws;
+    } else {
+      const ws = await traerWs();
+      if (ws) return ws;
+      try {
+        const pack = await traerMovsApiExpandAno(token, year, intentos);
+        if (pack) return pack;
+      } catch (e) {
+        intentos.push(`API+expand → error ${String(e.message || e)}`);
+      }
+    }
+
+    return { filas: null, intentos };
+  }
+
+  app.get("/api/contabilidad/tasas-estructura", async (req, res) => {
+    try {
+      const hoy = new Date();
+      const yearReq = parseInt(req.query.year, 10);
+      const yearPreferido = Number.isFinite(yearReq) ? yearReq : hoy.getFullYear();
+      const clave = `${EMPRESA_ID()}|tasas|${yearPreferido}|${modoMovsDim()}`;
+      const c = cacheTasas.get(clave);
+      if (c && !req.query.refrescar && Date.now() - c.ts < 30 * 60 * 1000) {
+        return res.json({ ...c.datos, deCache: true });
+      }
+
+      const token = await obtenerTokenBC();
+      const cfg = codigosEstructuraEmpresa();
+      let year = yearPreferido;
+      let pack = await traerMovsODataAno(token, year);
+      if (!pack.filas || !pack.filas.length) {
+        // Último año con datos: probar year-1
+        const prev = await traerMovsODataAno(token, year - 1);
+        if (prev.filas && prev.filas.length) {
+          year = year - 1;
+          pack = prev;
+        }
+      }
+      if (!pack.filas) {
+        return res.status(502).json({
+          error: "No se pudo leer el web service de movimientos de contabilidad con línea de negocio.",
+          intentos: pack.intentos,
+          pistas: [
+            "Publica en BC un servicio web de la página de movimientos de contabilidad (con Cód. Línea de negocio / dimensión 1).",
+            "O indica el nombre en BC_WS_MOVSCONTAB del .env.",
+          ],
+        });
+      }
+
+      // Quedarse con años que tengan ventas en OTs reales (como el .py)
+      const porAno = new Map();
+      for (const f of pack.filas) {
+        const fecha = String(leerCampo(f, ["Posting_Date", "Fecha_registro", "postingDate", "Document_Date"]) || "").slice(0, 10);
+        const y = parseInt(fecha.slice(0, 4), 10);
+        if (!y || y > hoy.getFullYear()) continue;
+        const cta = String(leerCampo(f, ["G_L_Account_No", "No", "accountNumber", "Nº cuenta", "Account_No"]) || "");
+        if (!cta.startsWith("7")) continue;
+        if (!normalizarOt(leerCampo(f, ["Shortcut_Dimension_2_Code", "Global_Dimension_2_Code", "Cód_OT", "Cod_OT", "Job_No"]))) continue;
+        porAno.set(y, (porAno.get(y) || 0) + 1);
+      }
+      const anios = [...porAno.keys()].sort((a, b) => a - b);
+      if (anios.length) {
+        year = anios.includes(yearPreferido) ? yearPreferido : Math.max(...anios);
+      }
+
+      const filasAno = pack.filas.filter((f) => {
+        const fecha = String(leerCampo(f, ["Posting_Date", "Fecha_registro", "postingDate", "Document_Date"]) || "").slice(0, 10);
+        return fecha.startsWith(String(year));
+      });
+
+      const porUn = infoEstructuraPorUn(filasAno, cfg);
+      const pctGeneral = pctGeneralEmpresa(filasAno, cfg);
+      const datos = {
+        empresa: EMPRESA_NOMBRE(),
+        year,
+        pctGeneral,
+        porUn,
+        codigos: cfg,
+        servicio: pack.servicio,
+        movimientos: filasAno.length,
+        calculado: new Date().toISOString(),
+      };
+      cacheTasas.set(clave, { ts: Date.now(), datos });
+      console.log(`[contabilidad/tasas-estructura] ${datos.empresa} ${year}: general=${(pctGeneral * 100).toFixed(1)}% · UNs=${Object.keys(porUn).length} · movs=${filasAno.length}`);
+      res.json(datos);
+    } catch (err) {
+      console.error("Error /api/contabilidad/tasas-estructura:", err);
+      res.status(500).json({ error: "No se pudieron calcular las tasas de estructura.", detalle: String(err.message || err) });
+    }
+  });
 };

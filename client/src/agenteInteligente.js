@@ -346,6 +346,7 @@ export function adaptarLineasCompraAPI(filas, campos = API_LINEA_CAMPOS.compra) 
       "Nombre de proveedor de compra":
         f["Buy_from_Vendor_Name"] ?? f["Nombre_de_proveedor_de_compra"] ?? f["Nombre_proveedor_compra"] ?? f["Pay_to_Name"] ?? null,
       "Fecha pedido": f["Order_Date"] ?? f["Fecha_pedido"] ?? null,
+      "Fecha registro": f["Posting_Date"] ?? f["Fecha_registro"] ?? f["Document_Date"] ?? null,
       "% Dto. 1": dtos[0] ?? 0,
       "% Dto. 2": dtos[1] ?? 0,
       "% Dto. 3": dtos[2] ?? 0,
@@ -1128,7 +1129,9 @@ export function construirFichasOT(listadoOTs, lineasVenta, lineasCompra, movsCue
 
     fichas.set(id, {
       numeroOT: id, // clave canónica (ej. "9999")
-      numeroOTOrigenes: { listadoOTs: fila[kOT] }, // formatos originales por fuente
+      // listado = alias de listadoOTs (código completo BC, p.ej. AC015202/2026).
+      // Antes solo existía listadoOTs y el detalle pedía líneas con .listado → nº corto → 0 filas.
+      numeroOTOrigenes: { listadoOTs: fila[kOT], listado: fila[kOT] },
       general: {
         cliente: fila[cO.cliente] ?? null,
         tipoTrabajo: fila[cO.tipoTrabajo] ?? null,
@@ -1289,6 +1292,7 @@ export function construirFichasOT(listadoOTs, lineasVenta, lineasCompra, movsCue
       importe,
       proveedor: linea[cC.proveedor] ?? null,
       fechaPedido: linea[cC.fechaPedido] ?? null,
+      fechaRegistro: linea["Fecha registro"] ?? linea["Posting_Date"] ?? linea.Posting_Date ?? null,
       dtos: [num(linea[cC.dto1]), num(linea[cC.dto2]), num(linea[cC.dto3])],
     };
 
@@ -1306,21 +1310,34 @@ export function construirFichasOT(listadoOTs, lineasVenta, lineasCompra, movsCue
     }
   }
 
-  // 3.5) Ingresos por OT desde movs_contabilidad_excel.
-  // Dos formas admitidas (misma fuente en la UI):
-  //   a) Job Ledger (pág. 1004): Entry_Type = Sale → Line_Amount_LCY + Job_No
-  //   b) Movs. contabilidad Excel: cuenta 70000000 + Amount + Job_No/OT
+  // 3.5) Ingresos por OT desde movs_contabilidad (G/L pág. 20) y/o Job Ledger.
+  //   a) Job Ledger: Entry_Type = Sale → Line_Amount_LCY + Job_No
+  //   b) G/L Excel (metadata): OT = Global_Dimension_2_Code · LN = Global_Dimension_1_Code
   // Los importes de cuenta de ingresos llegan en negativo (debe−haber),
   // así que se acumulan en valor absoluto. Line_Amount_LCY de Job Ledger
   // ya viene como importe de venta.
   const CUENTA_VENTAS_OT = "70000000";
   for (const linea of movsCuentaVentas) {
     const id = normalizarNumeroOT(
-      linea["Job_No"] ?? linea["Job No."] ?? linea["Cód. OT"] ?? linea[kOT]
+      linea["Global_Dimension_2_Code"] ??
+        linea["Shortcut_Dimension_2_Code"] ??
+        linea["Job_No"] ??
+        linea["Job No."] ??
+        linea["Cód. OT"] ??
+        linea["Cod_OT"] ??
+        linea[kOT]
     );
     if (!id) continue;
 
-    const cuenta = (linea["G_L_Account_No"] ?? linea["Nº cuenta"] ?? "").toString().trim();
+    const cuenta = (
+      linea["G_L_Account_No"] ??
+      linea["Nº cuenta"] ??
+      linea["No"] ??
+      linea["accountNumber"] ??
+      ""
+    )
+      .toString()
+      .trim();
     const entryType = (linea["Entry_Type"] ?? linea["Entry Type"] ?? "").toString().trim().toLowerCase();
     const esVentaJob =
       entryType === "sale" ||
@@ -1342,16 +1359,18 @@ export function construirFichasOT(listadoOTs, lineasVenta, lineasCompra, movsCue
       fichas.set(id, ficha);
     }
     if (ficha.venta.importeCuentaVentas == null) ficha.venta.importeCuentaVentas = 0;
-    const importe = Math.abs(
-      num(
-        linea["Line_Amount_LCY"] ??
-          linea["Line Amount (LCY)"] ??
-          linea["Amount"] ??
-          linea["Importe"] ??
-          linea["Importe (DL)"]
-      )
-    );
-    ficha.venta.importeCuentaVentas += importe;
+    let bruto =
+      linea["Line_Amount_LCY"] ??
+      linea["Line Amount (LCY)"] ??
+      linea["Amount"] ??
+      linea["Importe"] ??
+      linea["Importe (DL)"];
+    if (bruto == null || bruto === "") {
+      const debe = num(linea["Debit_Amount"] ?? linea["debitAmount"]);
+      const haber = num(linea["Credit_Amount"] ?? linea["creditAmount"]);
+      bruto = debe - haber;
+    }
+    ficha.venta.importeCuentaVentas += Math.abs(num(bruto));
   }
 
   // 4) Post-proceso por ficha: margen y material comprado no facturado
