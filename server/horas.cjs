@@ -392,4 +392,80 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
       res.status(500).json({ error: "No se pudieron cargar las horas.", detalle: String(e.message || e) });
     }
   });
+
+  // Horas de UNA OT con presupuesto. Movs. proyecto, todas las fechas:
+  // tipo de movimiento Uso y tipo Recurso. Cualquier tipo de trabajo.
+  app.get("/api/horas/ot-uso", async (req, res) => {
+    const no = String(req.query?.no || "").trim();
+    if (!no) return res.status(400).json({ error: "Falta el nº de OT (ej. AC014549/2026)." });
+    try {
+      const token = await obtenerTokenBC();
+      const cat = await catalogo(token);
+      const candidatos = [...new Set([
+        process.env.BC_WS_MOVSPROYECTO,
+        "Movs_proyecto_Excel",
+        ...cat.filter((n) => /mov|ledger/i.test(n) && /proyect|job/i.test(n) && n !== "JobLedgerEntries"),
+      ].filter(Boolean))];
+      const noSafe = no.replace(/'/g, "''");
+      const selects = [
+        "&$select=Entry_No,Posting_Date,Entry_Type,Document_No,Job_No,Job_Task_No,Type,No,Description,Work_Type_Code,Unit_of_Measure_Code,Quantity",
+        "",
+      ];
+      const camposJob = ["Job_No", "No_proyecto", "JobNo"];
+      let brutas = null;
+      let servicio = null;
+      let campoJob = null;
+      let ultimo = null;
+      for (const nombre of candidatos) {
+        const base = `${raiz()}/${encodeURIComponent(nombre)}`;
+        let encontrado = false;
+        for (const sel of selects) {
+          for (const campo of camposJob) {
+            try {
+              brutas = await leerTodo(`${base}?$filter=${encodeURIComponent(`${campo} eq '${noSafe}'`)}${sel}`, token);
+              servicio = nombre;
+              campoJob = campo;
+              encontrado = true;
+              break;
+            } catch (e) {
+              ultimo = e;
+              if (e.status === 404) { encontrado = false; break; }
+              if (e.status === 400) continue;
+              throw e;
+            }
+          }
+          if (encontrado || (ultimo && ultimo.status === 404)) break;
+        }
+        if (brutas) break;
+      }
+      if (!brutas) {
+        return res.status(404).json({
+          error: "No encuentro Movs. proyecto para esta OT.",
+          detalle: ultimo ? String(ultimo.message || ultimo).slice(0, 300) : "",
+        });
+      }
+      const filas = [];
+      for (const f of brutas) {
+        const tipo = String(campo(f, ["Type", "Tipo"])).trim();
+        if (!/resour|recurs/i.test(tipo)) continue;
+        const tipoMov = String(campo(f, ["Entry_Type", "Tipo_movimiento", "EntryType"])).trim();
+        if (!/^(usage|uso)$/i.test(tipoMov)) continue;
+        filas.push({
+          fecha: String(campo(f, ["Posting_Date", "Fecha_registro", "PostingDate"])).slice(0, 10),
+          documento: String(campo(f, ["Document_No", "No_documento", "DocumentNo"])),
+          recurso: String(campo(f, ["No", "No_", "Nº"])),
+          descripcion: String(campo(f, ["Description", "Descripción", "Descripcion"])),
+          tipoTrabajo: String(campo(f, ["Work_Type_Code", "Cod_tipo_trabajo", "WorkTypeCode"])),
+          unidad: String(campo(f, ["Unit_of_Measure_Code", "Cod_unidad_medida", "UnitOfMeasureCode"])),
+          cantidad: Number(campo(f, ["Quantity", "Cantidad"])) || 0,
+        });
+      }
+      const horas = Math.round(filas.reduce((a, f) => a + f.cantidad, 0) * 100) / 100;
+      console.log(`[horas/ot-uso] ${EMPRESA_NOMBRE()} ${no}: ${brutas.length} movs, ${filas.length} de uso/recurso, ${horas} h (${servicio} · ${campoJob})`);
+      res.json({ no, servicio, campoJob, horas, filas });
+    } catch (e) {
+      console.error("Error /api/horas/ot-uso:", e);
+      res.status(500).json({ error: "No se pudieron leer las horas de Movs. proyecto.", detalle: String(e.message || e) });
+    }
+  });
 };

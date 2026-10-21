@@ -220,6 +220,9 @@ export function adaptarFilasJob(filasJob, campos = JOB_CAMPOS, seriePrefijo = "A
       Estat: f[campos.estado] ?? null,
       "Estat App":
         f["Motivo_cancelación_PR"] ?? f["Motivo_cancelacion_PR"] ?? f["Motivo_de_cancelación_PR"] ?? null, // FACTURAT / PENDENT / PROCES...
+      // Ficha de proyecto, campo «Cód. PR del que procede» (p. ej. PR00003526).
+      "Nº pressupost":
+        f["Cód_PR_del_que_procede"] ?? f["Cod_PR_del_que_procede"] ?? null,
       "Tipus feina": null,
       // Los importes llegan por líneas de venta/compra o por facturas:
       "P venta": 0,
@@ -1142,6 +1145,7 @@ export function construirFichasOT(listadoOTs, lineasVenta, lineasCompra, movsCue
         segmento: segmentoFila, // ej. "INS-I"
         estado: fila["Estat"] ?? null, // Open / Planning (de la tabla Job)
         estadoApp: fila["Estat App"] ?? null, // FACTURAT / PENDENT / PROCES... (Motivo_cancelación_PR)
+        presupuesto: fila["Nº pressupost"] ?? null, // Cód. PR del que procede
       },
       // Resumen tal cual viene del CSV (nivel OT, no de línea)
       resumenOT: {
@@ -1405,7 +1409,7 @@ function crearFichaHuerfana(numeroOT) {
   return {
     numeroOT,
     numeroOTOrigenes: {},
-    general: { cliente: null, tipoTrabajo: null, departamento: null, descripcion: null, unidadNegocio: null },
+    general: { cliente: null, tipoTrabajo: null, departamento: null, descripcion: null, unidadNegocio: null, presupuesto: null },
     venta: {
       horas: { cantidad: 0, importe: 0, lineas: [] },
       desplazamiento: { importe: 0, lineas: [], seCobro: false },

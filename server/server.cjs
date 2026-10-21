@@ -1423,7 +1423,7 @@ app.post("/api/correo/enviar", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   }
-  const { para, cc, asunto, cuerpoHtml, adjunto, incluirFirma, respuestaA } = req.body || {};
+  const { para, cc, asunto, cuerpoHtml, adjunto, adjuntos: adjuntosPedido, incluirFirma, respuestaA } = req.body || {};
   const destinatarios = Array.isArray(para) ? para.filter(Boolean) : [];
   const enPara = new Set(destinatarios.map((e) => String(e).trim().toLowerCase()));
   const copiasVistas = new Set();
@@ -1450,6 +1450,43 @@ app.post("/api/correo/enviar", async (req, res) => {
     if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
     return "application/octet-stream";
   };
+
+  // Lista nueva (reclamación): varios ficheros de oficina, 3 MB cada uno y 10 MB en total.
+  // El campo antiguo `adjunto` (un solo PDF de facturas) se deja igual.
+  const ficheros = [];
+  if (Array.isArray(adjuntosPedido)) {
+    if (adjuntosPedido.length > 10) return res.status(400).json({ error: "Máximo 10 adjuntos por correo." });
+    const permitidas = new Set(["pdf", "png", "jpg", "jpeg", "doc", "docx", "xls", "xlsx"]);
+    const topeFichero = 3 * 1024 * 1024;
+    const topeTotal = 10 * 1024 * 1024;
+    let suma = 0;
+    for (const a of adjuntosPedido) {
+      if (!a || !a.base64) continue;
+      const nombre = String(a.nombre || "adjunto").replace(/[\\/]/g, "_").slice(0, 180);
+      const punto = nombre.lastIndexOf(".");
+      const ext = punto >= 0 ? nombre.slice(punto + 1).toLowerCase() : "";
+      if (!permitidas.has(ext)) return res.status(400).json({ error: `«${nombre}» no es PDF, foto, Excel ni Word.` });
+      const limpio = String(a.base64).replace(/\s/g, "");
+      const bytes = Buffer.from(limpio, "base64");
+      if (!bytes.length) return res.status(400).json({ error: `«${nombre}» está vacío.` });
+      if (bytes.length > topeFichero) return res.status(400).json({ error: `«${nombre}» pesa más de 3 MB.` });
+      if (suma + bytes.length > topeTotal) return res.status(400).json({ error: "Los adjuntos juntos no pueden pasar de 10 MB." });
+      suma += bytes.length;
+      ficheros.push({
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        name: nombre,
+        contentType: a.mime || mimeDeNombre(nombre) || "application/octet-stream",
+        contentBytes: limpio,
+      });
+    }
+  } else if (adjunto?.base64) {
+    ficheros.push({
+      "@odata.type": "#microsoft.graph.fileAttachment",
+      name: adjunto.nombre || "adjunto.pdf",
+      contentType: adjunto.mime || mimeDeNombre(adjunto.nombre) || "application/pdf",
+      contentBytes: adjunto.base64,
+    });
+  }
 
   try {
     const buzon = await buzonDelUsuario(req, res);
@@ -1482,13 +1519,8 @@ app.post("/api/correo/enviar", async (req, res) => {
         const af = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", firma);
         if (!af.ok) console.warn("[correo/enviar] firma no adjuntada", af.status);
       }
-      if (adjunto?.base64) {
-        const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", {
-          "@odata.type": "#microsoft.graph.fileAttachment",
-          name: adjunto.nombre || "adjunto.pdf",
-          contentType: adjunto.mime || mimeDeNombre(adjunto.nombre) || "application/pdf",
-          contentBytes: adjunto.base64,
-        });
+      for (const f of ficheros) {
+        const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", f);
         if (!aa.ok) throw new Error(`Graph respondió ${aa.status} al adjuntar el fichero: ${(await aa.text()).slice(0, 200)}`);
       }
       const env = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/send`, "POST");
@@ -1508,16 +1540,41 @@ app.post("/api/correo/enviar", async (req, res) => {
       toRecipients: destinatarios.map((email) => ({ emailAddress: { address: email } })),
       ...(ccRecipients.length ? { ccRecipients } : {}),
     };
+    // Varios adjuntos van en un borrador y se añaden de uno en uno:
+    // Outlook no acepta varios ficheros metidos en el mismo envío.
+    if (Array.isArray(adjuntosPedido) && ficheros.length) {
+      const creado = await graph(`${base}/messages`, "POST", mensaje);
+      if (!creado.ok) {
+        const pista = creado.status === 403 ? " — falta el permiso Mail.ReadWrite para adjuntar ficheros." : "";
+        throw new Error(`Graph respondió ${creado.status} al preparar el correo${pista}: ${(await creado.text()).slice(0, 300)}`);
+      }
+      const draft = await creado.json();
+      const borrarBorrador = () => graph(`${base}/messages/${encodeURIComponent(draft.id)}`, "DELETE").catch(() => {});
+      if (firma) {
+        const af = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", firma);
+        if (!af.ok) console.warn("[correo/enviar] firma no adjuntada", af.status);
+      }
+      for (const f of ficheros) {
+        const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", f);
+        if (!aa.ok) {
+          await borrarBorrador();
+          throw new Error(`Graph respondió ${aa.status} al adjuntar «${f.name}»: ${(await aa.text()).slice(0, 200)}`);
+        }
+      }
+      const envioBorrador = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/send`, "POST");
+      if (!envioBorrador.ok) {
+        await borrarBorrador();
+        const pista = envioBorrador.status === 403
+          ? " — falta el permiso de aplicación Mail.Send en Azure, con consentimiento de administrador."
+          : "";
+        throw new Error(`Graph respondió ${envioBorrador.status} enviando el correo${pista}: ${(await envioBorrador.text()).slice(0, 300)}`);
+      }
+      console.log(`[correo/enviar] de=${buzon} "${asunto}" → ${destinatarios.join(", ")}${copias.length ? ` cc=${copias.join(", ")}` : ""} (${ficheros.length} adjunto${ficheros.length > 1 ? "s" : ""})`);
+      return res.json({ ok: true, de: buzon, para: destinatarios, cc: copias });
+    }
     const adjuntos = [];
     if (firma) adjuntos.push(firma);
-    if (adjunto?.base64) {
-      adjuntos.push({
-        "@odata.type": "#microsoft.graph.fileAttachment",
-        name: adjunto.nombre || "adjunto.pdf",
-        contentType: adjunto.mime || mimeDeNombre(adjunto.nombre) || "application/pdf",
-        contentBytes: adjunto.base64,
-      });
-    }
+    for (const f of ficheros) adjuntos.push(f);
     if (adjuntos.length) mensaje.attachments = adjuntos;
     const url = `${base}/sendMail`;
     const r = await fetchConReintento(url, {
@@ -1532,7 +1589,7 @@ app.post("/api/correo/enviar", async (req, res) => {
         : "";
       throw new Error(`Graph respondió ${r.status} enviando el correo${pista}: ${detalle.slice(0, 300)}`);
     }
-    console.log(`[correo/enviar] de=${buzon} "${asunto}" → ${destinatarios.join(", ")}${copias.length ? ` cc=${copias.join(", ")}` : ""}${adjunto?.base64 ? " (con adjunto)" : ""}`);
+    console.log(`[correo/enviar] de=${buzon} "${asunto}" → ${destinatarios.join(", ")}${copias.length ? ` cc=${copias.join(", ")}` : ""}${ficheros.length ? ` (${ficheros.length} adjunto${ficheros.length > 1 ? "s" : ""})` : ""}`);
     res.json({ ok: true, de: buzon, para: destinatarios, cc: copias });
   } catch (err) {
     console.error("Error enviando correo:", err);
@@ -2324,6 +2381,36 @@ app.get("/api/bc/diag/metadata-api", async (req, res) => {
   }
 });
 
+// La lista de OTs (página 89) no trae el presupuesto de origen. Ese campo
+// («Cód. PR del que procede») está en la ficha de proyecto, ya publicada
+// como Ficha_proyecto_Excel. Solo se piden el Nº y ese código.
+async function leerPresupuestosProyecto(baseOData, token) {
+  const nombre = process.env.BC_WS_FICHA_PROYECTO || "Ficha_proyecto_Excel";
+  const campo = "Cód_PR_del_que_procede";
+  const select = encodeURIComponent(`No,${campo}`);
+  let url = `${baseOData}/${encodeURIComponent(nombre)}?$select=${select}`;
+  const mapa = new Map();
+  let paginas = 0;
+  while (url) {
+    const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) {
+      const detalle = await r.text().catch(() => "");
+      console.warn(`[proyectos] Presupuesto (${nombre}) → ${r.status} ${detalle.slice(0, 180)}`);
+      return null;
+    }
+    const pagina = await r.json();
+    paginas += 1;
+    for (const f of pagina.value || []) {
+      const no = (f.No ?? "").toString().trim();
+      const cod = (f[campo] ?? "").toString().trim();
+      if (no && cod) mapa.set(no, cod);
+    }
+    url = pagina["@odata.nextLink"] || "";
+  }
+  console.log(`[proyectos] Presupuestos leídos: ${mapa.size} (páginas ${paginas})`);
+  return mapa;
+}
+
 // ---------------------------------------------------------------------
 // 2b) PROYECTOS (tabla Job 167, página Job List 89)
 //     GET /api/bc/proyectos
@@ -2416,6 +2503,24 @@ app.get("/api/bc/proyectos", async (req, res) => {
     }
 
     console.log(`[proyectos] OK con "${servicioUsado}" · ${filas.length} filas`);
+
+    // Presupuesto de origen (Cód. PR del que procede). Si la ficha no
+    // responde, el listado de OTs sigue saliendo igual, sin ese código.
+    try {
+      const mapaPR = await leerPresupuestosProyecto(baseOData, token);
+      if (mapaPR) {
+        let conPresupuesto = 0;
+        for (const f of filas) {
+          const cod = mapaPR.get((f.No ?? "").toString().trim());
+          if (!cod) continue;
+          f["Cód_PR_del_que_procede"] = cod;
+          conPresupuesto += 1;
+        }
+        console.log(`[proyectos] Presupuesto asignado a ${conPresupuesto} de ${filas.length} proyectos`);
+      }
+    } catch (e) {
+      console.warn("[proyectos] No se pudieron leer los presupuestos:", String(e.message || e));
+    }
 
     // Filtro opcional por rango de años (el año va en el Nº: "AC014340/2026")
     const { fromYear, toYear } = req.query;

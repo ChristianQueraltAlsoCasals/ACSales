@@ -16,7 +16,7 @@
  * el backend (/api/recepcion), no en el navegador.
  */
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { RefreshCw, Search, CheckCircle2, Mail, X, Upload, ChevronRight, ChevronDown, Send, StickyNote, Trash2 } from "lucide-react";
+import { RefreshCw, Search, CheckCircle2, Mail, X, Upload, ChevronRight, ChevronDown, Send, StickyNote, Trash2, Paperclip } from "lucide-react";
 import { emailsPorCodigoDepartamento, copiasAdministracion } from "./departamentos.js";
 import { empresaGuardada } from "./empresa.jsx";
 
@@ -284,6 +284,35 @@ function textoCierre(nombre) {
 const TEXTO_INTERNO =
   "Buenos días,\n\nOs escribimos para confirmar si el material correspondiente al pedido que detallamos ha sido recibido en nuestras instalaciones.\n\nEsto es, porque figura como pendiente y no hemos recibido el albarán del proveedor y, por tanto, tampoco se ha facturado.\n\nSi todavía no ha sido recibido, agradeceríamos que nos confirmaseis la fecha prevista de recepción o nos informarais de cualquier incidencia.\n\nAsimismo, os rogamos que nos indiquéis si el pedido ha sido cancelado o si el material ya no es necesario.";
 
+const EXTENSIONES_ADJUNTO = new Set(["pdf", "png", "jpg", "jpeg", "doc", "docx", "xls", "xlsx"]);
+const TOPE_FICHERO = 3 * 1024 * 1024;
+const TOPE_TOTAL = 10 * 1024 * 1024;
+
+function extensionFichero(nombre) {
+  const s = String(nombre || "");
+  const i = s.lastIndexOf(".");
+  return i >= 0 ? s.slice(i + 1).toLowerCase() : "";
+}
+
+function leerFicheroAdjunto(file) {
+  return new Promise((resolve, reject) => {
+    const lector = new FileReader();
+    lector.onload = () => {
+      const raw = String(lector.result || "");
+      const coma = raw.indexOf(",");
+      resolve({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        nombre: file.name,
+        mime: file.type || "",
+        base64: coma >= 0 ? raw.slice(coma + 1) : "",
+        bytes: file.size,
+      });
+    };
+    lector.onerror = () => reject(new Error(`No se pudo leer ${file.name}`));
+    lector.readAsDataURL(file);
+  });
+}
+
 function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuardado, reclamados, onClose, onEnviado }) {
   const [sel, setSel] = useState(() => new Set(inicial));
   const [para, setPara] = useState(emailGuardado || "");
@@ -296,6 +325,8 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
   const [cierre, setCierre] = useState(() => textoCierre(""));
   const [enviando, setEnviando] = useState(false);
   const [error, setError] = useState(null);
+  const [adjuntos, setAdjuntos] = useState([]);
+  const inputAdjuntoRef = useRef(null);
   const elegidos = pedidosProv.filter((p) => sel.has(p.num));
 
   useEffect(() => {
@@ -367,6 +398,44 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
 
   const html = useMemo(() => htmlReclamacion(elegidos, intro, cierre), [elegidos, intro, cierre]);
 
+  const anadirAdjuntos = async (lista) => {
+    const files = Array.from(lista || []);
+    if (!files.length) return;
+    const rechazados = [];
+    const aceptados = [];
+    let suma = adjuntos.reduce((n, a) => n + (a.bytes || 0), 0);
+    const avisoTope = "Los adjuntos juntos no pueden pasar de 10 MB.";
+    for (const f of files) {
+      if (!EXTENSIONES_ADJUNTO.has(extensionFichero(f.name))) {
+        rechazados.push(`«${f.name}» no es PDF, foto, Excel ni Word.`);
+        continue;
+      }
+      if (!f.size) {
+        rechazados.push(`«${f.name}» está vacío.`);
+        continue;
+      }
+      if (f.size > TOPE_FICHERO) {
+        rechazados.push(`«${f.name}» pesa más de 3 MB.`);
+        continue;
+      }
+      if (suma + f.size > TOPE_TOTAL) {
+        if (!rechazados.includes(avisoTope)) rechazados.push(avisoTope);
+        continue;
+      }
+      suma += f.size;
+      aceptados.push(f);
+    }
+    try {
+      const leidos = [];
+      for (const f of aceptados) leidos.push(await leerFicheroAdjunto(f));
+      if (leidos.length) setAdjuntos((prev) => [...prev, ...leidos]);
+      setError(rechazados.length ? rechazados.join(" ") : null);
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+    if (inputAdjuntoRef.current) inputAdjuntoRef.current.value = "";
+  };
+
   const enviar = async () => {
     const destProv = partirEmails(para);
     // Sin email del proveedor se envía igual: a las personas de CC (o, si tampoco hay, a Maria)
@@ -380,7 +449,13 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
       const r = await fetch("/api/correo/enviar", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ para: dest, cc: ccEnvio, asunto: asunto ?? asuntoAuto, cuerpoHtml: html }),
+        body: JSON.stringify({
+          para: dest,
+          cc: ccEnvio,
+          asunto: asunto ?? asuntoAuto,
+          cuerpoHtml: html,
+          adjuntos: adjuntos.map(({ nombre, base64, mime }) => ({ nombre, base64, mime })),
+        }),
       });
       const json = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
@@ -453,6 +528,40 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
           <textarea value={intro} onChange={(e) => setIntro(e.target.value)} rows={8} className="w-full border border-slate-300 rounded px-2 py-1" />
           <label className="text-xs font-semibold text-slate-500 self-start pt-1">Despedida</label>
           <textarea value={cierre} onChange={(e) => { cierreTocado.current = true; setCierre(e.target.value); }} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
+        </div>
+
+        <div className="mb-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-semibold text-slate-500">Adjuntos</span>
+            <button
+              type="button"
+              onClick={() => inputAdjuntoRef.current?.click()}
+              className="inline-flex items-center gap-1.5 text-sm rounded-md px-3 py-1.5 border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+            >
+              <Paperclip size={14} /> Adjuntar
+            </button>
+            <span className="text-[10px] text-slate-400">PDF, foto (JPG o PNG), Excel o Word. Cada uno hasta 3 MB.</span>
+            <input
+              ref={inputAdjuntoRef}
+              type="file"
+              multiple
+              accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx"
+              className="hidden"
+              onChange={(e) => anadirAdjuntos(e.target.files)}
+            />
+          </div>
+          {adjuntos.length > 0 && (
+            <ul className="flex flex-wrap gap-1.5 mt-2">
+              {adjuntos.map((a) => (
+                <li key={a.id} className="inline-flex items-center gap-1 text-[12px] bg-slate-50 border border-slate-200 rounded px-2 py-1">
+                  <span className="max-w-[260px] truncate" title={a.nombre}>{a.nombre}</span>
+                  <button type="button" onClick={() => setAdjuntos((prev) => prev.filter((x) => x.id !== a.id))} className="text-slate-400 hover:text-red-600" aria-label={`Quitar ${a.nombre}`}>
+                    <X size={12} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         <div className="text-xs font-semibold text-slate-500 mb-1">Vista previa del correo</div>

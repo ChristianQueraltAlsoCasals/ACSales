@@ -3644,6 +3644,11 @@ function PantallaOTs({ incrustada = false }) {
   const [fDesde, setFDesde] = useState("");
   const [fHasta, setFHasta] = useState("");
   const [pagina, setPagina] = useState(0);
+  const [seleccionOTs, setSeleccionOTs] = useState(() => new Set());
+  const [confirmarFacturas, setConfirmarFacturas] = useState(false);
+  const [creandoFacturas, setCreandoFacturas] = useState(false);
+  const [progresoFacturas, setProgresoFacturas] = useState(null);
+  const [resultadoFacturas, setResultadoFacturas] = useState(null);
   const POR_PAGINA = 100;
 
   useEffect(() => {
@@ -3680,7 +3685,10 @@ function PantallaOTs({ incrustada = false }) {
     if (qC) arr = arr.filter((f) => (f.general.cliente || "").toLowerCase().includes(qC));
     if (qT)
       arr = arr.filter(
-        (f) => f.numeroOT.toLowerCase().includes(qT) || (f.general.descripcion || "").toLowerCase().includes(qT)
+        (f) =>
+          f.numeroOT.toLowerCase().includes(qT) ||
+          (f.general.presupuesto || "").toLowerCase().includes(qT) ||
+          (f.general.descripcion || "").toLowerCase().includes(qT)
       );
     if (fDepartament) arr = arr.filter((f) => f.general.departamento === fDepartament);
     if (fEstat) arr = arr.filter((f) => f.general.estadoApp === fEstat);
@@ -3703,7 +3711,7 @@ function PantallaOTs({ incrustada = false }) {
     const qT = fTexto.trim().toLowerCase();
     let arr = [...fichas.values()];
     if (qC) arr = arr.filter((f) => (f.general.cliente || "").toLowerCase().includes(qC));
-    if (qT) arr = arr.filter((f) => f.numeroOT.toLowerCase().includes(qT) || (f.general.descripcion || "").toLowerCase().includes(qT));
+    if (qT) arr = arr.filter((f) => f.numeroOT.toLowerCase().includes(qT) || (f.general.presupuesto || "").toLowerCase().includes(qT) || (f.general.descripcion || "").toLowerCase().includes(qT));
     if (fDepartament) arr = arr.filter((f) => f.general.departamento === fDepartament);
     if (fTipus) arr = arr.filter((f) => f.general.tipoTrabajo === fTipus);
     if (fDesde || fHasta) arr = arr.filter((f) => otEnRangoFecha(f, fDesde, fHasta));
@@ -3741,6 +3749,52 @@ function PantallaOTs({ incrustada = false }) {
 
   const totalPaginas = Math.max(1, Math.ceil(filtradas.length / POR_PAGINA));
   const visibles = filtradas.slice(pagina * POR_PAGINA, (pagina + 1) * POR_PAGINA);
+
+  const toggleOT = (id) => {
+    setConfirmarFacturas(false);
+    setSeleccionOTs((prev) => {
+      const siguiente = new Set(prev);
+      if (siguiente.has(id)) siguiente.delete(id);
+      else siguiente.add(id);
+      return siguiente;
+    });
+  };
+
+  const crearFacturasSeleccionadas = async () => {
+    if (!fichas || seleccionOTs.size === 0 || creandoFacturas) return;
+    const elegidas = [...seleccionOTs].map((id) => fichas.get(id)).filter(Boolean);
+    setCreandoFacturas(true);
+    setConfirmarFacturas(false);
+    setResultadoFacturas(null);
+    const ok = [];
+    const errores = [];
+    for (let i = 0; i < elegidas.length; i++) {
+      const f = elegidas[i];
+      const ot = codigoOTParaBC(f) || f.numeroOT;
+      const cliente = f.general?.cliente || "";
+      setProgresoFacturas({ hecho: i + 1, total: elegidas.length, ot });
+      try {
+        const r = await fetch("/api/bc/factura-venta-borrador", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cliente, ot }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) errores.push({ id: f.numeroOT, ot, cliente, texto: d.error || "No he podido crear la factura." });
+        else ok.push({ id: f.numeroOT, ot, cliente, numero: d.numero || "", enlace: d.enlace || "", avisos: d.avisos || [] });
+      } catch {
+        errores.push({ id: f.numeroOT, ot, cliente, texto: "No he podido conectar con el servidor." });
+      }
+    }
+    setResultadoFacturas({ ok, errores });
+    setSeleccionOTs((prev) => {
+      const siguiente = new Set(prev);
+      for (const x of ok) siguiente.delete(x.id);
+      return siguiente;
+    });
+    setProgresoFacturas(null);
+    setCreandoFacturas(false);
+  };
 
   if (seleccionada && fichas) {
     const ficha = fichas.get(seleccionada);
@@ -3801,7 +3855,7 @@ function PantallaOTs({ incrustada = false }) {
             <div className="flex gap-2 mb-3 flex-wrap">
               <input value={fCliente} onChange={(e) => { setFCliente(e.target.value); setPagina(0); }} placeholder="Filtrar client.."
                 className="text-sm border border-slate-300 rounded-md px-3 py-1.5 w-52 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
-              <input value={fTexto} onChange={(e) => { setFTexto(e.target.value); setPagina(0); }} placeholder="Filtrar OT / descripció.."
+              <input value={fTexto} onChange={(e) => { setFTexto(e.target.value); setPagina(0); }} placeholder="Filtrar OT / pressupost / descripció.."
                 className="text-sm border border-slate-300 rounded-md px-3 py-1.5 w-64 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
               <select value={fDepartament} onChange={(e) => { setFDepartament(e.target.value); setPagina(0); }}
                 className="text-sm border border-slate-300 rounded-md px-2 py-1.5 bg-white">
@@ -3837,12 +3891,84 @@ function PantallaOTs({ incrustada = false }) {
               )}
             </div>
 
+            {(seleccionOTs.size > 0 || confirmarFacturas || creandoFacturas || resultadoFacturas) && (
+              <div className="mb-3 bg-white border border-slate-200 rounded-lg px-3 py-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-slate-600">
+                    {seleccionOTs.size === 1 ? "1 OT seleccionada" : `${seleccionOTs.size} OTs seleccionadas`}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={creandoFacturas || seleccionOTs.size === 0}
+                    onClick={() => { setResultadoFacturas(null); setConfirmarFacturas(true); }}
+                    className="text-[11px] font-semibold text-white bg-blue-700 border border-blue-700 rounded-md px-2.5 py-1 hover:bg-blue-800 disabled:opacity-50"
+                  >
+                    {creandoFacturas ? "Creando facturas…" : "Crear factura a BC"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={creandoFacturas || seleccionOTs.size === 0}
+                    onClick={() => { setSeleccionOTs(new Set()); setConfirmarFacturas(false); }}
+                    className="text-[11px] text-slate-500 border border-slate-300 rounded-md px-2.5 py-1 bg-white hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    Quitar selección
+                  </button>
+                  {progresoFacturas && (
+                    <span className="text-[11px] text-slate-500">
+                      {progresoFacturas.hecho} de {progresoFacturas.total} · {progresoFacturas.ot}
+                    </span>
+                  )}
+                </div>
+                {confirmarFacturas && (
+                  <div className="mt-2 text-[11px] text-slate-700 bg-blue-50 border border-blue-200 rounded-md px-2.5 py-2">
+                    Se crearán {seleccionOTs.size === 1 ? "1 factura de venta abierta" : `${seleccionOTs.size} facturas de venta abiertas`}, una por OT, sin líneas y sin registrar. Las líneas las completas en Business Central con «Traer líneas alb. venta».
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        type="button"
+                        onClick={crearFacturasSeleccionadas}
+                        className="text-[11px] font-semibold text-white bg-blue-700 rounded px-2.5 py-1 hover:bg-blue-800"
+                      >
+                        Crear
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmarFacturas(false)}
+                        className="text-[11px] text-slate-600 border border-slate-300 rounded px-2.5 py-1 bg-white hover:bg-slate-50"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {resultadoFacturas && (
+                  <div className="mt-2 text-[11px] space-y-1">
+                    {resultadoFacturas.ok.map((x) => (
+                      <div key={x.id} className="text-emerald-800">
+                        {x.ot}{x.cliente ? ` · ${x.cliente}` : ""} · factura {x.numero || "creada"}
+                        {x.enlace && (
+                          <a href={x.enlace} target="_blank" rel="noopener noreferrer" className="ml-2 text-blue-700 hover:underline">Abrir en BC</a>
+                        )}
+                        {(x.avisos || [])[0] ? ` · ${x.avisos[0]}` : ""}
+                      </div>
+                    ))}
+                    {resultadoFacturas.errores.map((x) => (
+                      <div key={x.id} className="text-red-700">
+                        {x.ot}{x.cliente ? ` · ${x.cliente}` : ""} · {x.texto}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Tabla */}
             <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="bg-slate-100 text-slate-600 text-left">
+                    <th className="px-2 py-2 w-8" />
                     <th className="px-3 py-2 font-semibold">OT</th>
+                    <th className="px-2 py-2 font-semibold" title="Cód. PR del que procede, en la ficha del proyecto">Nº pressupost</th>
                     <th className="px-2 py-2 font-semibold">Estat App</th>
                     <th className="px-2 py-2 font-semibold">Client</th>
                     <th className="px-2 py-2 font-semibold w-[40%]">Descripció</th>
@@ -3855,8 +3981,18 @@ function PantallaOTs({ incrustada = false }) {
                 <tbody>
                   {visibles.map((f) => (
                     <tr key={f.numeroOT} onClick={() => setSeleccionada(f.numeroOT)}
-                      className="border-t border-slate-100 hover:bg-purple-50/50 cursor-pointer">
+                      className={`border-t border-slate-100 hover:bg-purple-50/50 cursor-pointer ${seleccionOTs.has(f.numeroOT) ? "bg-blue-50/70" : ""}`}>
+                      <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={seleccionOTs.has(f.numeroOT)}
+                          onChange={() => toggleOT(f.numeroOT)}
+                          title="Seleccionar esta OT para crear una factura de venta"
+                          aria-label={`Seleccionar ${codigoOTParaBC(f) || f.numeroOT}`}
+                        />
+                      </td>
                       <td className="px-3 py-1.5 font-bold text-slate-800 whitespace-nowrap">{codigoOTParaBC(f) || f.numeroOT}</td>
+                      <td className="px-2 py-1.5 whitespace-nowrap text-slate-700">{f.general.presupuesto || <span className="text-slate-300">—</span>}</td>
                       <td className="px-2 py-1.5 whitespace-nowrap">
                         {f.general.estadoApp && (
                           <span className={`text-[10px] font-bold rounded border px-1.5 py-0.5 ${COLOR_ESTADO_APP[f.general.estadoApp] || "bg-slate-50 text-slate-600 border-slate-200"}`}>
@@ -4025,6 +4161,9 @@ function DetalleOT({ ficha, fichas, onVolver }) {
   const [tasasEst, setTasasEst] = useState(null); // { pctGeneral, porUn, year, ... } desde contabilidad
   const [tasasEstEstado, setTasasEstEstado] = useState("cargando"); // cargando | ok | error
   const [tasasEstError, setTasasEstError] = useState(null);
+  const [creandoFactura, setCreandoFactura] = useState(false);
+  const [confirmarFactura, setConfirmarFactura] = useState(false);
+  const [avisoFactura, setAvisoFactura] = useState(null);
   const noBC = codigoOTParaBC(ficha);
 
   useEffect(() => { setClavesCosteNF(leerCosteNF(noBC)); }, [noBC]);
@@ -4064,6 +4203,66 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       });
     return () => { cancelado = true; };
   }, []);
+
+  // OT con Nº de presupuesto: las horas no salen del pedido de venta.
+  // Salen de Movs. proyecto (Uso + Recurso), todas las fechas.
+  const esPresupuesto = String(ficha.general?.presupuesto || "").trim() !== "";
+  const [movsUso, setMovsUso] = useState(null);
+  useEffect(() => {
+    if (!esPresupuesto || !noBC) {
+      setMovsUso(null);
+      return;
+    }
+    let cancelado = false;
+    setMovsUso({ cargando: true, horas: 0, filas: [], error: null });
+    fetch(`/api/horas/ot-uso?no=${encodeURIComponent(noBC)}`)
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || j.detalle || `Error ${r.status}`);
+        if (!cancelado) setMovsUso({ cargando: false, horas: Number(j.horas) || 0, filas: Array.isArray(j.filas) ? j.filas : [], error: null });
+      })
+      .catch((err) => {
+        if (!cancelado) setMovsUso({ cargando: false, horas: 0, filas: [], error: err.message || String(err) });
+      });
+    return () => { cancelado = true; };
+  }, [esPresupuesto, noBC]);
+  const horasMovsProyecto = esPresupuesto && movsUso && !movsUso.cargando && !movsUso.error
+    ? Number(movsUso.horas) || 0
+    : null;
+
+  const clienteFactura = ficha.general?.cliente || "";
+  const clienteNumeroFactura = (lineasBC?.ventaRaw || []).map((r) => r["Sell_to_Customer_No"]).find(Boolean) || "";
+  const crearFacturaDeEstaOT = async () => {
+    setCreandoFactura(true);
+    setAvisoFactura(null);
+    setConfirmarFactura(false);
+    try {
+      const r = await fetch("/api/bc/factura-venta-borrador", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clienteNumero: clienteNumeroFactura,
+          cliente: clienteFactura,
+          ot: noBC || "",
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setAvisoFactura({ tipo: "error", texto: d.error || "No he podido crear la factura." });
+        return;
+      }
+      const extra = (d.avisos || [])[0] ? ` ${d.avisos[0]}` : "";
+      setAvisoFactura({
+        tipo: "ok",
+        texto: `Factura ${d.numero || ""} creada, sin líneas.${extra}`,
+        enlace: d.enlace || "",
+      });
+    } catch {
+      setAvisoFactura({ tipo: "error", texto: "No he podido conectar con el servidor." });
+    } finally {
+      setCreandoFactura(false);
+    }
+  };
 
   // Artículos que la usuaria ha marcado como "no está bien" para este
   // tipo de trabajo. Se guardan en el navegador (localStorage), NO en
@@ -4394,12 +4593,13 @@ function DetalleOT({ ficha, fichas, onVolver }) {
   // Coste = material neto (compra + taller − stock) + mà d'obra a 21,50 €/h (sin estructura).
   const TARIFA_COSTE_MO_CAB = 21.5;
   const conBCCab = !!(lineasBC?.ventaRaw?.length);
-  const horasCab = conBCCab
+  const horasVentaCab = conBCCab
     ? lineasBC.ventaRaw.reduce(
         (a, l) => a + (((l["Type"] ?? "").toString().toLowerCase() === "resource") ? (Number(l["Quantity"]) || 0) : 0),
         0
       )
     : Number(ficha.venta.horas.cantidad) || 0;
+  const horasCab = horasMovsProyecto != null ? horasMovsProyecto : horasVentaCab;
   const materialesCab = compraReal.reduce((a, l) => a + (Number(l.importe ?? l["Importe línea"]) || 0), 0);
   const compradoNoVendidoCab = costeAplicado;
   const costeMaterialCab = Math.max(0, (materialesCab - compradoNoVendidoCab) + costeTaller);
@@ -4423,6 +4623,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       ingresos = Number(ficha.venta.importeTotalFacturado) || 0;
       horas = Number(ficha.venta.horas.cantidad) || 0;
     }
+    if (horasMovsProyecto != null) horas = horasMovsProyecto;
     const manoObra = horas * TARIFA_COSTE_MO;
     const materiales = compraReal.reduce((a, l) => a + (Number(l.importe ?? l["Importe línea"]) || 0), 0);
     const compradoNoVendido = costeAplicado;
@@ -4451,7 +4652,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       pctGeneral,
       un,
     };
-  }, [lineasBC, ficha, compraReal, dif, costeTaller, tasasEst, tasasEstEstado, costeAplicado]);
+  }, [lineasBC, ficha, compraReal, dif, costeTaller, tasasEst, tasasEstEstado, costeAplicado, horasMovsProyecto]);
 
   const costeNFVista = { filas: [] };
 
@@ -4529,6 +4730,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
           ingresos = Number(ficha.venta.importeTotalFacturado) || 0;
           horas = Number(ficha.venta.horas.cantidad) || 0;
         }
+        if (horasMovsProyecto != null) horas = horasMovsProyecto;
         const manoObra = horas * TARIFA_COSTE_MO;
         // Materiales = la MISMA suma que la tabla «Material pedido (compras)»:
         // líneas de compra reales (PC) deduplicadas (memoria + BC).
@@ -4653,7 +4855,17 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                 ...leerProvFecha(l),
               })),
             ];
-        const filasMO = conBC
+        const filasMO = horasMovsProyecto != null
+          ? (movsUso?.filas || []).map((l) => ({
+              documento: String(l.documento || "").trim(),
+              codigo: String(l.recurso || "").trim(),
+              descripcion: [l.descripcion, l.tipoTrabajo].filter(Boolean).join(" · "),
+              cantidad: Number(l.cantidad) || 0,
+              importe: (Number(l.cantidad) || 0) * TARIFA_COSTE_MO,
+              proveedor: "",
+              fecha: fmtFechaDesglose(l.fecha),
+            }))
+          : conBC
           ? (lineasBC?.ventaRaw || [])
               .filter((l) => String(l.Type || "").toLowerCase() === "resource")
               .map((l) => ({
@@ -4812,11 +5024,17 @@ function DetalleOT({ ficha, fichas, onVolver }) {
               <Metrica
                 label={`Mano de obra · ${horas} h`}
                 valor={eur(manoObra)}
-                sub={"a coste 21,50 €/h" + clicHint}
+                sub={(esPresupuesto && movsUso?.cargando
+                  ? "carregant movs. projecte"
+                  : horasMovsProyecto != null
+                    ? "movs. projecte · Ús · 21,50 €/h"
+                    : "a coste 21,50 €/h") + clicHint}
                 title="Desglossar mà d'obra"
                 onClick={() => setDesglose({
                   titulo: `Mà d'obra · ${horas} h · ${eur(manoObra)}`,
-                  subtitulo: `Hores × ${TARIFA_COSTE_MO.toLocaleString("es-ES")} €/h (cost)`,
+                  subtitulo: horasMovsProyecto != null
+                    ? `Movs. projecte · Ús · recurs × ${TARIFA_COSTE_MO.toLocaleString("es-ES")} €/h`
+                    : `Hores × ${TARIFA_COSTE_MO.toLocaleString("es-ES")} €/h (cost)`,
                   filas: filasMO,
                   total: manoObra,
                   totalLabel: "Total = cel·la Mà d'obra",
@@ -4847,9 +5065,14 @@ function DetalleOT({ ficha, fichas, onVolver }) {
               />
               <div className={`w-1.5 rounded-r-lg ${resultado < 0 ? "bg-red-400" : "bg-emerald-400"}`} />
             </div>
-            {!conBC && (
+            {!conBC && !esPresupuesto && (
               <div className="text-[10px] text-amber-600 mt-1">
                 ⚠ Cifras de la memoria: pueden faltar líneas. Pulsa «Cargar líneas desde BC» para el cálculo exacto.
+              </div>
+            )}
+            {esPresupuesto && movsUso?.error && (
+              <div className="text-[10px] text-amber-700 mt-1">
+                No s'han pogut llegir les hores de movs. projecte: {movsUso.error}
               </div>
             )}
 
@@ -5062,7 +5285,33 @@ function DetalleOT({ ficha, fichas, onVolver }) {
           </span>
         )}
         {avisoBC && <span className="text-[11px] text-amber-700">⚠ {avisoBC}</span>}
+        <button
+          type="button"
+          onClick={() => { setAvisoFactura(null); setConfirmarFactura(true); }}
+          disabled={creandoFactura || (!clienteNumeroFactura && !clienteFactura)}
+          title="Crea una factura de venta vacía en Business Central. Las líneas las traes tú con «Traer líneas alb. venta»."
+          className="ml-auto flex items-center gap-1.5 text-[11px] font-semibold text-white bg-blue-700 border border-blue-700 rounded-md px-2.5 py-1.5 hover:bg-blue-800 disabled:opacity-50"
+        >
+          {creandoFactura ? "Creando factura…" : "Crear factura a BC"}
+        </button>
       </div>
+      {confirmarFactura && (
+        <div className="mb-3 text-[11px] text-slate-700 bg-blue-50 border border-blue-200 rounded-md px-2.5 py-2">
+          Se creará una factura de venta abierta{clienteFactura ? ` de ${clienteFactura}` : ""}{noBC ? ` (OT ${noBC})` : ""}, sin líneas y sin registrar. Las líneas las completas en Business Central con «Traer líneas alb. venta».
+          <div className="flex gap-2 mt-2">
+            <button type="button" onClick={crearFacturaDeEstaOT} className="text-[11px] font-semibold text-white bg-blue-700 rounded px-2.5 py-1 hover:bg-blue-800">Crear</button>
+            <button type="button" onClick={() => setConfirmarFactura(false)} className="text-[11px] text-slate-600 border border-slate-300 rounded px-2.5 py-1 bg-white hover:bg-slate-50">Cancelar</button>
+          </div>
+        </div>
+      )}
+      {avisoFactura && (
+        <div className={`mb-3 text-[11px] rounded-md px-2.5 py-2 border ${avisoFactura.tipo === "ok" ? "text-emerald-800 bg-emerald-50 border-emerald-200" : "text-red-700 bg-red-50 border-red-200"}`}>
+          {avisoFactura.texto}
+          {avisoFactura.enlace && (
+            <a href={avisoFactura.enlace} target="_blank" rel="noopener noreferrer" className="ml-2 text-blue-700 hover:underline">Abrir en BC</a>
+          )}
+        </div>
+      )}
 
       {/* Pestañas: Material propuesto / Factura / Partes */}
       <div className="flex items-center gap-1 mb-3 border-b border-slate-200">
@@ -7089,7 +7338,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           {panel("tareas", <Tareas pendienteAlta={tareaPendiente} />)}
           {panel("ia", <ChatIA />)}
           {panel("ratios", <Ratios recursos={data.recursos?.rows || []} />)}
-          {panel("horas", <ControlHoras />)}
+          {panel("horas", <ControlHoras recursos={data.recursos?.rows || []} />)}
           {panel("memoria", (
             <>
               <div className="flex items-center gap-2">

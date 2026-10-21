@@ -11,6 +11,7 @@
  */
 import React, { useEffect, useMemo, useState } from "react";
 import { ConfiguracionHoras, TarifasHoras, FestivosLinea, listaFestivos, agruparAmiantoPorDia, normNum } from "./horasExtra.jsx";
+import { indiceRecursos } from "./manoObra.jsx";
 
 const CATS = {
   normal: { txt: "Normal", color: "" },
@@ -51,8 +52,9 @@ const lunesDe = (s) => { const d = new Date(`${s}T00:00:00Z`); d.setUTCDate(d.ge
 const h = (v) => (v ? (Math.round(v * 100) / 100).toLocaleString("es-ES") : "");
 const fmtF = (s) => (s ? s.split("-").reverse().join("/") : "");
 const DIAS = ["D", "L", "M", "X", "J", "V", "S"];
+const SIN_DEPTO = "Sin departamento";
 
-export default function ControlHoras() {
+export default function ControlHoras({ recursos = [] }) {
   const [datos, setDatos] = useState(null);
   const [ajustes, setAjustes] = useState({ tipos: {}, jornada: 8, jornadaViernes: null, festivos: [] });
   const [desde, setDesde] = useState(inicioMes());
@@ -64,6 +66,7 @@ export default function ControlHoras() {
   const [sel, setSel] = useState(null); // recurso seleccionado para el detalle
   const [soloIncidencias, setSoloIncidencias] = useState(false);
   const [soloPersonas, setSoloPersonas] = useState(true); // fuera máquinas/vehículos (tipo de recurso en BC)
+  const [departamento, setDepartamento] = useState("");
   const [guardado, setGuardado] = useState("");
   const [plegados, setPlegados] = useState({}); // recurso -> plegado (por defecto se ven las filas por tipo de línea)
   const [diaDetalle, setDiaDetalle] = useState(null); // { r, dias: [..], titulo }
@@ -215,8 +218,26 @@ export default function ControlHoras() {
     return { dias, lista, noHoras, tipos: Object.values(tipos).sort((a, b) => b.horas - a.horas), hastaReal };
   }, [datos, ajustes, soloPersonas]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Departamento = grupo de recurso de la tabla Recursos (misma lectura que mano de obra).
+  const ficha = useMemo(() => indiceRecursos(recursos), [recursos]);
+  const deptoListo = ficha.cargada && !!ficha.columna;
+  const deptoDe = (recurso) => {
+    if (!deptoListo) return "";
+    return ficha.mapa.get(String(recurso || "").trim().toUpperCase())?.unidad || SIN_DEPTO;
+  };
+  const deptoActivo = deptoListo ? departamento : "";
+  const opcionesDep = calc && deptoListo
+    ? [...new Set(calc.lista.map((r) => deptoDe(r.recurso)).filter(Boolean))].sort((a, b) => {
+      if (a === SIN_DEPTO) return 1;
+      if (b === SIN_DEPTO) return -1;
+      return a.localeCompare(b, "es");
+    })
+    : [];
+
   const visibles = calc ? calc.lista.filter((r) =>
-    (!buscar || `${r.nombre} ${r.recurso}`.toLowerCase().includes(buscar.toLowerCase())) && (!soloIncidencias || r.incidencias)) : [];
+    (!buscar || `${r.nombre} ${r.recurso}`.toLowerCase().includes(buscar.toLowerCase()))
+    && (!soloIncidencias || r.incidencias)
+    && (!deptoActivo || deptoDe(r.recurso) === deptoActivo)) : [];
   const porSemanas = calc && calc.dias.length > 31;
   const columnas = calc ? (porSemanas ? [...new Set(calc.dias.map(lunesDe))] : calc.dias) : [];
 
@@ -310,6 +331,14 @@ export default function ControlHoras() {
           {(pestana === "cuadro" || pestana === "extras") && (
             <div className="flex flex-wrap items-center gap-3 mt-3 text-sm">
               <input value={buscar} onChange={(e) => setBuscar(e.target.value)} placeholder="Buscar trabajador…" className={`${input} w-56`} />
+              <label className="flex items-center gap-1 text-slate-600">Departamento
+                <select value={deptoActivo} onChange={(e) => setDepartamento(e.target.value)} disabled={!deptoListo} className={`${input} max-w-[220px]`} title="Grupo de recurso de la tabla Recursos, en Cargar datos">
+                  <option value="">Todos</option>
+                  {opcionesDep.map((d) => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </label>
+              {!ficha.cargada && <span className="text-xs text-amber-700">Para filtrar por departamento, carga la tabla Recursos en Cargar datos.</span>}
+              {ficha.cargada && !ficha.columna && <span className="text-xs text-amber-700">La tabla Recursos no trae el grupo del recurso, así que no se puede saber el departamento.</span>}
               <label className="flex items-center gap-1 text-slate-600"><input type="checkbox" checked={soloIncidencias} onChange={(e) => setSoloIncidencias(e.target.checked)} /> Solo con incidencias</label>
               {datos.tipoRecurso && Object.keys(datos.tipoRecurso).length > 0 && (
                 <label className="flex items-center gap-1 text-slate-600"><input type="checkbox" checked={soloPersonas} onChange={(e) => setSoloPersonas(e.target.checked)} /> Solo personas (sin máquinas)</label>
@@ -357,7 +386,10 @@ export default function ControlHoras() {
                             <td className="px-2 py-1.5 sticky left-0 z-10 bg-[#dce6f2] border border-white">
                               <div className="flex items-center gap-1.5">
                                 <button onClick={() => setPlegados((a) => ({ ...a, [r.recurso]: abierto }))} className="text-slate-600 w-4 text-[11px]" title={abierto ? "Plegar" : "Desplegar"}>{abierto ? "▼" : "▶"}</button>
-                                <button onClick={() => { setSel(r.recurso); setPestana("detalle"); }} className="text-left font-bold text-[12.5px] text-slate-800 uppercase hover:underline" title={`Nº recurso ${r.recurso}`}>{r.nombre}</button>
+                                <div>
+                                  <button onClick={() => { setSel(r.recurso); setPestana("detalle"); }} className="text-left font-bold text-[12.5px] text-slate-800 uppercase hover:underline" title={`Nº recurso ${r.recurso}${deptoDe(r.recurso) ? ` · ${deptoDe(r.recurso)}` : ""}`}>{r.nombre}</button>
+                                  {deptoDe(r.recurso) && <div className="text-[10px] font-normal normal-case text-slate-600">{deptoDe(r.recurso)}</div>}
+                                </div>
                               </div>
                             </td>
                             {columnas.map((c) => celda(r, c))}
@@ -387,7 +419,7 @@ export default function ControlHoras() {
                   <div className="fixed inset-0 z-40 bg-black/30 flex items-center justify-center p-4" onClick={() => setDiaDetalle(null)}>
                     <div className="bg-white rounded-xl shadow-2xl p-6 max-w-3xl w-full max-h-[80vh] overflow-y-auto relative" onClick={(e) => e.stopPropagation()}>
                       <button onClick={() => setDiaDetalle(null)} className="absolute top-3 right-4 text-slate-400 hover:text-slate-600 text-lg">✕</button>
-                      <h2 className="text-lg font-bold text-slate-800 pr-6">{diaDetalle.r.nombre} — {diaDetalle.titulo}</h2>
+                      <h2 className="text-lg font-bold text-slate-800 pr-6">{diaDetalle.r.nombre}{deptoDe(diaDetalle.r.recurso) ? ` · ${deptoDe(diaDetalle.r.recurso)}` : ""} — {diaDetalle.titulo}</h2>
                       <table className="w-full text-sm mt-4 border">
                         <thead>
                           <tr className="bg-slate-50 text-slate-600">
@@ -443,7 +475,10 @@ export default function ControlHoras() {
                 <tbody>
                   {visibles.filter((r) => r.t.extras || r.t.exceso || r.t.ausencias || r.t.faltan || r.t.sinImputar || diasAmiantoDe(r.recurso)).map((r) => (
                     <tr key={r.recurso} className="border-t border-slate-100">
-                      <td className="px-3 py-1.5"><button onClick={() => { setSel(r.recurso); setPestana("detalle"); }} className="hover:underline font-medium text-slate-700">{r.nombre}</button></td>
+                      <td className="px-3 py-1.5">
+                        <button onClick={() => { setSel(r.recurso); setPestana("detalle"); }} className="hover:underline font-medium text-slate-700">{r.nombre}</button>
+                        {deptoDe(r.recurso) && <div className="text-[10px] text-slate-500">{deptoDe(r.recurso)}</div>}
+                      </td>
                       <td className="px-3 text-right text-purple-700">{h(r.t.extras)}</td>
                       <td className="px-3 text-right text-purple-700">{h(r.t.exceso)}</td>
                       {AUSENCIAS.map((a) => <td key={a} className={`px-3 text-right ${CATS[a].color}`}>{h(r.t.porAus[a])}</td>)}
@@ -482,7 +517,7 @@ export default function ControlHoras() {
                 return (
                   <section className="mt-3 bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
                     <div className="px-3 py-2 text-sm text-slate-600 border-b bg-slate-50">
-                      <b>{r.nombre}</b> · trabajadas {h(r.t.trabajadas) || 0} h de {h(r.t.teoricas) || 0} teóricas · extras {h(r.t.extras) || 0} · exceso {h(r.t.exceso) || 0} · ausencias {h(r.t.ausencias) || 0} · {r.t.sinImputar} días sin imputar
+                      <b>{r.nombre}</b>{deptoDe(r.recurso) ? ` · ${deptoDe(r.recurso)}` : ""} · trabajadas {h(r.t.trabajadas) || 0} h de {h(r.t.teoricas) || 0} teóricas · extras {h(r.t.extras) || 0} · exceso {h(r.t.exceso) || 0} · ausencias {h(r.t.ausencias) || 0} · {r.t.sinImputar} días sin imputar
                     </div>
                     <table className="w-full text-sm">
                       <thead><tr className="text-left text-xs text-slate-500"><th className="px-3 py-1.5">Fecha</th><th className="px-3">OT</th><th className="px-3">Tarea</th><th className="px-3">Tipo trabajo</th><th className="px-3">Clasificación</th><th className="px-3 text-right">Horas</th><th className="px-3">Descripción</th><th className="px-3">Documento</th></tr></thead>

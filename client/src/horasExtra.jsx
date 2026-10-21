@@ -28,6 +28,17 @@ const input = "border rounded px-2 py-1 text-sm";
 const norm = (s) => String(s ?? "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]/g, "");
 export const normNum = (s) => String(s ?? "").trim().replace(/^0+/, "").toUpperCase();
 export const PRECIO_AMIANTO_DEFECTO = 30;
+const PLUS_FESTIVO_EUR = 50;
+const esFestivoPlus = (cod) => /^h[_\s.-]*fest(ivo)?[_\s.-]*[12]$/i.test(String(cod || "").trim());
+/** Días distintos con H_FESTIVO1 o H_FESTIVO2. El mismo día con los dos códigos cuenta una vez. */
+function plusFestivoDe(tr) {
+  const fechas = new Set();
+  for (const mv of tr?.movs || []) {
+    if (!esFestivoPlus(mv.tipoTrabajo) || !(Number(mv.horas) > 0) || !mv.fecha) continue;
+    fechas.add(mv.fecha);
+  }
+  return { dias: fechas.size, importe: fechas.size * PLUS_FESTIVO_EUR };
+}
 /** Clave de precio editable por trabajador+día (plus amianto). */
 export const claveAmianto = (recurso, fecha) => `${normNum(recurso)}|${fecha}`;
 /**
@@ -330,14 +341,19 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
         return { c, horas: hh, ajuste: ajustesH[c] || 0, precio: p, importe: hh * p };
       });
       const ami = plusAmiantoDe(tr.recurso);
+      const festivo = plusFestivoDe(tr);
       const totalHoras = lineas.reduce((s, l) => s + l.importe, 0);
-      return { tr, fila, lineas, amianto: ami, total: totalHoras + ami.importe };
+      return { tr, fila, lineas, amianto: ami, festivo, total: totalHoras + ami.importe + festivo.importe };
     });
-    return { cods, filas };
+    const i2 = cods.findIndex((c) => /^h[_\s.-]*fest(ivo)?[_\s.-]*2$/i.test(String(c).trim()));
+    const i1 = cods.findIndex((c) => /^h[_\s.-]*fest(ivo)?[_\s.-]*1$/i.test(String(c).trim()));
+    const corte = i2 >= 0 ? i2 + 1 : (i1 >= 0 ? i1 + 1 : cods.length);
+    return { cods, filas, corte };
   }, [t, trabajadores, ajustes, desde, hasta, amiantoMap, precioDefAmianto]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const setMapeo = (m) => guardar({ ...t, mapeo: { ...(t.mapeo || {}), ...m } });
   const nombreCod = (c) => (c === "__exceso" ? "Exceso sobre jornada (no declarado)" : c);
+  const tieneImporte = (p) => p.lineas.some((l) => l.horas) || p.amianto?.dias || p.festivo?.dias;
 
   function abrirPopupAmianto(p) {
     const ami = p.amianto || plusAmiantoDe(p.tr.recurso);
@@ -365,12 +381,26 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
     setMsg("Preparando Excel…");
     try {
       const XLSX = await import(/* @vite-ignore */ "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs");
-      const visibles = pago.filas.filter((p) => p.lineas.some((l) => l.horas) || p.amianto?.dias);
-      const cab = ["Trabajador", "Nº recurso", ...pago.cods.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio €`, `${nombreCod(c)} importe €`]), "Días amianto", "Plus amianto €", "Total a pagar €"];
+      const visibles = pago.filas.filter(tieneImporte);
+      const antes = pago.cods.slice(0, pago.corte);
+      const despues = pago.cods.slice(pago.corte);
+      const colsTipo = (codigos) => codigos.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio €`, `${nombreCod(c)} importe €`]);
+      const valsTipo = (lineas) => lineas.flatMap((l) => [l.horas || "", l.horas ? l.precio : "", l.horas ? Math.round(l.importe * 100) / 100 : ""]);
+      const totTipo = (codigos) => codigos.flatMap((c) => {
+        const imp = Math.round(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0) * 100) / 100;
+        const hh = Math.round(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.horas || 0), 0) * 100) / 100;
+        return [hh || "", "", imp || ""];
+      });
+      const diasFest = pago.filas.reduce((s, p) => s + (p.festivo?.dias || 0), 0);
+      const impFest = Math.round(pago.filas.reduce((s, p) => s + (p.festivo?.importe || 0), 0) * 100) / 100;
+      const cab = ["Trabajador", "Nº recurso", ...colsTipo(antes), "Días plus festivo", "Plus festivo €", ...colsTipo(despues), "Días amianto", "Plus amianto €", "Total a pagar €"];
       const filasX = visibles.map((p) => [
         p.tr.nombre,
         p.tr.recurso,
-        ...p.lineas.flatMap((l) => [l.horas || "", l.horas ? l.precio : "", l.horas ? Math.round(l.importe * 100) / 100 : ""]),
+        ...valsTipo(p.lineas.slice(0, pago.corte)),
+        p.festivo?.dias || "",
+        p.festivo?.importe ? Math.round(p.festivo.importe * 100) / 100 : "",
+        ...valsTipo(p.lineas.slice(pago.corte)),
         p.amianto?.dias || "",
         p.amianto?.importe ? Math.round(p.amianto.importe * 100) / 100 : "",
         Math.round(p.total * 100) / 100,
@@ -378,17 +408,16 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
       const totales = [
         "Total",
         "",
-        ...pago.cods.flatMap((c) => {
-          const imp = Math.round(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0) * 100) / 100;
-          const hh = Math.round(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.horas || 0), 0) * 100) / 100;
-          return [hh || "", "", imp || ""];
-        }),
+        ...totTipo(antes),
+        diasFest || "",
+        impFest || "",
+        ...totTipo(despues),
         pago.filas.reduce((s, p) => s + (p.amianto?.dias || 0), 0) || "",
         Math.round(pago.filas.reduce((s, p) => s + (p.amianto?.importe || 0), 0) * 100) / 100 || "",
         Math.round(pago.filas.reduce((s, p) => s + p.total, 0) * 100) / 100,
       ];
       const ws = XLSX.utils.aoa_to_sheet([
-        [`A pagar · Periodo ${fmtF(desde)} – ${fmtF(hasta)} · horas BC ± incidencias · plus amianto`],
+        [`A pagar · Periodo ${fmtF(desde)} – ${fmtF(hasta)} · horas BC ± incidencias · plus festivo · plus amianto`],
         cab,
         ...filasX,
         totales,
@@ -494,7 +523,7 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
               ) : (
                 <>
                   <div className="flex flex-wrap items-center gap-2 p-2 border-b bg-slate-50 text-xs text-slate-600">
-                    Periodo {fmtF(desde)} – {fmtF(hasta)} · horas BC ± incidencias · plus amianto (días × €)
+                    Periodo {fmtF(desde)} – {fmtF(hasta)} · horas BC ± incidencias · plus festivo (días × 50 €) · plus amianto (días × €)
                     <label className="flex items-center gap-1 ml-2">
                       Precio amianto por defecto
                       <input type="number" min={0} step={1} value={precioDefAmianto}
@@ -506,8 +535,14 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
                     {amianto?.error && <span className="text-amber-700">{amianto.error}</span>}
                     <div className="ml-auto flex gap-1">
                       <button onClick={descargarExcelPago} className="px-2 py-1 rounded border bg-white hover:bg-slate-50">⬇ Descargar Excel</button>
-                      <button onClick={() => descargarCSV(`pago_horas_${desde}_${hasta}.csv`, ["Nº recurso", "Trabajador", ...pago.cods.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio`, `${nombreCod(c)} importe`]), "Días amianto", "Plus amianto", "Total"],
-                        pago.filas.filter((p) => p.lineas.some((l) => l.horas) || p.amianto?.dias).map((p) => ({ "Nº recurso": p.tr.recurso, Trabajador: p.tr.nombre, ...Object.fromEntries(p.lineas.flatMap((l) => [[`${nombreCod(l.c)} horas`, h(l.horas)], [`${nombreCod(l.c)} precio`, h(l.precio)], [`${nombreCod(l.c)} importe`, h(l.importe)]])), "Días amianto": p.amianto?.dias || "", "Plus amianto": h(p.amianto?.importe), Total: h(p.total) })))}
+                      <button onClick={() => {
+                        const antes = pago.cods.slice(0, pago.corte);
+                        const despues = pago.cods.slice(pago.corte);
+                        const colsTipo = (codigos) => codigos.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio`, `${nombreCod(c)} importe`]);
+                        const valsTipo = (lineas) => Object.fromEntries(lineas.flatMap((l) => [[`${nombreCod(l.c)} horas`, h(l.horas)], [`${nombreCod(l.c)} precio`, h(l.precio)], [`${nombreCod(l.c)} importe`, h(l.importe)]]));
+                        descargarCSV(`pago_horas_${desde}_${hasta}.csv`, ["Nº recurso", "Trabajador", ...colsTipo(antes), "Días plus festivo", "Plus festivo", ...colsTipo(despues), "Días amianto", "Plus amianto", "Total"],
+                          pago.filas.filter(tieneImporte).map((p) => ({ "Nº recurso": p.tr.recurso, Trabajador: p.tr.nombre, ...valsTipo(p.lineas.slice(0, pago.corte)), "Días plus festivo": p.festivo?.dias || "", "Plus festivo": h(p.festivo?.importe), ...valsTipo(p.lineas.slice(pago.corte)), "Días amianto": p.amianto?.dias || "", "Plus amianto": h(p.amianto?.importe), Total: h(p.total) })));
+                      }}
                         className="px-2 py-1 rounded border bg-white hover:bg-slate-50">⬇ CSV</button>
                     </div>
                   </div>
@@ -515,19 +550,30 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
                     <thead>
                       <tr className="text-xs text-slate-500">
                         <th className="px-3 py-1.5 text-left">Trabajador</th>
-                        {pago.cods.map((c) => <th key={c} className="px-3 text-right">{nombreCod(c)}<div className="font-normal text-[10px]">horas × precio</div></th>)}
+                        {pago.cods.slice(0, pago.corte).map((c) => <th key={c} className="px-3 text-right">{nombreCod(c)}<div className="font-normal text-[10px]">horas × precio</div></th>)}
+                        <th className="px-3 text-right">Plus festivo<div className="font-normal text-[10px]">días × 50 €</div></th>
+                        {pago.cods.slice(pago.corte).map((c) => <th key={c} className="px-3 text-right">{nombreCod(c)}<div className="font-normal text-[10px]">horas × precio</div></th>)}
                         <th className="px-3 text-right">Plus amianto<div className="font-normal text-[10px]">días × €/día · clic para detalle</div></th>
                         <th className="px-3 text-right">Total a pagar</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {pago.filas.filter((p) => p.lineas.some((l) => l.horas) || p.amianto?.dias).map((p) => (
+                      {pago.filas.filter(tieneImporte).map((p) => (
                         <tr key={p.tr.recurso} className="border-t border-slate-100">
                           <td className="px-3 py-1">
                             {p.tr.nombre} <span className="text-[10px] text-slate-400">{p.tr.recurso}</span>
                             {!p.fila && <div className="text-[10px] text-red-600">No está en la tabla de tarifas</div>}
                           </td>
-                          {p.lineas.map((l) => (
+                          {p.lineas.slice(0, pago.corte).map((l) => (
+                            <td key={l.c} className="px-3 text-right whitespace-nowrap">
+                              {l.horas ? <>{h(l.horas)} h × {h(l.precio) || 0} € <div className="font-medium">{eur(l.importe)}</div></> : ""}
+                              {l.ajuste ? <div className="text-[10px] text-amber-700">{l.ajuste > 0 ? "+" : ""}{h(l.ajuste)} h por incidencia</div> : null}
+                            </td>
+                          ))}
+                          <td className="px-3 text-right whitespace-nowrap">
+                            {p.festivo?.dias ? <>{p.festivo.dias} {p.festivo.dias === 1 ? "día" : "días"}<div className="font-medium">{eur(p.festivo.importe)}</div></> : ""}
+                          </td>
+                          {p.lineas.slice(pago.corte).map((l) => (
                             <td key={l.c} className="px-3 text-right whitespace-nowrap">
                               {l.horas ? <>{h(l.horas)} h × {h(l.precio) || 0} € <div className="font-medium">{eur(l.importe)}</div></> : ""}
                               {l.ajuste ? <div className="text-[10px] text-amber-700">{l.ajuste > 0 ? "+" : ""}{h(l.ajuste)} h por incidencia</div> : null}
@@ -548,7 +594,9 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
                     <tfoot>
                       <tr className="border-t-2 font-semibold">
                         <td className="px-3 py-2">Total</td>
-                        {pago.cods.map((c) => <td key={c} className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0))}</td>)}
+                        {pago.cods.slice(0, pago.corte).map((c) => <td key={c} className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0))}</td>)}
+                        <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.festivo?.importe || 0), 0))}</td>
+                        {pago.cods.slice(pago.corte).map((c) => <td key={c} className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0))}</td>)}
                         <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.amianto?.importe || 0), 0))}</td>
                         <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + p.total, 0))}</td>
                       </tr>

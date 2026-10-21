@@ -60,7 +60,7 @@ function unidadDeGrupo(codigo) {
   return DEPARTAMENTO[m[1]] || m[1];
 }
 
-function indiceRecursos(filas) {
+export function indiceRecursos(filas) {
   const lista = filas || [];
   let columna = "";
   for (const row of lista) {
