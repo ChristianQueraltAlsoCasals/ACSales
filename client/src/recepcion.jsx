@@ -17,7 +17,8 @@
  */
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { RefreshCw, Search, CheckCircle2, Mail, X, Upload, ChevronRight, ChevronDown, Send, StickyNote, Trash2 } from "lucide-react";
-import { emailsPorCodigoDepartamento, EMAIL_POR_DEFECTO } from "./departamentos.js";
+import { emailsPorCodigoDepartamento, copiasAdministracion } from "./departamentos.js";
+import { empresaGuardada } from "./empresa.jsx";
 
 // --- utilidades de formato (es-ES) ---
 const parseNum = (v) => {
@@ -264,29 +265,72 @@ function htmlReclamacion(pedidosSel, intro, cierre) {
   return `<div style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#1e293b"><p>${parrafos(intro)}</p>${bloques}<p style="margin-top:16px">${parrafos(cierre)}</p></div>`;
 }
 
-// Personas que van SIEMPRE en copia de las reclamaciones a proveedores (25/09/2026)
-const CC_SIEMPRE = ["ana.moreno@ferrosca.com"];
+const TEXTO_PROVEEDOR =
+  "Buenos días,\n\nOs escribimos para preguntar si el material pendiente de entrega de los pedidos que detallamos a continuación ya se ha enviado. Si todavía no, os agradeceríamos que nos confirmarais la fecha prevista de entrega o, si hay alguna incidencia, que nos la indicarais lo antes posible.\n\nEn caso de que el material ya se haya entregado, os rogamos que nos enviéis el albarán de entrega firmado.";
+
+function razonEmpresaFirma() {
+  const e = empresaGuardada();
+  const n = `${e?.nombre || ""} ${e?.displayName || ""}`.toLowerCase();
+  if (n.includes("ferros")) return "Ferros Coll de l'Alba, S.L.";
+  if (n.includes("quimlab")) return e?.displayName || e?.nombre || "QUIMLAB";
+  return "ALSO CASALS INSTAL·LACIONS, S.L.";
+}
+
+function textoCierre(nombre) {
+  const quien = String(nombre || "").trim();
+  return "Gracias de antemano.\n\nUn saludo," + (quien ? "\n" + quien : "") + "\n" + razonEmpresaFirma();
+}
+
+const TEXTO_INTERNO =
+  "Buenos días,\n\nOs escribimos para confirmar si el material correspondiente al pedido que detallamos ha sido recibido en nuestras instalaciones.\n\nEsto es, porque figura como pendiente y no hemos recibido el albarán del proveedor y, por tanto, tampoco se ha facturado.\n\nSi todavía no ha sido recibido, agradeceríamos que nos confirmaseis la fecha prevista de recepción o nos informarais de cualquier incidencia.\n\nAsimismo, os rogamos que nos indiquéis si el pedido ha sido cancelado o si el material ya no es necesario.";
 
 function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuardado, reclamados, onClose, onEnviado }) {
   const [sel, setSel] = useState(() => new Set(inicial));
   const [para, setPara] = useState(emailGuardado || "");
   const [emailBC, setEmailBC] = useState(null); // null = consultando, "" = la ficha no tiene
+  const emailProveedorRef = useRef(emailGuardado || "");
+  const tipoRef = useRef("proveedor");
+  const [tipoMensaje, setTipoMensaje] = useState("proveedor");
+  const [remitente, setRemitente] = useState("");
+  const cierreTocado = useRef(false);
+  const [cierre, setCierre] = useState(() => textoCierre(""));
   const [enviando, setEnviando] = useState(false);
   const [error, setError] = useState(null);
   const elegidos = pedidosProv.filter((p) => sel.has(p.num));
 
-  // CC automático = responsables del departamento de CADA pedido marcado + los que van siempre.
-  // Al marcar/desmarcar pedidos se recalcula, conservando lo que Maria haya escrito a mano.
-  const ccAutoDe = (nums) => {
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.email) setRemitente(d.email);
+        if (!cierreTocado.current) setCierre(textoCierre(d.nombre));
+      })
+      .catch(() => {});
+  }, []);
+
+  // CC = responsables del departamento + Administración, sin quien envía.
+  // Al marcar/desmarcar pedidos se recalcula, conservando lo escrito a mano.
+  const ccAutoDe = (nums, emailRemitente) => {
     const set = new Set();
-    pedidosProv.filter((p) => nums.has(p.num)).forEach((p) => (emailsPorCodigoDepartamento(p.depto) || [EMAIL_POR_DEFECTO]).forEach((e) => set.add(e)));
-    CC_SIEMPRE.forEach((e) => set.add(e)); // en copia en TODAS las reclamaciones
+    pedidosProv.filter((p) => nums.has(p.num)).forEach((p) => (emailsPorCodigoDepartamento(p.depto) || []).forEach((e) => set.add(e)));
+    copiasAdministracion(emailRemitente).forEach((e) => set.add(e));
     return [...set];
   };
-  const autoPrevRef = useRef(ccAutoDe(new Set(inicial)));
+  const autoPrevRef = useRef(ccAutoDe(new Set(inicial), ""));
   const [cc, setCc] = useState(() => autoPrevRef.current.join("; "));
+  const sinCorreoProveedor = (lista) => {
+    const prov = (emailProveedorRef.current || "").trim().toLowerCase();
+    return lista.filter((e) => e.toLowerCase() !== prov);
+  };
   useEffect(() => {
-    const nuevoAuto = ccAutoDe(sel);
+    const internos = sinCorreoProveedor(ccAutoDe(sel, remitente));
+    if (tipoMensaje === "interno") {
+      setPara(internos.join("; "));
+      setCc("");
+      autoPrevRef.current = [];
+      return;
+    }
+    const nuevoAuto = internos;
     setCc((actual) => {
       const previos = new Set(autoPrevRef.current.map((e) => e.toLowerCase()));
       const aMano = partirEmails(actual).filter((e) => !previos.has(e.toLowerCase()));
@@ -294,15 +338,18 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
       return [...nuevoAuto, ...aMano].filter((e) => { const k = e.toLowerCase(); if (vistos.has(k)) return false; vistos.add(k); return true; }).join("; ");
     });
     autoPrevRef.current = nuevoAuto;
-  }, [sel]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sel, remitente, tipoMensaje]); // eslint-disable-line react-hooks/exhaustive-deps
   const asuntoAuto = elegidos.length === 1
     ? `Reclamación pedido ${elegidos[0].num} – ALSO CASALS`
     : `Reclamación de material pendiente (${elegidos.length} pedidos) – ALSO CASALS`;
   const [asunto, setAsunto] = useState(null); // null = automático
-  const [intro, setIntro] = useState(
-    "Buenos días,\n\nOs escribimos para preguntar si el material pendiente de entrega de los pedidos que detallamos a continuación ya se ha enviado. Si todavía no, os agradeceríamos que nos confirmarais la fecha prevista de entrega o, si hay alguna incidencia, que nos la indicarais lo antes posible.\n\nEn caso de que el material ya se haya entregado, os rogamos que nos enviéis el albarán de entrega firmado."
-  );
-  const [cierre, setCierre] = useState("Gracias de antemano.\n\nUn saludo,\nMaria Rufí\nALSO CASALS INSTAL·LACIONS, S.L.");
+  const [intro, setIntro] = useState(TEXTO_PROVEEDOR);
+  const elegirTipo = (tipo) => {
+    tipoRef.current = tipo;
+    setTipoMensaje(tipo);
+    setIntro(tipo === "interno" ? TEXTO_INTERNO : TEXTO_PROVEEDOR);
+    if (tipo === "proveedor") setPara(emailProveedorRef.current || "");
+  };
 
   // Email desde la ficha del proveedor en BC
   useEffect(() => {
@@ -312,7 +359,8 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
       .then((d) => {
         const e = (d && d.email) || "";
         setEmailBC(e);
-        if (e && !emailGuardado) setPara(e);
+        emailProveedorRef.current = e || emailGuardado || "";
+        if (tipoRef.current === "proveedor") setPara(emailProveedorRef.current);
       })
       .catch(() => setEmailBC(""));
   }, [proveedor, provNum]);
@@ -336,7 +384,7 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
       });
       const json = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
-      onEnviado({ pedidos: elegidos.map((p) => p.num), para: sinProveedor ? `${dest.join("; ")} (sin email del proveedor)` : dest.join("; "), recordarEmail: !sinProveedor && dest.join("; ") !== (emailBC || "") ? dest.join("; ") : null });
+      onEnviado({ pedidos: elegidos.map((p) => p.num), para: sinProveedor ? `${dest.join("; ")} (sin email del proveedor)` : dest.join("; "), recordarEmail: tipoMensaje === "proveedor" && !sinProveedor && dest.join("; ") !== (emailBC || "") ? dest.join("; ") : null });
     } catch (err) {
       setError(err.message || String(err));
       setEnviando(false);
@@ -368,13 +416,33 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
           )}
         </div>
 
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-xs font-semibold text-slate-500">Mensaje</span>
+          <button
+            type="button"
+            onClick={() => elegirTipo("proveedor")}
+            className={`text-sm rounded-md px-3 py-1.5 border ${tipoMensaje === "proveedor" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+          >
+            Proveedor
+          </button>
+          <button
+            type="button"
+            onClick={() => elegirTipo("interno")}
+            className={`text-sm rounded-md px-3 py-1.5 border ${tipoMensaje === "interno" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+          >
+            Interno
+          </button>
+        </div>
+
         <div className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-2 items-center text-[13px] mb-3">
           <label className="text-xs font-semibold text-slate-500">Para</label>
           <div>
             <input value={para} onChange={(e) => setPara(e.target.value)} placeholder="email del proveedor (si lo dejas vacío, se envía solo a las personas de CC)" className="w-full border border-slate-300 rounded px-2 py-1" />
             <div className="text-[10px] text-slate-400 mt-0.5">
-              {emailBC === null ? "Consultando la ficha del proveedor en BC…" : emailBC ? `Ficha BC: ${emailBC}` : "La ficha del proveedor en BC no tiene email — escríbelo y se recordará para la próxima vez."}
-              {emailGuardado && emailGuardado !== emailBC ? ` · Recordado: ${emailGuardado}` : ""}
+              {tipoMensaje === "interno"
+                ? "Mensaje interno: el correo del proveedor no se incluye."
+                : (emailBC === null ? "Consultando la ficha del proveedor en BC…" : emailBC ? `Ficha BC: ${emailBC}` : "La ficha del proveedor en BC no tiene email — escríbelo y se recordará para la próxima vez.")}
+              {tipoMensaje === "proveedor" && emailGuardado && emailGuardado !== emailBC ? ` · Recordado: ${emailGuardado}` : ""}
             </div>
           </div>
           <label className="text-xs font-semibold text-slate-500">CC</label>
@@ -382,9 +450,9 @@ function ModalReclamacion({ proveedor, provNum, pedidosProv, inicial, emailGuard
           <label className="text-xs font-semibold text-slate-500">Asunto</label>
           <input value={asunto ?? asuntoAuto} onChange={(e) => setAsunto(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1" />
           <label className="text-xs font-semibold text-slate-500 self-start pt-1">Texto inicial</label>
-          <textarea value={intro} onChange={(e) => setIntro(e.target.value)} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <textarea value={intro} onChange={(e) => setIntro(e.target.value)} rows={8} className="w-full border border-slate-300 rounded px-2 py-1" />
           <label className="text-xs font-semibold text-slate-500 self-start pt-1">Despedida</label>
-          <textarea value={cierre} onChange={(e) => setCierre(e.target.value)} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <textarea value={cierre} onChange={(e) => { cierreTocado.current = true; setCierre(e.target.value); }} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
         </div>
 
         <div className="text-xs font-semibold text-slate-500 mb-1">Vista previa del correo</div>

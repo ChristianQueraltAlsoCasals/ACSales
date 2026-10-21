@@ -27,6 +27,13 @@ bc_automation/*.png
 bc_automation/antes_de_*.png
 bc_automation/captura_*.png
 
+
+# Local / no versionar
+.cursor/
+.tmp-syntax-check/
+borradores/
+data/datos_empresas_grupo.json
+
 # Misc local
 ChatGPT.url
 *.zip

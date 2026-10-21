@@ -16,10 +16,9 @@
  *
  * Botón "Enviar aviso": manda un correo REAL (vía Graph, con la factura
  * en PDF adjunta — un mailto: no puede llevar adjuntos) al responsable
- * del departamento del pedido, igual que ya hace el Explorador de OTs
- * (misma lista EMAILS_DEPARTAMENTO, departamentos.js). El departamento
- * se lee del propio pedido de compra (columna "Cód. UN"/Shortcut
- * Dimension 1, la misma que ya usa Recepción de material).
+ * del departamento del pedido, con Administración en copia
+ * (departamentos.js). El departamento se lee del propio pedido de compra
+ * (columna "Cód. UN"/Shortcut Dimension 1, la misma que ya usa Recepción).
  *
  * Botón "Entrar en BC" (solo en facturas con semáforo verde): crea la
  * factura de compra en BC como BORRADOR (sin contabilizar — alguien la
@@ -34,8 +33,9 @@
 import React, { Fragment, useState, useRef, useMemo, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet, Inbox, Send, StickyNote } from "lucide-react";
-import { emailsPorCodigoDepartamento, EMAIL_POR_DEFECTO } from "./departamentos.js";
+import { emailsPorCodigoDepartamento, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
 import { empresaGuardada } from "./empresa.jsx";
+import { htmlPerEnviar } from "./correo.jsx";
 
 /** Buzón Continia Document Capture — facturas OK validadas se reenvían aquí. */
 const EMAIL_CONTINIA = "compras.alsoprod.8020885@cdc.continiaonline.com";
@@ -365,15 +365,44 @@ function departamentoDePedido(pedidos, numeroPedido) {
 
 /** Destinatarios para una factura: unión de los emails de los
  * departamentos de TODOS los pedidos que referencia (sin duplicados). */
-function destinatariosFactura(pedidosDetalle, pedidos) {
-  const set = new Set();
+function destinatariosFactura(pedidosDetalle, pedidos, emailRemitente) {
+  const deps = new Set();
+  let alguno = false;
   for (const p of pedidosDetalle || []) {
+    alguno = true;
     const dep = departamentoDePedido(pedidos, p.pedido);
-    const emails = emailsPorCodigoDepartamento(dep);
-    (emails || [EMAIL_POR_DEFECTO]).forEach((e) => set.add(e));
+    const seg = dep ? dep.toString().split("-")[0].trim().toUpperCase() : "";
+    if (seg) deps.add(seg);
   }
-  if (!set.size) set.add(EMAIL_POR_DEFECTO);
-  return [...set];
+  if (!alguno || !deps.size) {
+    const listas = listasCorreoDepartamento(null);
+    return aplicarRemitente(listas.para, listas.cc, emailRemitente);
+  }
+  const para = [];
+  const vistos = new Set();
+  for (const seg of deps) {
+    for (const e of emailsPorCodigoDepartamento(seg) || []) {
+      const k = e.toLowerCase();
+      if (vistos.has(k)) continue;
+      vistos.add(k);
+      para.push(e);
+    }
+  }
+  if (!para.length) {
+    const listas = listasCorreoDepartamento(null);
+    return aplicarRemitente(listas.para, listas.cc, emailRemitente);
+  }
+  const cc = [];
+  const ccVistos = new Set();
+  for (const seg of deps) {
+    for (const e of listasCorreoDepartamento(seg).cc) {
+      const k = e.toLowerCase();
+      if (ccVistos.has(k)) continue;
+      ccVistos.add(k);
+      cc.push(e);
+    }
+  }
+  return aplicarRemitente(para, cc, emailRemitente);
 }
 
 function construirCuerpoHtml(factura, motivos) {
@@ -595,6 +624,10 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
   const [recepPedido, setRecepPedido] = useState(null);
   const [buscandoCorreos, setBuscandoCorreos] = useState(false);
   const [pdfManual, setPdfManual] = useState(f.pdfBase64 || null);
+  const [verDetalle, setVerDetalle] = useState(() => !f.factura);
+  useEffect(() => {
+    if (seleccionActiva != null) setVerDetalle(true);
+  }, [seleccionActiva]);
   useEffect(() => {
     if (f.pdfBase64 || pdfManual || !f.origen?.msg) return;
     let vivo = true;
@@ -901,17 +934,30 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
   // se sigue sincronizando solo si cambia el cálculo automático (p. ej.
   // al elegir un pedido a mano); en cuanto lo edita, deja de
   // sobrescribirse — con un enlace para volver al cálculo automático.
-  const destinatariosAuto = useMemo(() => destinatariosFactura(pedidosDetalle, pedidos), [pedidosDetalle, pedidos]);
-  const [destinatariosTexto, setDestinatariosTexto] = useState(() => destinatariosAuto.join(", "));
+  const listasAuto = useMemo(
+    () => destinatariosFactura(pedidosDetalle, pedidos, remitenteEmail),
+    [pedidosDetalle, pedidos, remitenteEmail]
+  );
+  const paraAutoTxt = listasAuto.para.join(", ");
+  const ccAutoTxt = listasAuto.cc.join(", ");
+  const [destinatariosTexto, setDestinatariosTexto] = useState(() => paraAutoTxt);
   const [destinatariosEditados, setDestinatariosEditados] = useState(false);
+  const [ccTexto, setCcTexto] = useState(() => ccAutoTxt);
+  const [ccEditado, setCcEditado] = useState(false);
   useEffect(() => {
-    if (!destinatariosEditados) setDestinatariosTexto(destinatariosAuto.join(", "));
+    if (!destinatariosEditados) setDestinatariosTexto(paraAutoTxt);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [destinatariosAuto.join(",")]);
-  const destinatarios = useMemo(
-    () =>
-      [...new Set(destinatariosTexto.split(/[,;\s]+/).map((s) => s.trim()).filter((s) => s.includes("@")))],
-    [destinatariosTexto]
+  }, [paraAutoTxt]);
+  useEffect(() => {
+    if (!ccEditado) setCcTexto(ccAutoTxt);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ccAutoTxt]);
+  const emailsDeCampo = (texto) =>
+    [...new Set(String(texto || "").split(/[,;\s]+/).map((s) => s.trim()).filter((s) => s.includes("@")))];
+  const destinatarios = useMemo(() => emailsDeCampo(destinatariosTexto), [destinatariosTexto]);
+  const copias = useMemo(
+    () => emailsDeCampo(ccTexto).filter((e) => !destinatarios.some((p) => p.toLowerCase() === e.toLowerCase())),
+    [ccTexto, destinatarios]
   );
 
   // "Entrar en BC de todas formas" (Maria, 2026-09-04): aunque el
@@ -1043,6 +1089,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           para: destinatarios,
+          cc: copias,
           asunto: (vistaCorreo.asunto || asuntoIncidencia).trim(),
           cuerpoHtml: textoPlanoAHtml(vistaCorreo.cuerpo),
           adjunto: f.pdfBase64 ? { nombre: `Factura_${cabecera.factura}.pdf`, base64: f.pdfBase64 } : null,
@@ -1051,7 +1098,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       const json = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(json.error || `Error ${r.status}`);
       const nums = [...new Set(pedidosDetalle.filter((p) => p.pedido && (p.lineas || []).some((l) => l.pendienteRecepcion)).map((p) => p.pedido))];
-      const texto = `Incidencia de la factura ${cabecera.factura} enviada a ${destinatarios.join(", ")}`;
+      const texto = `Incidencia de la factura ${cabecera.factura} enviada a ${destinatarios.join(", ")}${copias.length ? ` (copia: ${copias.join(", ")})` : ""}`;
       for (const pedido of nums) {
         await fetch("/api/recepcion/nota", {
           method: "POST",
@@ -1493,7 +1540,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                       </div>
                     ))}
                     {envio.estado === "error" && envio.error && <div className="text-[11px] text-red-700 mt-1">{envio.error}</div>}
-                    {envio.estado === "ok" && <div className="text-[11px] text-emerald-700 mt-1">Correo enviado a {destinatarios.join(", ")}</div>}
+                    {envio.estado === "ok" && <div className="text-[11px] text-emerald-700 mt-1">Correo enviado a {destinatarios.join(", ")}{copias.length ? ` · copia: ${copias.join(", ")}` : ""}</div>}
                   </div>
                 </div>
               );
@@ -1535,11 +1582,13 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               title="Destinatarios de la incidencia — sepáralos por comas. Se calculan solos por el departamento del pedido."
               className="flex-1 min-w-[180px] text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-blue-400 focus:outline-none focus:bg-white px-0.5"
             />
-            {destinatariosEditados && (
+            {(destinatariosEditados || ccEditado) && (
               <button
                 onClick={() => {
                   setDestinatariosEditados(false);
-                  setDestinatariosTexto(destinatariosAuto.join(", "));
+                  setCcEditado(false);
+                  setDestinatariosTexto(paraAutoTxt);
+                  setCcTexto(ccAutoTxt);
                 }}
                 title="Volver a los destinatarios calculados automáticamente"
                 className="text-blue-600 hover:text-blue-800 underline shrink-0"
@@ -1547,6 +1596,19 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                 Restablecer
               </button>
             )}
+          </div>
+          <div className="flex items-center gap-1.5 text-xs text-slate-500 flex-1 min-w-[220px]">
+            Copia (administración):
+            <input
+              value={ccTexto}
+              onChange={(e) => {
+                setCcTexto(e.target.value);
+                setCcEditado(true);
+              }}
+              placeholder="ana@…, edith@…, maria@…"
+              title="Copia de Administración. Quien envía no se incluye. Dirección se añade a mano."
+              className="flex-1 min-w-[180px] text-slate-700 bg-transparent border-b border-transparent hover:border-slate-300 focus:border-blue-400 focus:outline-none focus:bg-white px-0.5"
+            />
           </div>
           <div className="flex items-center gap-2">
             {remitenteEmail && (
@@ -1668,6 +1730,18 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       )}
 
       {abierta && !f.yaEntrada && (
+        <div className="px-4 py-2 border-t border-slate-200 bg-white flex justify-end" onClick={(e) => e.stopPropagation()}>
+          <button
+            type="button"
+            onClick={() => setVerDetalle((v) => !v)}
+            className="text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded px-3 py-1.5"
+          >
+            {verDetalle ? "Ocultar líneas y PDF" : (sinNumero || pedidosDetalle.some((p) => p.bcError) ? "Ver líneas, PDF y pedidos" : "Ver líneas y PDF")}
+          </button>
+        </div>
+      )}
+
+      {abierta && !f.yaEntrada && verDetalle && (
         <div className="border-t border-slate-200 bg-[#f4f6f8]" onClick={(e) => e.stopPropagation()}>
           <div className="flex flex-col xl:flex-row xl:items-start">
             <div className="xl:w-[min(680px,48%)] xl:shrink-0 min-w-0 bg-white">
@@ -1990,7 +2064,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
 
-      {abierta && !f.yaEntrada && !esGasto && !ultima?.puedeCrear && (
+      {abierta && !f.yaEntrada && !esGasto && !ultima?.puedeCrear && verDetalle && (
         <div className="px-4 py-3 border-t border-slate-100" onClick={(e) => e.stopPropagation()}>
             <div>
               <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-2">
@@ -2051,6 +2125,17 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                   onChange={(e) => {
                     setDestinatariosTexto(e.target.value);
                     setDestinatariosEditados(true);
+                  }}
+                  className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
+                />
+              </label>
+              <label className="block">
+                <span className="text-[11px] text-slate-500">Copia</span>
+                <input
+                  value={ccTexto}
+                  onChange={(e) => {
+                    setCcTexto(e.target.value);
+                    setCcEditado(true);
                   }}
                   className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
                 />
@@ -2820,18 +2905,13 @@ function estaEntrada(f) {
   return !!(f?.yaEntrada || f?.veredicto === "ya_entrada");
 }
 
-function estadoLectura(f) {
-  if (estaEntrada(f)) return { tono: "text-slate-400", texto: "—" };
-  if (f?.veredicto === "gasto") return { tono: "text-blue-800 font-semibold", texto: "Proveedor de gasto" };
-  if (f?.veredicto === "ok") return { tono: "text-emerald-700 font-semibold", texto: "Se puede entrar" };
-  const err = String(f?.incidencia || "").trim();
-  return { tono: "text-red-800", texto: err || "Errores detectados" };
-}
-
-function marcaEntrada(f) {
-  if (!f) return { tono: "text-slate-400", texto: "Sin leer" };
-  if (estaEntrada(f)) return { tono: "text-emerald-700 font-semibold", texto: "Entrada" };
-  return { tono: "text-amber-800 font-semibold", texto: "No entrada" };
+function estadoCorto(f) {
+  if (!f) return { texto: "Sin leer", clase: "bg-slate-100 text-slate-600", detalle: "" };
+  if (estaEntrada(f)) return { texto: "Entrada", clase: "bg-emerald-100 text-emerald-800", detalle: "" };
+  if (f.veredicto === "gasto") return { texto: "Gasto", clase: "bg-blue-100 text-blue-800", detalle: "" };
+  if (f.veredicto === "ok") return { texto: "Lista", clase: "bg-emerald-100 text-emerald-800", detalle: "" };
+  const err = String(f.incidencia || "").trim();
+  return { texto: "Revisar", clase: "bg-red-100 text-red-800", detalle: err || "Hay diferencias con el pedido" };
 }
 
 function PanelCorreoFila({ it }) {
@@ -2930,7 +3010,8 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
   const [datos, setDatos] = useState(null);
   const [verOtras, setVerOtras] = useState(false);
   const [verProcesadas, setVerProcesadas] = useState(false);
-  const [filtroEntrada, setFiltroEntrada] = useState("todas");
+  const [vista, setVista] = useState("pendientes");
+  const [busca, setBusca] = useState("");
   const empresa = empresaGuardada();
   const datosRef = useRef(null);
   const arranque = useRef(false);
@@ -3050,16 +3131,38 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
     if (n === leidas.length) return "si";
     return "mixta";
   };
-  const visibles = [...deEsta, ...sinAsignar, ...(verOtras ? deOtras : [])]
-    .filter((it) => verProcesadas || !it.procesada)
-    .filter((it) => {
-      if (filtroEntrada === "todas") return true;
-      const c = clasificarEntrada(it);
-      if (filtroEntrada === "entradas") return c === "si" || c === "mixta";
-      return c === "sin" || c === "no" || c === "mixta";
-    })
+  const leidasDe = (it) => {
+    const clave = `${it.msg}|${it.att}`;
+    const deFila = facturasDeFila(facturas, it);
+    return (deFila.length ? deFila : (lecturas[clave] || [])).map(resumenLectura);
+  };
+  const qBusca = busca.trim().toLowerCase();
+  const coincideBusca = (it) => {
+    if (!qBusca) return true;
+    const blob = [it.asunto, it.de, it.deNombre, it.nombre, ...leidasDe(it).flatMap((f) => [f.factura, f.proveedor])]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return blob.includes(qBusca);
+  };
+  const esPendiente = (it) => {
+    const c = clasificarEntrada(it);
+    return c === "sin" || c === "no" || c === "mixta";
+  };
+  const esEntrada = (it) => {
+    const c = clasificarEntrada(it);
+    return c === "si" || c === "mixta";
+  };
+  const candidatos = [...deEsta, ...sinAsignar, ...(verOtras ? deOtras : [])]
+    .filter((it) => verProcesadas || !it.procesada);
+  const nPend = candidatos.filter(esPendiente).length;
+  const nEnt = candidatos.filter(esEntrada).length;
+  const visibles = candidatos
+    .filter((it) => (vista === "todas" ? true : vista === "entradas" ? esEntrada(it) : esPendiente(it)))
+    .filter(coincideBusca)
     .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
   const pendientesEsta = deEsta.filter((it) => !it.procesada).length;
+  const pill = (id, label) => `rounded-full px-2.5 py-0.5 font-semibold border ${vista === id ? "bg-purple-600 text-white border-purple-600" : "bg-white text-slate-600 border-slate-300 hover:bg-slate-50"}`;
 
   return (
     <div className="mt-4 bg-white border border-slate-200 rounded-lg">
@@ -3071,201 +3174,178 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
       </button>
       {abierta && (
         <div className="px-4 pb-3">
-          <div className="flex flex-wrap items-center gap-3 text-[12px] mb-2">
-            <label className="flex items-center gap-1">Últimos
-              <select value={dias} onChange={(e) => ampliarVentana(Number(e.target.value))} className="border border-slate-300 rounded px-1 py-0.5">
+          <div className="flex flex-wrap items-center gap-2 text-[12px] mb-2">
+            <div className="relative">
+              <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                value={busca}
+                onChange={(e) => setBusca(e.target.value)}
+                placeholder="Proveedor, nº de factura o asunto"
+                className="border border-slate-300 rounded pl-7 pr-2 py-1 w-64 max-w-full"
+              />
+            </div>
+            <button type="button" onClick={() => setVista("pendientes")} className={pill("pendientes")}>Pendientes {nPend}</button>
+            <button type="button" onClick={() => setVista("entradas")} className={pill("entradas")}>Entradas {nEnt}</button>
+            <button type="button" onClick={() => setVista("todas")} className={pill("todas")}>Todas</button>
+            <button
+              type="button"
+              onClick={() => setVerOtras((v) => !v)}
+              className={`rounded-full px-2.5 py-0.5 font-semibold border ${verOtras ? "bg-slate-700 text-white border-slate-700" : "bg-white text-slate-600 border-slate-300 hover:bg-slate-50"}`}
+            >
+              Otras empresas {deOtras.length}
+            </button>
+            <label className="flex items-center gap-1 text-slate-500">Últimos
+              <select value={dias} onChange={(e) => ampliarVentana(Number(e.target.value))} className="border border-slate-300 rounded px-1 py-0.5 bg-white">
                 {[1, 3, 7, 15, 30, 60].map((d) => <option key={d} value={d}>{d} día{d > 1 ? "s" : ""}</option>)}
-              </select>
-            </label>
-            <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={verOtras} onChange={(e) => setVerOtras(e.target.checked)} /> Ver también las de otras empresas ({deOtras.length})</label>
-            <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={verProcesadas} onChange={(e) => setVerProcesadas(e.target.checked)} /> Ver ocultadas</label>
-            <label className="flex items-center gap-1">Entrada
-              <select value={filtroEntrada} onChange={(e) => setFiltroEntrada(e.target.value)} className="border border-slate-300 rounded px-1 py-0.5">
-                <option value="todas">Todas</option>
-                <option value="entradas">Entradas</option>
-                <option value="no">No entradas</option>
               </select>
             </label>
             <button onClick={() => cargar()} disabled={sincronizando} className="flex items-center gap-1 text-purple-700 hover:underline disabled:opacity-50">
               <RefreshCw size={12} className={sincronizando ? "animate-spin" : ""} /> {sincronizando ? "Buscando nuevos…" : "Buscar nuevos"}
             </button>
-            <span className="text-slate-400 ml-auto">Pulsa una fila sin leer: se lee minimizada, en segundo plano. Cuando termine, pulsa otra vez para abrirla.</span>
+            <button type="button" onClick={() => setVerProcesadas((v) => !v)} className={`hover:underline ${verProcesadas ? "text-purple-700 font-semibold" : "text-slate-400"}`}>
+              {verProcesadas ? "Ocultar descartadas" : "Ver descartadas"}
+            </button>
+            <span className="text-slate-400">Pulsa una fila para leerla. Cuando termine, púlsala otra vez para abrirla.</span>
           </div>
           {error && <div className="text-[12px] text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-2">{error}</div>}
           {cargando && !datos && <div className="text-[12px] text-slate-400">Leyendo el buzón por primera vez…</div>}
           {sincronizando && datos && <div className="text-[12px] text-purple-700 mb-1">Buscando correos nuevos{horaActualizacion ? ` desde las ${horaActualizacion}` : ""}… La lista guardada sigue visible.</div>}
-          {datos && visibles.length === 0 && <div className="text-[12px] text-slate-400">{filtroEntrada === "todas" ? `No hay facturas pendientes de ${empresa?.displayName || "esta empresa"} en este periodo.` : "Ninguna factura con este filtro de entrada."}</div>}
+          {datos && visibles.length === 0 && (
+            <div className="text-[12px] text-slate-400">
+              {qBusca
+                ? "Ninguna factura coincide con la búsqueda."
+                : vista === "entradas"
+                  ? "Ninguna factura entrada en este periodo."
+                  : vista === "todas"
+                    ? "No hay facturas en este periodo."
+                    : `No hay facturas pendientes de ${empresa?.displayName || "esta empresa"} en este periodo.`}
+            </div>
+          )}
           {visibles.length > 0 && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-[12px] min-w-[1180px]">
-                <thead>
-                  <tr className="text-left text-slate-500 border-b border-slate-200">
-                    <th className="py-1 pr-2 whitespace-nowrap">Fecha de la factura</th>
-                    <th className="py-1 pr-2 whitespace-nowrap">Nº de factura</th>
-                    <th className="py-1 pr-2">Proveedor</th>
-                    <th className="py-1 pr-2">Se puede entrar / Errores detectados</th>
-                    <th className="py-1 pr-2 whitespace-nowrap">Entrada</th>
-                    <th className="py-1 pr-2 text-right whitespace-nowrap">Base imponible</th>
-                    <th className="py-1 pr-2 text-right">IVA</th>
-                    <th className="py-1 pr-2 text-right whitespace-nowrap">Importe total</th>
-                    <th className="py-1 pr-1"></th>
-                    <th className="py-1 pr-2"></th>
-                    <th className="py-1"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibles.map((it) => {
-                    const otra = it.empresaId && it.empresaId !== actualId;
-                    const clave = `${it.msg}|${it.att}`;
-                    const leyendoEsta = leyendoMap[clave];
-                    const estaAbierta = filaAbierta === clave;
-                    const deEsta = facturasDeFila(facturas, it);
-                    const errorEsta = errorFila?.clave === clave ? errorFila.texto : null;
-                    const panel = estaAbierta && (deEsta.length > 0 || errorEsta);
-                    const leidas = (deEsta.length ? deEsta : (lecturas[clave] || [])).map(resumenLectura);
-                    const leidasFiltro = filtroEntrada === "entradas"
-                      ? leidas.filter(estaEntrada)
-                      : filtroEntrada === "no"
-                        ? leidas.filter((f) => !estaEntrada(f))
-                        : leidas;
-                    const tieneLectura = leidasFiltro.length > 0;
-                    const lineas = tieneLectura ? leidasFiltro : [null];
-                    const pedidosNotas = [...new Set(leidas.flatMap((f) => f.pedidos || []))];
-                    const cuentaNotas = notasMap ? pedidosNotas.reduce((n, p) => n + ((notasMap[p] || []).length), 0) : 0;
-                    const extraEsta = extra?.clave === clave ? extra.tipo : null;
-                    const btnExtra = (activo) => `inline-flex items-center gap-1 text-[11px] font-semibold rounded px-2 py-1 border disabled:opacity-40 ${activo ? "bg-purple-600 text-white border-purple-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`;
-                    const abrir = () => { if (!otra && !it.procesada) onAbrir?.(it); };
-                    const celdaAcciones = (rowSpan) => (
-                      <>
-                        <td rowSpan={rowSpan} className="py-1 pr-1 whitespace-nowrap align-top">
-                          <button type="button" onClick={(e) => abrirExtra(e, clave, "correo")} className={btnExtra(extraEsta === "correo")}>
-                            <Mail size={12} /> Correo
-                          </button>
-                        </td>
-                        <td rowSpan={rowSpan} className="py-1 pr-2 whitespace-nowrap align-top">
-                          <button type="button" onClick={(e) => abrirExtra(e, clave, "notas")} disabled={!tieneLectura} title={tieneLectura ? "Notas del pedido" : "Las notas aparecen cuando la factura está leída"} className={btnExtra(extraEsta === "notas")}>
-                            <StickyNote size={12} /> Notas{cuentaNotas > 0 ? ` ${cuentaNotas}` : ""}
-                          </button>
-                        </td>
-                        <td rowSpan={rowSpan} className="py-1 text-right whitespace-nowrap align-top">
-                          {it.procesada ? (
-                            <button onClick={(e) => { e.stopPropagation(); marcar(it, true); }} className="text-[11px] text-slate-500 hover:underline" title="Volver a mostrarla">ocultada · mostrar</button>
-                          ) : otra ? (
-                            <span className="text-[11px] text-slate-400">Cambia a {it.empresaNombre} para verla</span>
-                          ) : (
-                            <button onClick={(e) => { e.stopPropagation(); marcar(it); }} className="text-[11px] text-slate-500 hover:underline" title="No mostrar esta factura">descartar</button>
-                          )}
-                        </td>
-                      </>
-                    );
-                    return (
-                      <Fragment key={clave}>
+            <div className="text-[12px] divide-y divide-slate-100">
+              {visibles.map((it) => {
+                const otra = it.empresaId && it.empresaId !== actualId;
+                const clave = `${it.msg}|${it.att}`;
+                const leyendoEsta = leyendoMap[clave];
+                const estaAbierta = filaAbierta === clave;
+                const deFila = facturasDeFila(facturas, it);
+                const errorEsta = errorFila?.clave === clave ? errorFila.texto : null;
+                const panel = estaAbierta && (deFila.length > 0 || errorEsta);
+                const leidas = leidasDe(it);
+                const leidasFiltro = vista === "entradas"
+                  ? leidas.filter(estaEntrada)
+                  : vista === "pendientes"
+                    ? leidas.filter((f) => !estaEntrada(f))
+                    : leidas;
+                const tieneLectura = leidasFiltro.length > 0;
+                const lineas = leidasFiltro.length ? leidasFiltro : (leidas.length ? [] : [null]);
+                const pedidosNotas = [...new Set(leidas.flatMap((f) => f.pedidos || []))];
+                const cuentaNotas = notasMap ? pedidosNotas.reduce((n, p) => n + ((notasMap[p] || []).length), 0) : 0;
+                const extraEsta = extra?.clave === clave ? extra.tipo : null;
+                const btnExtra = (activo) => `inline-flex items-center gap-1 text-[11px] font-semibold rounded px-2 py-1 border disabled:opacity-40 ${activo ? "bg-purple-600 text-white border-purple-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`;
+                const abrir = () => { if (!otra && !it.procesada) onAbrir?.(it); };
+                const marca = estaAbierta || leyendoEsta ? "border-l-4 border-purple-500 pl-2" : "";
+                return (
+                  <div key={clave} className={`${it.procesada ? "opacity-60" : ""} ${estaAbierta || leyendoEsta ? "bg-purple-50" : ""}`}>
+                    <div className="flex items-start gap-2 py-1.5">
+                      <div className={`flex-1 min-w-0 ${marca}`}>
                         {lineas.map((f, idx) => {
-                          const ultima = idx === lineas.length - 1;
-                          const clase = `${panel || extraEsta || !ultima ? "" : "border-b border-slate-100"} ${it.procesada ? "opacity-60" : ""} ${estaAbierta || leyendoEsta ? "bg-purple-50" : ""} ${otra || it.procesada ? "" : "cursor-pointer hover:bg-purple-50"}`;
                           if (!f) {
                             return (
-                              <tr key={`${clave}-sin`} onClick={abrir} className={clase}>
-                                <td colSpan={4} className={`py-1 pr-2 ${estaAbierta || leyendoEsta ? "border-l-4 border-purple-500 pl-2" : ""}`}>
-                                  <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
-                                    <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Sin leer</span>
-                                    <span className="text-slate-500 whitespace-nowrap">{new Date(it.fecha).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</span>
-                                    <span className="truncate max-w-[180px]" title={it.de}>{it.deNombre || it.de}</span>
-                                    <span className="truncate max-w-[320px]" title={it.asunto}>{it.asunto}</span>
-                                    <span className="text-[10px] text-slate-400 truncate max-w-[220px]">{it.nombre}</span>
-                                    {it.empresaId ? (
-                                      <span className={`text-[10px] font-semibold rounded px-1.5 py-0.5 ${otra ? "bg-slate-100 text-slate-500" : "bg-emerald-100 text-emerald-800"}`}>{it.empresaNombre} · {it.cif}</span>
-                                    ) : (
-                                      <span className="text-[10px] font-semibold rounded px-1.5 py-0.5 bg-amber-100 text-amber-800" title={it.sinTexto ? "PDF escaneado: no se puede leer el CIF automáticamente" : "No aparece ningún CIF de las empresas"}>
-                                        {it.variosCif ? `Varios CIF (${it.cif}) · revisar` : it.sinTexto ? "Escaneado · revisar CIF" : "CIF no encontrado"}
-                                      </span>
-                                    )}
-                                  </div>
-                                  {leyendoEsta && (
-                                    <div className="mt-0.5 flex items-center gap-1 text-[11px] font-medium text-purple-800">
-                                      <Loader2 size={12} className="animate-spin" /> {leyendoEsta} · sigue en segundo plano
-                                    </div>
+                              <div key={`${clave}-sin`} onClick={abrir} className={otra || it.procesada ? "" : "cursor-pointer"}>
+                                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                                  <span className="inline-flex text-[11px] font-semibold rounded px-1.5 py-0.5 bg-slate-100 text-slate-600">Sin leer</span>
+                                  <span className="text-slate-500 whitespace-nowrap">{new Date(it.fecha).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</span>
+                                  <span className="truncate max-w-[220px]" title={it.de}>{it.deNombre || it.de}</span>
+                                  <span className="min-w-0 truncate" title={it.asunto}>{it.asunto}</span>
+                                  <span className="text-[10px] text-slate-400 truncate max-w-[180px]">{it.nombre}</span>
+                                  {it.empresaId ? (
+                                    <span className={`text-[10px] font-semibold rounded px-1.5 py-0.5 ${otra ? "bg-slate-100 text-slate-500" : "bg-emerald-100 text-emerald-800"}`}>{it.empresaNombre}</span>
+                                  ) : (
+                                    <span className="text-[10px] font-semibold rounded px-1.5 py-0.5 bg-amber-100 text-amber-800" title={it.sinTexto ? "PDF escaneado: no se puede leer el CIF automáticamente" : "No aparece ningún CIF de las empresas"}>
+                                      {it.variosCif ? `Varios CIF · revisar` : it.sinTexto ? "Escaneado · revisar CIF" : "CIF no encontrado"}
+                                    </span>
                                   )}
-                                  {!leyendoEsta && errorEsta && !estaAbierta && (
-                                    <div className="mt-0.5 text-[11px] text-red-700">No se ha podido leer: {errorEsta}</div>
-                                  )}
-                                </td>
-                                <td className="py-1 pr-2 whitespace-nowrap text-slate-400">Sin leer</td>
-                                <td colSpan={3}></td>
-                                {celdaAcciones(1)}
-                              </tr>
+                                </div>
+                              </div>
                             );
                           }
-                          const estado = estadoLectura(f);
-                          const entrada = marcaEntrada(f);
+                          const estado = estadoCorto(f);
                           return (
-                            <tr key={`${clave}-${idx}-${f.factura || "fac"}`} onClick={abrir} className={clase}>
-                              <td className={`py-1 pr-2 whitespace-nowrap text-slate-800 ${idx === 0 && (estaAbierta || leyendoEsta) ? "border-l-4 border-purple-500 pl-2" : ""}`}>{fmtFechaFactura(f.fecha)}</td>
-                              <td className="py-1 pr-2 whitespace-nowrap font-medium text-slate-800" title={f.factura || ""}>{f.factura || "—"}</td>
-                              <td className="py-1 pr-2 max-w-[200px] truncate text-slate-800" title={f.proveedor || ""}>{f.proveedor || "—"}</td>
-                              <td className={`py-1 pr-2 max-w-[280px] ${estado.tono}`} title={estado.texto}>
-                                {estado.texto}
-                                {idx === 0 && leyendoEsta && (
-                                  <div className="mt-0.5 flex items-center gap-1 text-[11px] font-medium text-purple-800">
-                                    <Loader2 size={12} className="animate-spin" /> {leyendoEsta}
-                                  </div>
-                                )}
-                                {idx === 0 && !leyendoEsta && errorEsta && !estaAbierta && (
-                                  <div className="mt-0.5 text-[11px] font-normal text-red-700">No se ha podido leer: {errorEsta}</div>
-                                )}
-                              </td>
-                              <td className={`py-1 pr-2 whitespace-nowrap ${entrada.tono}`}>{entrada.texto}</td>
-                              <td className="py-1 pr-2 text-right whitespace-nowrap text-slate-800">{moneyFactura(f.baseImponible)}</td>
-                              <td className="py-1 pr-2 text-right whitespace-nowrap text-slate-800">{moneyFactura(ivaFactura(f))}</td>
-                              <td className="py-1 pr-2 text-right whitespace-nowrap font-semibold text-slate-800">{moneyFactura(f.importeTotal)}</td>
-                              {idx === 0 ? celdaAcciones(lineas.length) : null}
-                            </tr>
+                            <div key={`${clave}-${idx}-${f.factura || "fac"}`} onClick={abrir} className={`py-0.5 ${otra || it.procesada ? "" : "cursor-pointer"}`}>
+                              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+                                <span className={`inline-flex text-[11px] font-semibold rounded px-1.5 py-0.5 ${estado.clase}`}>{estado.texto}</span>
+                                <span className="whitespace-nowrap text-slate-700">{fmtFechaFactura(f.fecha)}</span>
+                                <span className="font-medium text-slate-800" title={f.factura || ""}>{f.factura || "—"}</span>
+                                <span className="text-slate-800 truncate max-w-[280px]" title={f.proveedor || ""}>{f.proveedor || "—"}</span>
+                                <span className="ml-auto font-semibold text-slate-800 whitespace-nowrap">{moneyFactura(f.importeTotal)}</span>
+                                <span className="text-slate-500 whitespace-nowrap">Base {moneyFactura(f.baseImponible)} · IVA {moneyFactura(ivaFactura(f))}</span>
+                              </div>
+                              {estado.detalle && (
+                                <div className="text-[11px] text-red-800 mt-0.5" title={estado.detalle}>{estado.detalle}</div>
+                              )}
+                            </div>
                           );
                         })}
-                        {extraEsta && (
-                          <tr className="bg-slate-50">
-                            <td colSpan={11} className="px-3 py-2 border-l-4 border-purple-200">
-                              <div onClick={(e) => e.stopPropagation()}>
-                                {extraEsta === "correo" && <PanelCorreoFila it={it} />}
-                                {extraEsta === "notas" && (
-                                  <>
-                                    {notasFallo && <div className="text-[12px] text-red-700 mb-1">{notasFallo}</div>}
-                                    {notasCargando && !notasMap ? (
-                                      <div className="text-[12px] text-slate-400">Cargando notas…</div>
-                                    ) : (
-                                      <PanelNotasFila
-                                        pedidos={pedidosNotas}
-                                        notasMap={notasMap || {}}
-                                        onGuardada={(pedido, lista) => setNotasMap((prev) => ({ ...(prev || {}), [pedido]: lista }))}
-                                      />
-                                    )}
-                                  </>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
+                        {leyendoEsta && (
+                          <div className="mt-0.5 flex items-center gap-1 text-[11px] font-medium text-purple-800">
+                            <Loader2 size={12} className="animate-spin" /> {leyendoEsta} · sigue en segundo plano
+                          </div>
                         )}
-                        {panel && (
-                          <tr ref={estaAbierta ? filaRef : null} className="bg-purple-50">
-                            <td colSpan={11} className="p-0 border-l-4 border-purple-500">
-                              <div className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
-                                {errorEsta && (
-                                  <div className="text-[13px] text-red-700">Error leyendo el documento: {errorEsta}</div>
-                                )}
-                                {deEsta.length > 0 && (
-                                  <div className="space-y-3">
-                                    {deEsta.map((f, i) => renderFactura(f, i))}
-                                  </div>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
+                        {!leyendoEsta && errorEsta && !estaAbierta && (
+                          <div className="mt-0.5 text-[11px] text-red-700">No se ha podido leer: {errorEsta}</div>
                         )}
-                      </Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button type="button" onClick={(e) => abrirExtra(e, clave, "correo")} className={btnExtra(extraEsta === "correo")}>
+                          <Mail size={12} /> Correo
+                        </button>
+                        <button type="button" onClick={(e) => abrirExtra(e, clave, "notas")} disabled={!tieneLectura} title={tieneLectura ? "Notas del pedido" : "Las notas aparecen cuando la factura está leída"} className={btnExtra(extraEsta === "notas")}>
+                          <StickyNote size={12} /> Notas{cuentaNotas > 0 ? ` ${cuentaNotas}` : ""}
+                        </button>
+                        {it.procesada ? (
+                          <button onClick={(e) => { e.stopPropagation(); marcar(it, true); }} className="text-[11px] text-slate-500 hover:underline" title="Volver a mostrarla">mostrar</button>
+                        ) : otra ? (
+                          <span className="text-[11px] text-slate-400 max-w-[120px] text-right">Cambia a {it.empresaNombre}</span>
+                        ) : (
+                          <button onClick={(e) => { e.stopPropagation(); marcar(it); }} className="text-[11px] text-slate-500 hover:underline" title="No mostrar esta factura">descartar</button>
+                        )}
+                      </div>
+                    </div>
+                    {extraEsta && (
+                      <div className="px-3 py-2 mb-1 bg-slate-50 border-l-4 border-purple-200" onClick={(e) => e.stopPropagation()}>
+                        {extraEsta === "correo" && <PanelCorreoFila it={it} />}
+                        {extraEsta === "notas" && (
+                          <>
+                            {notasFallo && <div className="text-[12px] text-red-700 mb-1">{notasFallo}</div>}
+                            {notasCargando && !notasMap ? (
+                              <div className="text-[12px] text-slate-400">Cargando notas…</div>
+                            ) : (
+                              <PanelNotasFila
+                                pedidos={pedidosNotas}
+                                notasMap={notasMap || {}}
+                                onGuardada={(pedido, lista) => setNotasMap((prev) => ({ ...(prev || {}), [pedido]: lista }))}
+                              />
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {panel && (
+                      <div ref={estaAbierta ? filaRef : null} className="px-3 py-2 border-l-4 border-purple-500" onClick={(e) => e.stopPropagation()}>
+                        {errorEsta && (
+                          <div className="text-[13px] text-red-700">Error leyendo el documento: {errorEsta}</div>
+                        )}
+                        {deFila.length > 0 && (
+                          <div className="space-y-3">
+                            {deFila.map((f, i) => renderFactura(f, i))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -3274,9 +3354,236 @@ function BandejaFacturas({ onAbrir, leyendoMap = {}, filaAbierta, errorFila, fac
   );
 }
 
+const ASUNTO_EXTRACTO_2026 = "Solicitud de extracto de facturación 2026 — ALSO CASALS INSTAL·LACIONS, S.L.";
+const MESES_EXTRACTO = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+
+function fechaLimiteLarga(iso) {
+  if (!iso) return "[fecha límite]";
+  const partes = String(iso).split("-");
+  const y = Number(partes[0]);
+  const m = Number(partes[1]);
+  const d = Number(partes[2]);
+  if (!y || !m || !d || !MESES_EXTRACTO[m - 1]) return "[fecha límite]";
+  return `${d} de ${MESES_EXTRACTO[m - 1]} de ${y}`;
+}
+
+function cuerpoExtractoFacturacion(fechaTexto) {
+  return "Buenos días,\n\n"
+    + "Con el fin de conciliar nuestra contabilidad, les agradeceríamos que nos enviaran el diario (o extracto) de facturación emitida a ALSO CASALS INSTAL·LACIONS, S.L. (CIF B43831593) correspondiente al ejercicio 2026, desde el 1 de enero hasta la fecha.\n\n"
+    + "Para facilitar la comprobación, les rogamos que el listado incluya, para cada documento:\n"
+    + "- Fecha de factura\n"
+    + "- Número de factura\n"
+    + "- Base imponible, IVA y total\n"
+    + "- Abonos o rectificativas emitidos, si los hubiera\n\n"
+    + `Si es posible, les agradeceríamos recibirlo en formato Excel antes del ${fechaTexto}.\n\n`
+    + "Una vez lo recibamos, lo cotejaremos con nuestro diario de compras y, en caso de detectar alguna diferencia, nos pondremos en contacto con ustedes para aclararla.\n\n"
+    + "Muchas gracias de antemano por su colaboración.";
+}
+
+function emailsDeTexto(texto) {
+  return String(texto || "")
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s));
+}
+
+function nombresProveedorPedidos(pedidos) {
+  const cols = columnasPedidos(pedidos?.headers || []);
+  if (!cols.proveedor) return [];
+  const vistos = new Set();
+  const lista = [];
+  for (const fila of pedidos?.rows || []) {
+    const nombre = String(fila[cols.proveedor] || "").trim();
+    const clave = nombre.toUpperCase();
+    if (!nombre || vistos.has(clave)) continue;
+    vistos.add(clave);
+    lista.push(nombre);
+  }
+  lista.sort((a, b) => a.localeCompare(b, "es"));
+  return lista;
+}
+
+function SolicitudExtracto({ abierto, onCerrar, pedidos, remitenteEmail }) {
+  const proveedores = useMemo(() => nombresProveedorPedidos(pedidos), [pedidos]);
+  const [proveedor, setProveedor] = useState("");
+  const [para, setPara] = useState("");
+  const [fecha, setFecha] = useState("");
+  const [asuntoTocado, setAsuntoTocado] = useState(false);
+  const [asuntoManual, setAsuntoManual] = useState(ASUNTO_EXTRACTO_2026);
+  const [cuerpo, setCuerpo] = useState(() => cuerpoExtractoFacturacion("[fecha límite]"));
+  const fechaEnCuerpo = useRef("[fecha límite]");
+  const [envio, setEnvio] = useState({ estado: "idle" });
+
+  useEffect(() => {
+    if (!abierto) return;
+    setProveedor("");
+    setPara("");
+    setFecha("");
+    setAsuntoTocado(false);
+    setAsuntoManual(ASUNTO_EXTRACTO_2026);
+    fechaEnCuerpo.current = "[fecha límite]";
+    setCuerpo(cuerpoExtractoFacturacion("[fecha límite]"));
+    setEnvio({ estado: "idle" });
+  }, [abierto]);
+
+  const asunto = asuntoTocado
+    ? asuntoManual
+    : (proveedor.trim() ? `${ASUNTO_EXTRACTO_2026} · ${proveedor.trim()}` : ASUNTO_EXTRACTO_2026);
+
+  const cambiarFecha = (iso) => {
+    setFecha(iso);
+    const nueva = fechaLimiteLarga(iso);
+    const vieja = fechaEnCuerpo.current;
+    setCuerpo((prev) => {
+      const marca = `antes del ${vieja}.`;
+      if (!prev.includes(marca)) return prev;
+      fechaEnCuerpo.current = nueva;
+      return prev.replace(marca, `antes del ${nueva}.`);
+    });
+  };
+
+  const destinatarios = emailsDeTexto(para);
+  const puedeEnviar = envio.estado !== "enviando"
+    && envio.estado !== "ok"
+    && proveedor.trim()
+    && destinatarios.length > 0
+    && fecha
+    && asunto.trim()
+    && !String(cuerpo).includes("[fecha límite]");
+
+  const enviar = async () => {
+    if (!puedeEnviar) return;
+    setEnvio({ estado: "enviando" });
+    try {
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: destinatarios,
+          asunto: asunto.trim(),
+          cuerpoHtml: htmlPerEnviar(cuerpo),
+          incluirFirma: true,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      setEnvio({ estado: "ok", de: json.de });
+    } catch (err) {
+      setEnvio({ estado: "error", error: err.message || String(err) });
+    }
+  };
+
+  if (!abierto) return null;
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-900/40 p-4"
+      onClick={() => { if (envio.estado !== "enviando") onCerrar(); }}
+    >
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="px-4 py-3 border-b border-slate-200 text-sm font-semibold text-slate-800">
+          Solicitud de extracto de facturación 2026
+        </div>
+        <div className="px-4 py-3 space-y-3 text-sm">
+          <div>
+            <div className="text-[11px] text-slate-500">De</div>
+            <div className="text-slate-800">{remitenteEmail || "Tu correo de empresa"}</div>
+          </div>
+          <label className="block">
+            <span className="text-[11px] text-slate-500">Proveedor</span>
+            <input
+              value={proveedor}
+              onChange={(e) => setProveedor(e.target.value)}
+              list="extracto-proveedores-2026"
+              placeholder="Escribe o elige el proveedor"
+              disabled={envio.estado === "enviando" || envio.estado === "ok"}
+              className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
+            />
+            <datalist id="extracto-proveedores-2026">
+              {proveedores.map((nombre) => <option key={nombre} value={nombre} />)}
+            </datalist>
+          </label>
+          <label className="block">
+            <span className="text-[11px] text-slate-500">Correo del proveedor</span>
+            <input
+              value={para}
+              onChange={(e) => setPara(e.target.value)}
+              placeholder="proveedor@empresa.com"
+              disabled={envio.estado === "enviando" || envio.estado === "ok"}
+              className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] text-slate-500">Fecha límite</span>
+            <input
+              type="date"
+              value={fecha}
+              onChange={(e) => cambiarFecha(e.target.value)}
+              disabled={envio.estado === "enviando" || envio.estado === "ok"}
+              className="mt-0.5 border border-slate-300 rounded px-2 py-1.5 text-[13px]"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] text-slate-500">Asunto</span>
+            <input
+              value={asunto}
+              onChange={(e) => { setAsuntoTocado(true); setAsuntoManual(e.target.value); }}
+              disabled={envio.estado === "enviando" || envio.estado === "ok"}
+              className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] text-slate-500">Mensaje</span>
+            <textarea
+              value={cuerpo}
+              onChange={(e) => setCuerpo(e.target.value)}
+              rows={14}
+              disabled={envio.estado === "enviando" || envio.estado === "ok"}
+              className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px] leading-relaxed"
+            />
+          </label>
+          <div className="border-t border-slate-200 pt-2">
+            <div className="text-[11px] text-slate-500 mb-1">Firma (se añade al enviar, sin adjunto)</div>
+            <div className="text-[12px] text-slate-700">Salutacions / Saludos / Best Regards.</div>
+            <img src="/firma-correo.png" alt="Firma" className="max-w-full h-auto max-h-28 object-contain object-left" />
+          </div>
+          {envio.estado === "error" && <div className="text-[12px] text-red-700">{envio.error || "No se ha podido enviar."}</div>}
+          {envio.estado === "ok" && (
+            <div className="text-[12px] text-emerald-700">
+              Enviado{envio.de ? ` desde ${envio.de}` : ""} a {destinatarios.join(", ")}.
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 border-t border-slate-200 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCerrar}
+            disabled={envio.estado === "enviando"}
+            className="text-sm text-slate-600 hover:text-slate-800 px-3 py-1.5 disabled:opacity-50"
+          >
+            {envio.estado === "ok" ? "Cerrar" : "Cancelar"}
+          </button>
+          {envio.estado !== "ok" && (
+            <button
+              type="button"
+              onClick={enviar}
+              disabled={!puedeEnviar}
+              className="flex items-center gap-1.5 text-sm font-semibold text-white bg-slate-800 hover:bg-slate-900 disabled:opacity-60 rounded-md px-3 py-1.5"
+            >
+              {envio.estado === "enviando" ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+              {envio.estado === "enviando" ? "Enviando…" : "Enviar"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 export default function FacturasCompra({ pedidos, usuario = null }) {
   const inputRef = useRef(null);
   const [subiendo, setSubiendo] = useState(false);
+  const [extractoAbierto, setExtractoAbierto] = useState(false);
   const [leyendoMap, setLeyendoMap] = useState({});
   const [filaAbierta, setFilaAbierta] = useState(null);
   const [errorFila, setErrorFila] = useState(null);
@@ -3636,14 +3943,21 @@ export default function FacturasCompra({ pedidos, usuario = null }) {
 
   return (
     <div>
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">Validación de facturas</h1>
           <p className="text-slate-500 text-sm mt-1">
             El listado sale solo. Pulsa una fila para leer ese PDF. Si trae pedido, se coteja. Si no trae pedido, se crea uno igual que la última factura de ese proveedor.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          <button
+            type="button"
+            onClick={() => setExtractoAbierto(true)}
+            className="flex items-center gap-2 text-sm font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md px-4 py-2"
+          >
+            <Mail size={15} /> Solicitud de extracto de facturación 2026
+          </button>
           <button
             onClick={() => setRegistroAbierto(true)}
             className="flex items-center gap-2 text-sm font-semibold text-slate-600 bg-white border border-slate-300 hover:bg-slate-50 rounded-md px-4 py-2"
@@ -3672,6 +3986,12 @@ export default function FacturasCompra({ pedidos, usuario = null }) {
       </div>
 
       <RegistroFacturas abierto={registroAbierto} onCerrar={() => setRegistroAbierto(false)} />
+      <SolicitudExtracto
+        abierto={extractoAbierto}
+        onCerrar={() => setExtractoAbierto(false)}
+        pedidos={pedidos}
+        remitenteEmail={remitenteEmail}
+      />
 
       <BandejaFacturas
         onAbrir={abrirDesdeBandeja}

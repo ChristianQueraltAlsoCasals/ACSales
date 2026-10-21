@@ -13,10 +13,11 @@
  * Servicio web: «JobLedgerEntries» (publicado en BC), o BC_WS_MOVSPROYECTO en
  * .env, o se busca en el catálogo (nombres tipo «Movs_proyecto»…).
  */
-module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, db, claveEmpresa }) {
+module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa }) {
   const raiz = () => `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${encodeURIComponent(EMPRESA_NOMBRE() || "")}')`;
   const leerJSON = async (base, def) => db.getDoc(claveEmpresa(base), def);
   const escribirJSON = async (base, d) => db.setDoc(claveEmpresa(base), d);
+  const { erpConfigurado, getPool, sql, esErrorConectividadErp } = require("./erp-db");
 
   let catEstado = "";
   async function catalogo(token) {
@@ -104,6 +105,43 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
       await escribirJSON("horas_tarifas", tarifas);
       res.json({ tarifas });
     } catch (e) { res.status(500).json({ error: "No se pudo guardar la tabla de tarifas.", detalle: String(e.message || e) }); }
+  });
+
+  // Partes con amianto (ALSOAPP.dbo.Parte, esAmiant=1) para el plus diario en Control de horas.
+  // Fecha del día = date_created. Solo lectura. Precio por defecto 30 €/día (editable en pantalla).
+  app.get("/api/horas/amianto", async (req, res) => {
+    const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.desde) ? req.query.desde : null;
+    const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.hasta) ? req.query.hasta : null;
+    if (!desde || !hasta) return res.status(400).json({ error: "Indica desde y hasta (AAAA-MM-DD)." });
+    if (!erpConfigurado()) return res.status(503).json({ error: "SQL del ERP (ALSOAPP) no configurado. Revisa ERP_MSSQL_* en .env y Tailscale." });
+    try {
+      const pool = await getPool();
+      const r = await pool.request()
+        .input("desde", sql.DateTime, new Date(`${desde}T00:00:00`))
+        .input("hasta", sql.DateTime, new Date(`${hasta}T23:59:59.997`))
+        .query(`
+          SELECT id, idOT, codiTreballador, treballador, codigoParte, date_created
+          FROM [ALSOAPP].[dbo].[Parte]
+          WHERE esAmiant = 1
+            AND date_created >= @desde AND date_created <= @hasta
+          ORDER BY date_created, id
+        `);
+      const partes = (r.recordset || []).map((p) => ({
+        id: String(p.id),
+        idOT: p.idOT != null ? String(p.idOT) : "",
+        codiTreballador: String(p.codiTreballador || "").trim(),
+        treballador: String(p.treballador || "").trim(),
+        codigoParte: String(p.codigoParte || "").trim(),
+        fecha: p.date_created ? new Date(p.date_created).toISOString().slice(0, 10) : "",
+      })).filter((p) => p.fecha && p.codiTreballador);
+      res.json({ desde, hasta, precioDefecto: 30, partes });
+    } catch (e) {
+      console.error("Error /api/horas/amianto:", e);
+      const msg = esErrorConectividadErp(e)
+        ? "No se pudo conectar al SQL de producción (¿Tailscale activo?)."
+        : "No se pudieron leer los partes de amianto.";
+      res.status(esErrorConectividadErp(e) ? 503 : 500).json({ error: msg, detalle: String(e.message || e) });
+    }
   });
 
   app.post("/api/horas/cargar", async (req, res) => {
@@ -221,6 +259,137 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
     } catch (e) {
       console.error("Error /api/horas/cargar:", e);
       res.status(500).json({ error: "No se pudieron cargar las horas de BC.", detalle: String(e.message || e) });
+    }
+  });
+
+  // Horas reales de Movs. proyecto. Solo recurso y tipo de movimiento Uso.
+  app.get("/api/horas/mano-obra", async (req, res) => {
+    const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.desde) ? req.query.desde : null;
+    const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.hasta) ? req.query.hasta : null;
+    if (!desde || !hasta) return res.status(400).json({ error: "Indica las fechas desde y hasta." });
+    if (desde > hasta) return res.status(400).json({ error: "La fecha inicial no puede ser posterior a la fecha final." });
+    try {
+      const token = await obtenerTokenBC();
+      const cat = await catalogo(token);
+      const candidatos = [...new Set([
+        process.env.BC_WS_MOVSPROYECTO,
+        "Movs_proyecto_Excel",
+        ...cat.filter((n) => /mov|ledger/i.test(n) && /proyect|job/i.test(n) && n !== "JobLedgerEntries"),
+      ].filter(Boolean))];
+      let brutas = null;
+      let servicio = null;
+      for (const nombre of candidatos) {
+        const base = `${raiz()}/${encodeURIComponent(nombre)}`;
+        try {
+          const sel = nombre === "Movs_proyecto_Excel" ? "&$select=Entry_No,Posting_Date,Entry_Type,Document_No,Job_No,Job_Task_No,Type,No,Description,Work_Type_Code,Unit_of_Measure_Code,Quantity,Total_Cost_LCY" : "";
+          try {
+            brutas = await leerTodo(`${base}?$filter=${encodeURIComponent(`Posting_Date ge ${desde} and Posting_Date le ${hasta}`)}${sel}`, token);
+          } catch (e) {
+            if (e.status !== 400) throw e;
+            brutas = await leerTodo(base, token);
+          }
+          if (brutas.length && !("No" in brutas[0])) { brutas = null; continue; }
+          servicio = nombre;
+          break;
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
+      }
+      if (!servicio) return res.status(404).json({ error: "No encuentro el servicio de Movs. proyecto publicado." });
+
+      const filas = [];
+      for (const f of brutas) {
+        const fecha = String(campo(f, ["Posting_Date", "Fecha_registro", "PostingDate"])).slice(0, 10);
+        if (!fecha || fecha < desde || fecha > hasta) continue;
+        const tipo = String(campo(f, ["Type", "Tipo"]));
+        if (tipo && !/resour|recurs/i.test(tipo)) continue;
+        const tipoMov = String(campo(f, ["Entry_Type", "Tipo_movimiento", "EntryType"])).trim();
+        if (!/^(usage|uso)$/i.test(tipoMov)) continue;
+        filas.push({
+          recurso: String(campo(f, ["No", "No_", "Nº"])),
+          desc: String(campo(f, ["Description", "Descripción", "Descripcion"])),
+          ot: String(campo(f, ["Job_No", "No_proyecto", "JobNo"])),
+          horas: Number(campo(f, ["Quantity", "Cantidad"])) || 0,
+        });
+      }
+
+      const nombres = {};
+      let avisoNombre = "";
+      const servRec = elegir(cat, [process.env.BC_WS_RECURSOS, "Ficha_recurso_Excel", "Recursos", "Resource_List", "Lista_recursos", "Resources"], [/recurs|resource/i]);
+      if (servRec) {
+        try {
+          const recursos = await leerTodo(`${raiz()}/${encodeURIComponent(servRec)}?$select=No,Name`, token, 20000);
+          for (const r of recursos) {
+            const no = String(campo(r, ["No", "No_", "Nº"]));
+            if (!no) continue;
+            nombres[no] = String(campo(r, ["Name", "Nombre"]) || no);
+          }
+        } catch (e) {
+          if (e.status !== 400) throw e;
+          avisoNombre = "No se ha podido leer el nombre del recurso.";
+        }
+      }
+
+      const ots = {};
+      let avisoOt = "";
+      const servOT = elegir(cat, [process.env.BC_WS_JOBLIST, "Job_List"], [/job|proyect/i, /list|lista/i]);
+      const otsUsadas = new Set(filas.map((f) => f.ot).filter(Boolean));
+      if (servOT && otsUsadas.size) {
+        try {
+          let trabajos = null;
+          try {
+            trabajos = await leerTodo(`${raiz()}/${encodeURIComponent(servOT)}?$select=No,Bill_to_Name,Global_Dimension_1_Code`, token, 100000);
+          } catch (e) {
+            if (e.status !== 400) throw e;
+            trabajos = await leerTodo(`${raiz()}/${encodeURIComponent(servOT)}?$select=No,Bill_to_Name`, token, 100000);
+          }
+          for (const j of trabajos) {
+            const no = String(j.No || "");
+            if (!otsUsadas.has(no)) continue;
+            ots[no] = {
+              cliente: String(j.Bill_to_Name || ""),
+              dimension: String(j.Global_Dimension_1_Code || ""),
+            };
+          }
+        } catch (e) {
+          avisoOt = "No se ha podido leer el cliente ni la dimensión de la OT.";
+          console.warn("[horas/mano-obra] Job_List:", e.message);
+        }
+      } else if (!servOT) {
+        avisoOt = "No encuentro publicada la lista de obras (Job_List).";
+      }
+
+      const grupos = new Map();
+      for (const f of filas) {
+        const ot = ots[f.ot] || { cliente: "", dimension: "" };
+        const clave = [f.recurso, f.ot, ot.cliente, ot.dimension].join("|");
+        const prev = grupos.get(clave) || {
+          recurso: f.recurso,
+          nombre: nombres[f.recurso] || f.desc || f.recurso,
+          ot: f.ot,
+          cliente: ot.cliente,
+          dimension: ot.dimension,
+          horas: 0,
+        };
+        prev.horas += f.horas;
+        grupos.set(clave, prev);
+      }
+      const salida = [...grupos.values()]
+        .map((r) => ({ ...r, horas: Math.round(r.horas * 100) / 100 }))
+        .sort((a, b) => b.horas - a.horas || a.nombre.localeCompare(b.nombre, "es"));
+
+      console.log(`[horas/mano-obra] ${EMPRESA_NOMBRE()} ${desde}→${hasta}: ${filas.length} movimientos de uso, ${salida.length} líneas`);
+      res.json({
+        empresa: EMPRESA_NOMBRE(),
+        desde,
+        hasta,
+        servicio,
+        aviso: [avisoNombre, avisoOt].filter(Boolean).join(" "),
+        filas: salida,
+      });
+    } catch (e) {
+      console.error("Error /api/horas/mano-obra:", e);
+      res.status(500).json({ error: "No se pudieron cargar las horas.", detalle: String(e.message || e) });
     }
   });
 };

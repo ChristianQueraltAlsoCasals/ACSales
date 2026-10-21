@@ -15,6 +15,8 @@
  * Cada cambio aplicado queda anotado en Postgres (clave cambios_bc).
  */
 module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, db }) {
+  const fs = require("fs");
+  const path = require("path");
   const acfactory = require("./acfactory-client.cjs");
   const RAIZ = () => `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}`;
   const RE_EMPRESAS = () => new RegExp(process.env.IA_BC_EMPRESAS || "also|ferros|quimlab", "i");
@@ -27,6 +29,40 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
   const escribirReglas = async (lista) => db.setDoc("reglas_ia", lista);
   const reglasPara = async (empresaNombre) => (await leerReglas()).filter((r) => r.ambito === "todas" || r.ambito === empresaNombre);
   const MAX_RESULTADO = 14000; // caracteres de resultado que se devuelven a la IA
+
+  // Datos fiscales/contacto del grupo (fichas PDF, altas, correos). Fuente: data/datos_empresas_grupo.json
+  let cacheDatosGrupo = null;
+  function leerDatosEmpresasGrupo() {
+    if (cacheDatosGrupo) return cacheDatosGrupo;
+    try {
+      const p = path.join(__dirname, "..", "data", "datos_empresas_grupo.json");
+      cacheDatosGrupo = JSON.parse(fs.readFileSync(p, "utf8"));
+    } catch (e) {
+      console.warn("[ia-bc] No se pudo cargar data/datos_empresas_grupo.json:", e.message || e);
+      cacheDatosGrupo = null;
+    }
+    return cacheDatosGrupo;
+  }
+  function bloqueDatosEmpresasGrupo() {
+    const d = leerDatosEmpresasGrupo();
+    if (!d?.empresas) return "";
+    const c = d.contacto_operativo_defecto || {};
+    const a = d.empresas.also_casals || {};
+    const f = d.empresas.ferrosca || {};
+    const lineaDir = (e) =>
+      [e.direccion, e.numero, e.codigo_postal, e.localidad, e.provincia, e.pais].filter(Boolean).join(", ");
+    const lineaEnvio = (e) => {
+      if (!e?.envio) return "preguntar";
+      if (e.envio.modo) return e.envio.modo + (e.envio.nota ? ` (${e.envio.nota})` : "");
+      return [e.envio.direccion, e.envio.codigo_postal, e.envio.localidad, e.envio.provincia].filter(Boolean).join(", ");
+    };
+    return `DATOS DEL GRUPO (para rellenar fichas PDF de alta, correos o altas en BC; no inventes otros; si falta algo, pregunta):
+- Contacto operativo por defecto: ${c.nombre || "Maria Rufí Castell"} · ${c.cargo || ""} · Tel ${c.telefono || ""} · ${c.email || ""}
+- ALSO CASALS: ${a.razon_social || ""} · CIF ${a.cif || ""} · Fiscal: ${lineaDir(a)} · Email facturación ${a.email_facturacion || ""} · Albaranes ${a.email_albaranes || ""} · Web ${a.web || ""} · Envío: ${lineaEnvio(a)} · Preferencias: ${a.preferencias?.modo_facturacion || ""} · ${a.preferencias?.forma_pago || ""} · ${a.preferencias?.plazo || ""} · Marketing: ${a.preferencias?.marketing ? "Sí" : "No"} · Banco (solo giro): ${a.banco?.entidad || ""} IBAN ${a.banco?.iban || ""} BIC ${a.banco?.bic || ""}
+- FERROSCA / Ferros Coll de l'Alba: ${f.razon_social || ""} · CIF ${f.cif || ""} · Fiscal: ${lineaDir(f)} · Tel ${f.telefono || ""} · Email facturación ${f.email_facturacion || ""} · Gerente (si el formulario lo pide): ${f.gerente?.nombre || ""} DNI ${f.gerente?.dni || ""} · Envío: ${lineaEnvio(f)} · Preferencias: ${f.preferencias?.forma_pago || ""}${f.preferencias?.plazo ? ` · ${f.preferencias.plazo}` : " · plazo: preguntar"} · Banco (solo giro): ${f.banco?.entidad || ""} IBAN ${f.banco?.iban || ""} BIC ${f.banco?.bic || ""}
+
+`;
+  }
 
   // ---------- utilidades ----------
   let cacheEmpresas = null;
@@ -541,7 +577,7 @@ Qué puedes hacer:
 - CREAR PRODUCTOS/ARTÍCULOS: SOLO con proponer_producto (ACFactory → Also + Ferros + App). NUNCA uses proponer_cambio ni crees en 'items'. NO edites ni borres productos desde aquí (eso es ACFactory).
 - NO puedes borrar registros, ni registrar/postear documentos, ni lanzar acciones de BC. Si te lo piden, explica que eso se hace en BC directamente.
 
-${bloqueReglas}Aprender: cuando Maria te enseñe una forma de hacer algo que se repite («a partir de ahora…», «siempre…», «recuerda…», o te corrija algo que seguramente querrá igual la próxima vez), guárdalo con guardar_regla y díselo en una frase («📌 Apuntado: …»). Si solo es para este caso, no lo guardes.
+${bloqueReglas}${bloqueDatosEmpresasGrupo()}Aprender: cuando Maria te enseñe una forma de hacer algo que se repite («a partir de ahora…», «siempre…», «recuerda…», o te corrija algo que seguramente querrá igual la próxima vez), guárdalo con guardar_regla y díselo en una frase («📌 Apuntado: …»). Si solo es para este caso, no lo guardes.
 
 Cómo trabajar:
 - Antes de proponer un cambio, consulta el registro para tener la clave exacta y los nombres de campo reales. En la API v2.0 la clave es (id-guid). En los web services OData la clave suele ser compuesta, p.ej. Pedido_compra_Excel(Document_Type='Order',No='PC26-003403') o PurchaseLines(Document_Type='Order',Document_No='PC26-003403',Line_No=20000).

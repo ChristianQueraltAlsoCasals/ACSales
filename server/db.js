@@ -103,19 +103,24 @@ async function upsertEstadoKey(client, claveCompleta, valor) {
 }
 
 /**
- * GET estado: reconstruye bcData desde estado.bcData.<fuente>
- * (el resto de claves top-level siguen en estado.<clave>).
+ * GET estado: reconstruye bcData desde <prefijo>.bcData.<fuente>
+ * (el resto de claves top-level siguen en <prefijo>.<clave>).
+ * prefijo por defecto "estado" (= Also Casals / empresa por defecto).
+ * Otras empresas: p.ej. "estado_ferros_ca" vía claveEmpresa("estado").
  */
-async function getEstado() {
+async function getEstado(prefijo = "estado") {
+  const prefix = String(prefijo || "estado");
   const { rows } = await getPool().query(
-    `SELECT clave, valor FROM app_state WHERE clave LIKE 'estado.%'`
+    `SELECT clave, valor FROM app_state WHERE clave LIKE $1`,
+    [`${prefix}.%`]
   );
   const out = {};
   const bcData = {};
   let hasBcParts = false;
+  const sliceAt = prefix.length + 1; // "estado." → 7
 
   for (const r of rows) {
-    const rest = r.clave.slice("estado.".length);
+    const rest = r.clave.slice(sliceAt);
     if (rest === "bcData") {
       // legado: un solo blob (no debería existir tras el split)
       out.bcData = r.valor;
@@ -137,9 +142,11 @@ async function getEstado() {
 
 /**
  * POST estado: si viene bcData como objeto, se guarda UNA fila por fuente
- * (estado.bcData.pedidos_venta, …) para no superar el límite JSONB de ~256 MB.
+ * (<prefijo>.bcData.pedidos_venta, …) para no superar el límite JSONB de ~256 MB.
+ * Also Casals usa prefijo "estado" (claves actuales intactas).
  */
-async function mergeEstado(patch) {
+async function mergeEstado(patch, prefijo = "estado") {
+  const prefix = String(prefijo || "estado");
   const keys = Object.keys(patch || {});
   const client = await getPool().connect();
   const guardadas = [];
@@ -149,16 +156,16 @@ async function mergeEstado(patch) {
       const valor = patch[k];
       if (k === "bcData" && valor && typeof valor === "object" && !Array.isArray(valor)) {
         // Quitar blob monolítico si existía
-        await client.query(`DELETE FROM app_state WHERE clave = 'estado.bcData'`);
+        await client.query(`DELETE FROM app_state WHERE clave = $1`, [`${prefix}.bcData`]);
         const fuentes = Object.keys(valor);
         for (const fuente of fuentes) {
-          await upsertEstadoKey(client, `estado.bcData.${fuente}`, valor[fuente]);
+          await upsertEstadoKey(client, `${prefix}.bcData.${fuente}`, valor[fuente]);
           guardadas.push(`bcData.${fuente}`);
         }
         // Fuentes que ya no vienen en el patch: no las borramos en un merge parcial.
         // Si el cliente manda bcData completo (comportamiento actual), todas se reescriben.
       } else {
-        await upsertEstadoKey(client, `estado.${k}`, valor);
+        await upsertEstadoKey(client, `${prefix}.${k}`, valor);
         guardadas.push(k);
       }
     }
@@ -172,8 +179,9 @@ async function mergeEstado(patch) {
   return guardadas;
 }
 
-async function deleteEstado() {
-  await getPool().query(`DELETE FROM app_state WHERE clave LIKE 'estado.%'`);
+async function deleteEstado(prefijo = "estado") {
+  const prefix = String(prefijo || "estado");
+  await getPool().query(`DELETE FROM app_state WHERE clave LIKE $1`, [`${prefix}.%`]);
 }
 
 module.exports = {

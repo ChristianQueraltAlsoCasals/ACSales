@@ -46,6 +46,8 @@ CARPETA_PERFIL = CARPETA / "perfil_navegador"
 CARPETA_CAPTURAS = CARPETA / "capturas_error"
 
 PAGINA_PEDIDO_COMPRA = 50
+# Ficha de factura de compra (Purchase Invoice) — misma convención que iaBC.cjs.
+PAGINA_FACTURA_COMPRA = int(os.environ.get("BC_PAGE_FACTURA_COMPRA", "51"))
 CABECERA_BOOKMARK_HEX = "26000000008b01000000027bff"
 PUERTO = 5055
 
@@ -56,6 +58,9 @@ PUERTO = 5055
 _pagina = None
 _contexto = None
 _playwright = None
+# Fase A «Traer líneas pedido»: tras preparar la selección, esperamos
+# confirmación explícita antes de pulsar Aceptar.
+_pendiente_traer = None  # { numero_factura, seleccionadas, captura, ts }
 
 
 def url_pedido_directo(numero_pedido: str) -> str:
@@ -68,6 +73,18 @@ def url_pedido_directo(numero_pedido: str) -> str:
     return (
         f"https://businesscentral.dynamics.com/{TENANT_ID}/{ENVIRONMENT}/"
         f"?company={empresa}&page={PAGINA_PEDIDO_COMPRA}&bookmark={bookmark}"
+    )
+
+
+def url_factura_compra(numero_factura: str) -> str:
+    """Abre la ficha del borrador por filtro de Nº (más fiable que bookmark)."""
+    from urllib.parse import quote
+
+    empresa = COMPANY_NAME.replace(" ", "%20")
+    filtro_q = quote(f"'No.' IS '{numero_factura}'", safe="")
+    return (
+        f"https://businesscentral.dynamics.com/{TENANT_ID}/{ENVIRONMENT}/"
+        f"?company={empresa}&page={PAGINA_FACTURA_COMPRA}&filter={filtro_q}"
     )
 
 

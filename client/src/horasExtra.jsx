@@ -26,7 +26,33 @@ const h = (v) => (v ? (Math.round(v * 100) / 100).toLocaleString("es-ES") : "");
 const eur = (v) => (v ? v.toLocaleString("es-ES", { style: "currency", currency: "EUR" }) : "");
 const input = "border rounded px-2 py-1 text-sm";
 const norm = (s) => String(s ?? "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]/g, "");
-const normNum = (s) => String(s ?? "").trim().replace(/^0+/, "").toUpperCase();
+export const normNum = (s) => String(s ?? "").trim().replace(/^0+/, "").toUpperCase();
+export const PRECIO_AMIANTO_DEFECTO = 30;
+/** Clave de precio editable por trabajador+día (plus amianto). */
+export const claveAmianto = (recurso, fecha) => `${normNum(recurso)}|${fecha}`;
+/**
+ * Agrupa partes esAmiant=1: 1 día = 1 fila (aunque haya varios partes ese día).
+ * Devuelve Map normNum(codi) → { nombre, dias: [fecha…], porDia: { fecha: { ots, partes, nombre } } }.
+ */
+export function agruparAmiantoPorDia(partes) {
+  const out = new Map();
+  for (const p of partes || []) {
+    const rec = normNum(p.codiTreballador);
+    if (!rec || !p.fecha) continue;
+    let g = out.get(rec);
+    if (!g) { g = { nombre: p.treballador || "", dias: [], porDia: {} }; out.set(rec, g); }
+    if (!g.porDia[p.fecha]) {
+      g.porDia[p.fecha] = { ots: [], partes: [], nombre: p.treballador || g.nombre };
+      g.dias.push(p.fecha);
+    }
+    const d = g.porDia[p.fecha];
+    if (p.idOT && !d.ots.includes(p.idOT)) d.ots.push(p.idOT);
+    if (p.codigoParte && !d.partes.includes(p.codigoParte)) d.partes.push(p.codigoParte);
+    if (p.treballador) d.nombre = p.treballador;
+  }
+  for (const g of out.values()) g.dias.sort();
+  return out;
+}
 export function precio(v) {
   if (typeof v === "number") return v;
   let t = String(v ?? "").replace(/[€\s]/g, "");
@@ -186,13 +212,56 @@ function matrizATabla(matriz) {
   return { columnas, filas };
 }
 
-export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
+// Mapeo automático Excel «Precio por mano de obra» ↔ códigos BC (Also Casals).
+// Solo columnas de precio (h_…); se ignoran h_guar sin número, PLUS FEST/NOCT y los 50/20/25.
+const MAPEO_PRECIOS_BC = [
+  { cod: "H_EXTRA", re: /^h[_\s.-]*extra$/i },
+  { cod: "H_FESTIVO1", re: /^h[_\s.-]*fest(ivo)?[_\s.-]*1$/i },
+  { cod: "H_FESTIVO2", re: /^h[_\s.-]*fest(ivo)?[_\s.-]*2$/i },
+  { cod: "H_GUARDIA1", re: /^h[_\s.-]*guar(dia)?[_\s.-]*1$/i },
+  { cod: "H_GUARDIA2", re: /^h[_\s.-]*guar(dia)?[_\s.-]*2$/i },
+];
+function sugerirPreciosExcel(columnas) {
+  const out = {};
+  for (const { cod, re } of MAPEO_PRECIOS_BC) {
+    const col = columnas.find((c) => re.test(String(c).trim()));
+    if (col) out[cod] = col;
+  }
+  return out;
+}
+
+export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, amianto }) {
   const [t, setT] = useState(null); // {archivo, hoja, subido, columnas, filas, mapeo}
   const [cambios, setCambios] = useState(false);
   const [msg, setMsg] = useState("");
   const [vista, setVista] = useState("pago");
+  const [popupAmianto, setPopupAmianto] = useState(null); // { recurso, nombre, filasLocales: [{fecha, ots, partes, precio}] }
+  const [precioDefAmianto, setPrecioDefAmianto] = useState(PRECIO_AMIANTO_DEFECTO);
 
-  useEffect(() => { fetch("/api/horas/tarifas").then((r) => r.json()).then((j) => setT(j.tarifas || null)).catch(() => {}); }, []);
+  useEffect(() => { fetch("/api/horas/tarifas").then((r) => r.json()).then((j) => {
+    setT(j.tarifas || null);
+    const def = Number(j.tarifas?.mapeo?.amiantoPrecioDefecto);
+    if (def > 0) setPrecioDefAmianto(def);
+  }).catch(() => {}); }, []);
+
+  const amiantoMap = useMemo(() => agruparAmiantoPorDia(amianto?.partes), [amianto]);
+  const precioDiaAmianto = (recurso, fecha) => {
+    const overrides = t?.mapeo?.amiantoPrecios || {};
+    const k = claveAmianto(recurso, fecha);
+    const o = overrides[k];
+    if (o != null && o !== "" && isFinite(Number(o))) return Number(o);
+    return Number(t?.mapeo?.amiantoPrecioDefecto) > 0 ? Number(t.mapeo.amiantoPrecioDefecto) : precioDefAmianto;
+  };
+  const plusAmiantoDe = (recurso) => {
+    const g = amiantoMap.get(normNum(recurso));
+    if (!g?.dias?.length) return { dias: 0, importe: 0, detalle: [] };
+    const detalle = g.dias.map((fecha) => {
+      const d = g.porDia[fecha];
+      const p = precioDiaAmianto(recurso, fecha);
+      return { fecha, ots: d.ots, partes: d.partes, nombre: d.nombre || g.nombre, precio: p, total: p };
+    });
+    return { dias: detalle.length, importe: detalle.reduce((s, x) => s + x.total, 0), detalle };
+  };
 
   async function guardar(nuevo) {
     setT(nuevo);
@@ -209,15 +278,17 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
       const { hoja, matriz } = await leerFichero(file);
       const { columnas, filas } = matrizATabla(matriz);
       if (!columnas.length) throw new Error("No se ha encontrado una fila de títulos en la primera hoja.");
-      // Se conserva la relación de columnas si siguen existiendo
+      // Se conserva la relación de columnas si siguen existiendo; si falta, se sugiere el mapeo BC ↔ Excel
       const m = t?.mapeo || {};
+      const preciosPrevios = Object.fromEntries(Object.entries(m.precios || {}).filter(([, c]) => columnas.includes(c)));
       const mapeo = {
-        colRecurso: columnas.includes(m.colRecurso) ? m.colRecurso : columnas.find((c) => /^(n[ºo°.]?\s*)?(recurso|c[oó]d|codigo|n[ºo°]|num)/i.test(c)) || "",
-        colNombre: columnas.includes(m.colNombre) ? m.colNombre : columnas.find((c) => /nombre|trabajador|empleado/i.test(c)) || "",
-        precios: Object.fromEntries(Object.entries(m.precios || {}).filter(([, c]) => columnas.includes(c))),
+        colRecurso: columnas.includes(m.colRecurso) ? m.colRecurso : columnas.find((c) => /^(n[ºo°.]?\s*)?(recurso|c[oó]d|codigo|codi|n[ºo°]|num)/i.test(c)) || "",
+        colNombre: columnas.includes(m.colNombre) ? m.colNombre : columnas.find((c) => /nombre|trabajador|treballador|empleado/i.test(c)) || "",
+        precios: { ...sugerirPreciosExcel(columnas), ...preciosPrevios },
       };
       await guardar({ archivo: file.name, hoja, subido: new Date().toISOString(), columnas, filas, mapeo });
-      setMsg(`Cargado: ${filas.length} filas`);
+      const nSug = Object.keys(mapeo.precios).length;
+      setMsg(`Cargado: ${filas.length} filas${nSug ? ` · ${nSug} precios relacionados con BC` : ""}`);
     } catch (e) {
       setMsg(`✗ ${String(e.message || e).includes("fetch") || String(e.message || e).includes("import") ? "No se pudo leer el Excel (hace falta internet para abrir .xlsx). Guárdalo como CSV y súbelo." : e.message || e}`);
     }
@@ -229,7 +300,6 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
     a.download = nombre;
     a.click();
   }
-
   // ----- Cálculo del pago -----
   const pago = useMemo(() => {
     if (!t?.columnas?.length) return null;
@@ -259,13 +329,80 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
         const p = fila ? precio(fila[precios[c]]) : 0;
         return { c, horas: hh, ajuste: ajustesH[c] || 0, precio: p, importe: hh * p };
       });
-      return { tr, fila, lineas, total: lineas.reduce((s, l) => s + l.importe, 0) };
+      const ami = plusAmiantoDe(tr.recurso);
+      const totalHoras = lineas.reduce((s, l) => s + l.importe, 0);
+      return { tr, fila, lineas, amianto: ami, total: totalHoras + ami.importe };
     });
     return { cods, filas };
-  }, [t, trabajadores, ajustes, desde, hasta]);
+  }, [t, trabajadores, ajustes, desde, hasta, amiantoMap, precioDefAmianto]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const setMapeo = (m) => guardar({ ...t, mapeo: { ...(t.mapeo || {}), ...m } });
   const nombreCod = (c) => (c === "__exceso" ? "Exceso sobre jornada (no declarado)" : c);
+
+  function abrirPopupAmianto(p) {
+    const ami = p.amianto || plusAmiantoDe(p.tr.recurso);
+    if (!ami.dias) return;
+    setPopupAmianto({
+      recurso: p.tr.recurso,
+      nombre: p.tr.nombre,
+      filasLocales: ami.detalle.map((d) => ({ ...d, precio: String(d.precio) })),
+    });
+  }
+  async function guardarPopupAmianto() {
+    if (!popupAmianto || !t) return;
+    const precios = { ...(t.mapeo?.amiantoPrecios || {}) };
+    for (const f of popupAmianto.filasLocales) {
+      const n = Number(String(f.precio).replace(",", "."));
+      precios[claveAmianto(popupAmianto.recurso, f.fecha)] = isFinite(n) && n >= 0 ? n : precioDefAmianto;
+    }
+    await guardar({ ...t, mapeo: { ...(t.mapeo || {}), amiantoPrecios: precios, amiantoPrecioDefecto: precioDefAmianto } });
+    setPopupAmianto(null);
+  }
+
+  /** Excel .xlsx de la tabla «A pagar» (misma info que en pantalla). */
+  async function descargarExcelPago() {
+    if (!pago) return;
+    setMsg("Preparando Excel…");
+    try {
+      const XLSX = await import(/* @vite-ignore */ "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs");
+      const visibles = pago.filas.filter((p) => p.lineas.some((l) => l.horas) || p.amianto?.dias);
+      const cab = ["Trabajador", "Nº recurso", ...pago.cods.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio €`, `${nombreCod(c)} importe €`]), "Días amianto", "Plus amianto €", "Total a pagar €"];
+      const filasX = visibles.map((p) => [
+        p.tr.nombre,
+        p.tr.recurso,
+        ...p.lineas.flatMap((l) => [l.horas || "", l.horas ? l.precio : "", l.horas ? Math.round(l.importe * 100) / 100 : ""]),
+        p.amianto?.dias || "",
+        p.amianto?.importe ? Math.round(p.amianto.importe * 100) / 100 : "",
+        Math.round(p.total * 100) / 100,
+      ]);
+      const totales = [
+        "Total",
+        "",
+        ...pago.cods.flatMap((c) => {
+          const imp = Math.round(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0) * 100) / 100;
+          const hh = Math.round(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.horas || 0), 0) * 100) / 100;
+          return [hh || "", "", imp || ""];
+        }),
+        pago.filas.reduce((s, p) => s + (p.amianto?.dias || 0), 0) || "",
+        Math.round(pago.filas.reduce((s, p) => s + (p.amianto?.importe || 0), 0) * 100) / 100 || "",
+        Math.round(pago.filas.reduce((s, p) => s + p.total, 0) * 100) / 100,
+      ];
+      const ws = XLSX.utils.aoa_to_sheet([
+        [`A pagar · Periodo ${fmtF(desde)} – ${fmtF(hasta)} · horas BC ± incidencias · plus amianto`],
+        cab,
+        ...filasX,
+        totales,
+      ]);
+      ws["!cols"] = cab.map((_, i) => ({ wch: i === 0 ? 32 : i === 1 ? 12 : 14 }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "A pagar");
+      XLSX.writeFile(wb, `pago_horas_${desde}_${hasta}.xlsx`);
+      setMsg("Excel descargado ✓");
+      setTimeout(() => setMsg(""), 1500);
+    } catch (e) {
+      setMsg(`✗ No se pudo crear el Excel${String(e.message || e).includes("import") || String(e.message || e).includes("fetch") ? " (hace falta internet). Usa «Descargar CSV»." : `: ${e.message || e}`}`);
+    }
+  }
 
   return (
     <div className="grid gap-4 mt-3 text-sm">
@@ -356,22 +493,35 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
                 <p className="p-4 text-slate-500">Primero, en «🔗 Relacionar columnas», indica qué columna del Excel es el precio de cada tipo de trabajo.</p>
               ) : (
                 <>
-                  <div className="flex items-center gap-2 p-2 border-b bg-slate-50 text-xs text-slate-600">
-                    Periodo {fmtF(desde)} – {fmtF(hasta)} · horas de BC (solo «Uso») ± incidencias de Configuración
-                    <button onClick={() => descargarCSV(`pago_horas_${desde}_${hasta}.csv`, ["Nº recurso", "Trabajador", ...pago.cods.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio`, `${nombreCod(c)} importe`]), "Total"],
-                      pago.filas.filter((p) => p.total > 0).map((p) => ({ "Nº recurso": p.tr.recurso, Trabajador: p.tr.nombre, ...Object.fromEntries(p.lineas.flatMap((l) => [[`${nombreCod(l.c)} horas`, h(l.horas)], [`${nombreCod(l.c)} precio`, h(l.precio)], [`${nombreCod(l.c)} importe`, h(l.importe)]])), Total: h(p.total) })))}
-                      className="ml-auto px-2 py-1 rounded border bg-white">⬇ Descargar CSV</button>
+                  <div className="flex flex-wrap items-center gap-2 p-2 border-b bg-slate-50 text-xs text-slate-600">
+                    Periodo {fmtF(desde)} – {fmtF(hasta)} · horas BC ± incidencias · plus amianto (días × €)
+                    <label className="flex items-center gap-1 ml-2">
+                      Precio amianto por defecto
+                      <input type="number" min={0} step={1} value={precioDefAmianto}
+                        onChange={(e) => setPrecioDefAmianto(Number(e.target.value) || 0)}
+                        onBlur={() => t && guardar({ ...t, mapeo: { ...(t.mapeo || {}), amiantoPrecioDefecto: precioDefAmianto } })}
+                        className="border rounded px-1 py-0.5 w-16 text-right" />
+                      €/día
+                    </label>
+                    {amianto?.error && <span className="text-amber-700">{amianto.error}</span>}
+                    <div className="ml-auto flex gap-1">
+                      <button onClick={descargarExcelPago} className="px-2 py-1 rounded border bg-white hover:bg-slate-50">⬇ Descargar Excel</button>
+                      <button onClick={() => descargarCSV(`pago_horas_${desde}_${hasta}.csv`, ["Nº recurso", "Trabajador", ...pago.cods.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio`, `${nombreCod(c)} importe`]), "Días amianto", "Plus amianto", "Total"],
+                        pago.filas.filter((p) => p.lineas.some((l) => l.horas) || p.amianto?.dias).map((p) => ({ "Nº recurso": p.tr.recurso, Trabajador: p.tr.nombre, ...Object.fromEntries(p.lineas.flatMap((l) => [[`${nombreCod(l.c)} horas`, h(l.horas)], [`${nombreCod(l.c)} precio`, h(l.precio)], [`${nombreCod(l.c)} importe`, h(l.importe)]])), "Días amianto": p.amianto?.dias || "", "Plus amianto": h(p.amianto?.importe), Total: h(p.total) })))}
+                        className="px-2 py-1 rounded border bg-white hover:bg-slate-50">⬇ CSV</button>
+                    </div>
                   </div>
                   <table className="w-full">
                     <thead>
                       <tr className="text-xs text-slate-500">
                         <th className="px-3 py-1.5 text-left">Trabajador</th>
                         {pago.cods.map((c) => <th key={c} className="px-3 text-right">{nombreCod(c)}<div className="font-normal text-[10px]">horas × precio</div></th>)}
+                        <th className="px-3 text-right">Plus amianto<div className="font-normal text-[10px]">días × €/día · clic para detalle</div></th>
                         <th className="px-3 text-right">Total a pagar</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {pago.filas.filter((p) => p.lineas.some((l) => l.horas)).map((p) => (
+                      {pago.filas.filter((p) => p.lineas.some((l) => l.horas) || p.amianto?.dias).map((p) => (
                         <tr key={p.tr.recurso} className="border-t border-slate-100">
                           <td className="px-3 py-1">
                             {p.tr.nombre} <span className="text-[10px] text-slate-400">{p.tr.recurso}</span>
@@ -383,6 +533,14 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
                               {l.ajuste ? <div className="text-[10px] text-amber-700">{l.ajuste > 0 ? "+" : ""}{h(l.ajuste)} h por incidencia</div> : null}
                             </td>
                           ))}
+                          <td className="px-3 text-right whitespace-nowrap">
+                            {p.amianto?.dias ? (
+                              <button type="button" onClick={() => abrirPopupAmianto(p)} className="hover:bg-amber-50 rounded px-1 -mx-1 text-right w-full" title="Clic para ver OT / partes y cambiar precio">
+                                {p.amianto.dias} {p.amianto.dias === 1 ? "día" : "días"}
+                                <div className="font-medium text-amber-800">{eur(p.amianto.importe)}</div>
+                              </button>
+                            ) : ""}
+                          </td>
                           <td className="px-3 text-right font-bold">{eur(p.total)}</td>
                         </tr>
                       ))}
@@ -391,6 +549,7 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
                       <tr className="border-t-2 font-semibold">
                         <td className="px-3 py-2">Total</td>
                         {pago.cods.map((c) => <td key={c} className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0))}</td>)}
+                        <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.amianto?.importe || 0), 0))}</td>
                         <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + p.total, 0))}</td>
                       </tr>
                     </tfoot>
@@ -398,6 +557,64 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta }) {
                 </>
               )}
             </section>
+          )}
+
+          {popupAmianto && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setPopupAmianto(null)}>
+              <div className="bg-white rounded-xl shadow-xl max-w-3xl w-full max-h-[85vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
+                <div className="px-4 py-3 border-b flex items-center justify-between sticky top-0 bg-white">
+                  <div>
+                    <div className="font-semibold text-slate-800">Plus amianto · {popupAmianto.nombre}</div>
+                    <div className="text-xs text-slate-500">Una fila por día (fecha de creación del parte). Precio por defecto {precioDefAmianto} €/día; cámbialo si esa OT son 50 €.</div>
+                  </div>
+                  <button type="button" onClick={() => setPopupAmianto(null)} className="text-slate-400 hover:text-slate-700 text-lg px-2">✕</button>
+                </div>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs text-slate-500 bg-slate-50">
+                      <th className="px-3 py-2">Fecha</th>
+                      <th className="px-3 py-2">OT</th>
+                      <th className="px-3 py-2">Nº parte</th>
+                      <th className="px-3 py-2">Trabajador</th>
+                      <th className="px-3 py-2 text-right">Precio €/día</th>
+                      <th className="px-3 py-2 text-right">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {popupAmianto.filasLocales.map((f, i) => {
+                      const pNum = Number(String(f.precio).replace(",", ".")) || 0;
+                      return (
+                        <tr key={f.fecha} className="border-t border-slate-100">
+                          <td className="px-3 py-1.5 whitespace-nowrap">{fmtF(f.fecha)}</td>
+                          <td className="px-3 py-1.5">{(f.ots || []).join(", ") || "—"}</td>
+                          <td className="px-3 py-1.5 font-mono text-xs">{(f.partes || []).join(", ") || "—"}</td>
+                          <td className="px-3 py-1.5">{f.nombre || popupAmianto.nombre}</td>
+                          <td className="px-3 py-1.5 text-right">
+                            <input value={f.precio} inputMode="decimal"
+                              onChange={(e) => setPopupAmianto({
+                                ...popupAmianto,
+                                filasLocales: popupAmianto.filasLocales.map((x, j) => (j === i ? { ...x, precio: e.target.value } : x)),
+                              })}
+                              className="border rounded px-2 py-1 w-20 text-right text-sm" />
+                          </td>
+                          <td className="px-3 py-1.5 text-right font-medium">{eur(pNum)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr className="border-t-2 font-semibold">
+                      <td className="px-3 py-2" colSpan={5}>Total plus amianto</td>
+                      <td className="px-3 py-2 text-right">{eur(popupAmianto.filasLocales.reduce((s, f) => s + (Number(String(f.precio).replace(",", ".")) || 0), 0))}</td>
+                    </tr>
+                  </tfoot>
+                </table>
+                <div className="px-4 py-3 border-t flex justify-end gap-2 sticky bottom-0 bg-white">
+                  <button type="button" onClick={() => setPopupAmianto(null)} className="px-3 py-1.5 rounded border text-sm">Cancelar</button>
+                  <button type="button" onClick={guardarPopupAmianto} className="px-3 py-1.5 rounded bg-blue-700 text-white text-sm">Guardar precios</button>
+                </div>
+              </div>
+            </div>
           )}
         </>
       )}

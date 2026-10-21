@@ -8,13 +8,15 @@
  * Datos: backend /api/contabilidad/ratios (movs. de contabilidad de BC de
  * la empresa seleccionada). Solo lectura.
  */
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Indicadores from "./indicadores.jsx";
 import CuadroDireccion from "./cuadroDireccion.jsx";
+import ManoObra from "./manoObra.jsx";
 
 const hoy = () => new Date().toISOString().slice(0, 10);
 const inicioAnio = (iso) => `${String(iso || hoy()).slice(0, 4)}-01-01`;
 const eur = (v) => (v == null || !isFinite(v) ? "—" : v.toLocaleString("es-ES", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }));
+const eur2 = (v) => (v == null || !isFinite(v) ? "—" : v.toLocaleString("es-ES", { style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const div = (a, b) => (b && isFinite(a / b) ? a / b : null);
 const plano = (v) => (v == null || !isFinite(v) ? "" : v.toLocaleString("es-ES", { maximumFractionDigits: 2 }));
 
@@ -367,7 +369,553 @@ function Masas({ b, bp, eContable, eContablePrev, descuadre, stockTxt, onStock, 
   );
 }
 
-export default function Ratios() {
+function numeroPizarra(texto) {
+  let s = String(texto || "").trim();
+  if (!s) return null;
+  if (s.includes(",") && s.includes(".")) {
+    if (s.lastIndexOf(",") > s.lastIndexOf(".")) s = s.replace(/\./g, "").replace(",", ".");
+    else s = s.replace(/,/g, "");
+  } else if (s.includes(",")) s = s.replace(",", ".");
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+
+function parseFormulaPizarra(texto) {
+  const t = String(texto || "")
+    .trim()
+    .toLowerCase()
+    .replace(/cuentas?/g, " ")
+    .replace(/multiplica(?:r)?\s+por/g, " * ")
+    .replace(/divid(?:e|ir)\s+(?:por|entre)/g, " / ")
+    .replace(/\bmás\b|\bmas\b/g, " + ")
+    .replace(/\bmenos\b/g, " - ")
+    .replace(/×/g, " * ")
+    .replace(/÷/g, " / ")
+    .replace(/\sx\s/g, " * ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const m = t.match(/^(\d+)\s*(?:\.\.|a|-)\s*(\d+)(?:\s*([*/+\-])\s*([+-]?\d+(?:[.,]\d+)?))?$/);
+  if (!m) return null;
+  const factor = m[4] == null ? 1 : numeroPizarra(m[4]);
+  if (factor == null) return null;
+  const desde = m[1];
+  const hasta = m[2];
+  if (desde.length !== hasta.length) return { error: "Los dos extremos tienen que tener los mismos dígitos. Ejemplo: 700..799" };
+  return { desde, hasta, op: m[3] || "*", factor, lo: Math.min(Number(desde), Number(hasta)), hi: Math.max(Number(desde), Number(hasta)) };
+}
+
+function cuentaEnRango(cta, ancho, lo, hi) {
+  const digitos = String(cta || "").replace(/\D/g, "");
+  if (!digitos) return false;
+  const pref = Number(digitos.slice(0, ancho));
+  return pref >= lo && pref <= hi;
+}
+
+function aplicarOperacion(base, op, factor) {
+  if (op === "*") return base * factor;
+  if (op === "+") return base + factor;
+  if (op === "-") return base - factor;
+  if (op === "/") return factor ? base / factor : null;
+  return null;
+}
+
+function sumarRango(mapa, formula, nombres) {
+  const lista = [];
+  for (const [cta, raw] of Object.entries(mapa || {})) {
+    if (!cuentaEnRango(cta, formula.desde.length, formula.lo, formula.hi)) continue;
+    const n = Number(raw);
+    if (!isFinite(n)) continue;
+    const importe = String(cta).startsWith("7") ? -n : n;
+    if (Math.abs(importe) < 0.005) continue;
+    lista.push({ cta, nombre: (nombres && nombres[cta]) || "", importe });
+  }
+  lista.sort((a, b) => Math.abs(b.importe) - Math.abs(a.importe) || a.cta.localeCompare(b.cta));
+  return { total: lista.reduce((s, x) => s + x.importe, 0), cuentas: lista };
+}
+
+function calcularPizarra(texto, datos) {
+  const formula = parseFormulaPizarra(texto);
+  if (!formula) return { error: "Escribe un rango y la operación. Ejemplo: 700..799 × 1,68" };
+  if (formula.error) return { error: formula.error };
+  const grupo = (s) => s[0];
+  const a = grupo(formula.desde);
+  const b = grupo(formula.hasta);
+  const pyg = (a === "6" || a === "7") && (b === "6" || b === "7");
+  const balance = a !== "6" && a !== "7" && b !== "6" && b !== "7";
+  if (!pyg && !balance) return { error: "Ese rango mezcla balance y cuenta de resultados. Sepáralo en dos líneas." };
+  const nombres = datos?.cuentas?.nombres || {};
+  const base = sumarRango(pyg ? datos?.cuentas?.pyg : datos?.cuentas?.bal, formula, nombres);
+  const prev = pyg ? sumarRango(datos?.cuentas?.pygPrev, formula, nombres) : null;
+  const resultado = aplicarOperacion(base.total, formula.op, formula.factor);
+  const resultadoPrev = prev ? aplicarOperacion(prev.total, formula.op, formula.factor) : null;
+  const signo = { "*": "×", "/": "÷", "+": "+", "-": "−" }[formula.op] || "×";
+  return { formula, base: base.total, cuentas: base.cuentas, resultado, basePrev: prev ? prev.total : null, resultadoPrev, signo, deResultados: pyg };
+}
+
+function clavePizarra(empresa) {
+  return "acsales_pizarra_ratios_v1_" + (empresa || "defecto");
+}
+
+function claveDibuixPizarra(empresa) {
+  return "acsales_pizarra_dibuix_v1_" + (empresa || "defecto");
+}
+
+const COLORES_DIBUIX = [
+  { id: "negre", hex: "#0f172a", etiqueta: "Negre" },
+  { id: "vermell", hex: "#b91c1c", etiqueta: "Vermell" },
+  { id: "blau", hex: "#1d4ed8", etiqueta: "Blau" },
+  { id: "verd", hex: "#15803d", etiqueta: "Verd" },
+  { id: "taronja", hex: "#c2410c", etiqueta: "Taronja" },
+];
+const GROSSORS = [
+  { id: "fi", px: 2, etiqueta: "Fi" },
+  { id: "mitja", px: 5, etiqueta: "Mitjà" },
+  { id: "gruixut", px: 10, etiqueta: "Gruixut" },
+];
+
+/** Lienzo tipus Paint: llapis, goma, text, desfer, netejar, PNG. Guardat per empresa. */
+function LienzoPizarra({ empresa }) {
+  const canvasRef = useRef(null);
+  const dibujando = useRef(false);
+  const ultimo = useRef(null);
+  const historial = useRef([]);
+  const [herramienta, setHerramienta] = useState("llapis"); // llapis | goma | text
+  const [color, setColor] = useState(COLORES_DIBUIX[0].hex);
+  const [grosor, setGrosor] = useState(GROSSORS[1].px);
+  const [listo, setListo] = useState(false);
+  const [textoPendiente, setTextoPendiente] = useState("");
+  const [posTexto, setPosTexto] = useState(null); // { x, y } en coords canvas
+  const [confirmarNeteja, setConfirmarNeteja] = useState(false);
+
+  const ctxDe = () => {
+    const c = canvasRef.current;
+    return c ? c.getContext("2d") : null;
+  };
+
+  const snapshot = () => {
+    const c = canvasRef.current;
+    if (!c) return;
+    historial.current.push(c.toDataURL("image/png"));
+    if (historial.current.length > 40) historial.current.shift();
+  };
+
+  const persistir = () => {
+    const c = canvasRef.current;
+    if (!c) return;
+    try {
+      localStorage.setItem(claveDibuixPizarra(empresa), c.toDataURL("image/png"));
+    } catch { /* quota / mode privat */ }
+  };
+
+  const pintarFondo = (ctx, w, h) => {
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  };
+
+  const cargarImagen = (dataUrl) =>
+    new Promise((resolve) => {
+      if (!dataUrl) {
+        resolve(false);
+        return;
+      }
+      const img = new Image();
+      img.onload = () => {
+        const c = canvasRef.current;
+        const ctx = ctxDe();
+        if (!c || !ctx) {
+          resolve(false);
+          return;
+        }
+        pintarFondo(ctx, c.width, c.height);
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        resolve(true);
+      };
+      img.onerror = () => resolve(false);
+      img.src = dataUrl;
+    });
+
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    // Resolución interna fija (se escala con CSS)
+    const W = 960;
+    const H = 420;
+    c.width = W;
+    c.height = H;
+    pintarFondo(ctx, W, H);
+    historial.current = [];
+    let cancelado = false;
+    (async () => {
+      let guardada = null;
+      try {
+        guardada = localStorage.getItem(claveDibuixPizarra(empresa));
+      } catch { /* ignore */ }
+      if (!cancelado) {
+        await cargarImagen(guardada);
+        historial.current = [c.toDataURL("image/png")];
+        setListo(true);
+      }
+    })();
+    return () => { cancelado = true; };
+  }, [empresa]);
+
+  const puntoDesdeEvento = (e) => {
+    const c = canvasRef.current;
+    if (!c) return null;
+    const rect = c.getBoundingClientRect();
+    const src = e.touches && e.touches[0] ? e.touches[0] : e;
+    const x = ((src.clientX - rect.left) / rect.width) * c.width;
+    const y = ((src.clientY - rect.top) / rect.height) * c.height;
+    return { x, y };
+  };
+
+  const trazo = (desde, hasta) => {
+    const ctx = ctxDe();
+    if (!ctx || !desde || !hasta) return;
+    ctx.save();
+    if (herramienta === "goma") {
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.strokeStyle = "rgba(0,0,0,1)";
+      ctx.lineWidth = grosor * 2.2;
+    } else {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.strokeStyle = color;
+      ctx.lineWidth = grosor;
+    }
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(desde.x, desde.y);
+    ctx.lineTo(hasta.x, hasta.y);
+    ctx.stroke();
+    ctx.restore();
+  };
+
+  const inicio = (e) => {
+    if (herramienta === "text") return;
+    e.preventDefault();
+    const p = puntoDesdeEvento(e);
+    if (!p) return;
+    snapshot();
+    dibujando.current = true;
+    ultimo.current = p;
+    trazo(p, p);
+  };
+
+  const mover = (e) => {
+    if (!dibujando.current || herramienta === "text") return;
+    e.preventDefault();
+    const p = puntoDesdeEvento(e);
+    if (!p) return;
+    trazo(ultimo.current, p);
+    ultimo.current = p;
+  };
+
+  const fin = (e) => {
+    if (!dibujando.current) return;
+    if (e) e.preventDefault();
+    dibujando.current = false;
+    ultimo.current = null;
+    persistir();
+  };
+
+  const marcarPosTexto = (e) => {
+    if (herramienta !== "text") return;
+    e.preventDefault();
+    const p = puntoDesdeEvento(e);
+    if (!p) return;
+    setPosTexto(p);
+    setConfirmarNeteja(false);
+  };
+
+  const aplicarTexto = () => {
+    const texto = String(textoPendiente || "").trim();
+    if (!texto || !posTexto) return;
+    const ctx = ctxDe();
+    if (!ctx) return;
+    snapshot();
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = color;
+    ctx.font = `${Math.max(14, grosor * 4)}px "Segoe UI", system-ui, sans-serif`;
+    ctx.fillText(texto, posTexto.x, posTexto.y);
+    ctx.restore();
+    persistir();
+    setTextoPendiente("");
+    setPosTexto(null);
+  };
+
+  const desfer = () => {
+    const c = canvasRef.current;
+    const ctx = ctxDe();
+    if (!c || !ctx || historial.current.length < 2) return;
+    historial.current.pop();
+    const prev = historial.current[historial.current.length - 1];
+    cargarImagen(prev).then(() => persistir());
+  };
+
+  const netejar = () => {
+    if (!confirmarNeteja) {
+      setConfirmarNeteja(true);
+      return;
+    }
+    const c = canvasRef.current;
+    const ctx = ctxDe();
+    if (!c || !ctx) return;
+    snapshot();
+    pintarFondo(ctx, c.width, c.height);
+    persistir();
+    setConfirmarNeteja(false);
+  };
+
+  const exportarPng = () => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const a = document.createElement("a");
+    const slug = String(empresa || "empresa").toLowerCase().replace(/[^a-z0-9]+/g, "_") || "empresa";
+    a.download = `pissarra_${slug}_${new Date().toISOString().slice(0, 10)}.png`;
+    a.href = c.toDataURL("image/png");
+    a.click();
+  };
+
+  const btnBase = "px-2.5 py-1 rounded border text-xs transition-colors";
+  const btnAct = "bg-slate-800 text-white border-slate-800";
+  const btnInact = "bg-white text-slate-700 border-slate-200 hover:border-slate-400";
+
+  return (
+    <div className="mt-8 border-t border-slate-200 pt-5">
+      <h3 className="text-base font-semibold text-slate-800">Dibuix (tipus Paint)</h3>
+      <p className="text-sm text-slate-500 mt-1">
+        Dibuixa amb el ratolí o el dit. Pots afegir text, esborrar, desfer i baixar el dibuix en PNG.
+        Es desa sol per empresa en aquest navegador.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap gap-1">
+          {[
+            ["llapis", "Llapis"],
+            ["goma", "Goma"],
+            ["text", "Text"],
+          ].map(([id, lab]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => { setHerramienta(id); setConfirmarNeteja(false); }}
+              className={`${btnBase} ${herramienta === id ? btnAct : btnInact}`}
+            >
+              {lab}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-1.5 ml-1">
+          {COLORES_DIBUIX.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              title={c.etiqueta}
+              onClick={() => { setColor(c.hex); if (herramienta === "goma") setHerramienta("llapis"); }}
+              className={`w-6 h-6 rounded-full border-2 ${color === c.hex && herramienta !== "goma" ? "border-slate-800 scale-110" : "border-slate-200"}`}
+              style={{ backgroundColor: c.hex }}
+            />
+          ))}
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {GROSSORS.map((g) => (
+            <button
+              key={g.id}
+              type="button"
+              onClick={() => setGrosor(g.px)}
+              className={`${btnBase} ${grosor === g.px ? btnAct : btnInact}`}
+            >
+              {g.etiqueta}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap gap-1 ml-auto">
+          <button type="button" onClick={desfer} className={`${btnBase} ${btnInact}`}>Desfer</button>
+          <button
+            type="button"
+            onClick={netejar}
+            className={`${btnBase} ${confirmarNeteja ? "bg-amber-600 text-white border-amber-600" : btnInact}`}
+            title={confirmarNeteja ? "Torna a prémer per esborrar-ho tot" : "Esborra tot el dibuix"}
+          >
+            {confirmarNeteja ? "Confirmar neteja" : "Netejar"}
+          </button>
+          <button type="button" onClick={exportarPng} className={`${btnBase} bg-blue-700 text-white border-blue-700 hover:bg-blue-800`}>
+            Baixar PNG
+          </button>
+        </div>
+      </div>
+      {herramienta === "text" && (
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          <label className="text-xs text-slate-600 flex-1 min-w-[200px]">
+            Text {posTexto ? "(clica el llenç per moure el punt)" : "(clica el llenç per situar-lo)"}
+            <input
+              value={textoPendiente}
+              onChange={(e) => setTextoPendiente(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") aplicarTexto(); }}
+              placeholder="Escriu aquí…"
+              className="block w-full border rounded px-2 py-1.5 mt-1 text-sm"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={aplicarTexto}
+            disabled={!textoPendiente.trim() || !posTexto}
+            className="px-3 py-1.5 rounded bg-blue-700 text-white text-xs disabled:opacity-50"
+          >
+            Posar text
+          </button>
+        </div>
+      )}
+      <div className={`mt-3 rounded-lg border border-slate-300 bg-white overflow-hidden shadow-sm ${!listo ? "opacity-60" : ""}`}>
+        <canvas
+          ref={canvasRef}
+          className="w-full touch-none cursor-crosshair block"
+          style={{ aspectRatio: "960 / 420", maxHeight: 420 }}
+          onMouseDown={herramienta === "text" ? marcarPosTexto : inicio}
+          onMouseMove={mover}
+          onMouseUp={fin}
+          onMouseLeave={fin}
+          onTouchStart={herramienta === "text" ? marcarPosTexto : inicio}
+          onTouchMove={mover}
+          onTouchEnd={fin}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Pizarra({ datos, etiqActual, etiqPrev }) {
+  const empresa = datos?.empresa || "";
+  const [texto, setTexto] = useState("700..799 × 1,68");
+  const [lineas, setLineas] = useState([]);
+  const [abierta, setAbierta] = useState(null);
+
+  useEffect(() => {
+    try {
+      const guardadas = JSON.parse(localStorage.getItem(clavePizarra(empresa)) || "[]");
+      setLineas(Array.isArray(guardadas) ? guardadas : []);
+    } catch {
+      setLineas([]);
+    }
+  }, [empresa]);
+
+  const guardar = (lista) => {
+    setLineas(lista);
+    try { localStorage.setItem(clavePizarra(empresa), JSON.stringify(lista)); } catch { /* el navegador puede rechazar el guardado */ }
+  };
+
+  const anadir = () => {
+    const calc = datos ? calcularPizarra(texto, datos) : { error: "Pulsa Calcular para cargar las cuentas." };
+    if (calc.error) return;
+    guardar([{ id: Date.now(), formula: texto.trim(), conclusion: "" }, ...lineas]);
+  };
+
+  const vista = datos ? calcularPizarra(texto, datos) : null;
+
+  return (
+    <div className="mt-5 max-w-5xl">
+      <h2 className="text-lg font-semibold text-slate-800">Pizarra</h2>
+      <p className="text-sm text-slate-500 mt-1">
+        Escribe un rango de cuentas y una operación. Los ingresos del grupo 7 salen en positivo, como las ventas de esta pantalla.
+        El periodo es el de las fechas de arriba{etiqActual ? ` (${etiqActual})` : ""}.
+      </p>
+      {!datos && <p className="mt-3 text-sm text-slate-600">Pulsa Calcular para cargar las cuentas. Después podrás hacer el cálculo.</p>}
+      <div className="mt-3 flex flex-wrap items-end gap-2">
+        <label className="text-sm text-slate-600 flex-1 min-w-[240px]">
+          Cálculo
+          <input
+            value={texto}
+            onChange={(e) => setTexto(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") anadir(); }}
+            placeholder="700..799 × 1,68"
+            className="block w-full border rounded px-2 py-1.5 mt-1 text-sm"
+          />
+        </label>
+        <button type="button" onClick={anadir} disabled={!datos || vista?.error} className="px-4 py-2 rounded bg-blue-700 text-white text-sm disabled:opacity-50">
+          Añadir a la pizarra
+        </button>
+      </div>
+      {vista?.error && <p className="mt-2 text-sm text-amber-800">{vista.error}</p>}
+      {vista && !vista.error && (
+        <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 text-sm">
+          <div className="text-slate-800">
+            Suma {vista.formula.desde}–{vista.formula.hasta}: <b>{eur2(vista.base)}</b>
+            {vista.formula.factor !== 1 || vista.formula.op !== "*" ? <> {vista.signo} {String(vista.formula.factor).replace(".", ",")} = <b>{eur2(vista.resultado)}</b></> : null}
+          </div>
+          {vista.basePrev != null && (
+            <div className="text-slate-500 mt-1">
+              Mismo periodo del año anterior{etiqPrev ? ` (${etiqPrev})` : ""}: {eur2(vista.basePrev)}
+              {vista.formula.factor !== 1 || vista.formula.op !== "*" ? <> {vista.signo} {String(vista.formula.factor).replace(".", ",")} = {eur2(vista.resultadoPrev)}</> : null}
+            </div>
+          )}
+          <div className="text-xs text-slate-400 mt-1">{vista.cuentas.length} cuenta(s) con movimiento.</div>
+        </div>
+      )}
+      {lineas.length > 0 && (
+        <div className="mt-4 space-y-3">
+          {lineas.map((linea) => {
+            const calc = datos ? calcularPizarra(linea.formula, datos) : null;
+            return (
+              <div key={linea.id} className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium text-slate-800">{linea.formula}</div>
+                    {calc?.error && <div className="text-sm text-amber-800 mt-1">{calc.error}</div>}
+                    {calc && !calc.error && (
+                      <div className="text-sm text-slate-700 mt-1">
+                        {eur2(calc.base)} {calc.signo} {String(calc.formula.factor).replace(".", ",")} = <b>{eur2(calc.resultado)}</b>
+                        {calc.resultadoPrev != null && <span className="text-slate-500"> · año anterior {eur2(calc.resultadoPrev)}</span>}
+                      </div>
+                    )}
+                  </div>
+                  <button type="button" onClick={() => guardar(lineas.filter((x) => x.id !== linea.id))} className="text-xs text-slate-400 hover:text-slate-700">Quitar</button>
+                </div>
+                {calc && !calc.error && (
+                  <button type="button" onClick={() => setAbierta(abierta === linea.id ? null : linea.id)} className="mt-1 text-xs text-blue-700 underline">
+                    {abierta === linea.id ? "Ocultar cuentas" : `Ver ${calc.cuentas.length} cuentas`}
+                  </button>
+                )}
+                {abierta === linea.id && calc && !calc.error && (
+                  <div className="mt-2 max-h-48 overflow-auto border rounded">
+                    <table className="w-full text-xs">
+                      <tbody>
+                        {calc.cuentas.map((c) => (
+                          <tr key={c.cta} className="border-t border-slate-100">
+                            <td className="px-2 py-1 whitespace-nowrap text-slate-700">{c.cta}</td>
+                            <td className="px-2 py-1 text-slate-600">{c.nombre || "—"}</td>
+                            <td className="px-2 py-1 text-right whitespace-nowrap">{eur2(c.importe)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                <label className="block mt-2 text-xs text-slate-500">
+                  Conclusión
+                  <textarea
+                    value={linea.conclusion}
+                    onChange={(e) => guardar(lineas.map((x) => x.id === linea.id ? { ...x, conclusion: e.target.value } : x))}
+                    rows={2}
+                    placeholder="Qué te dice esta cifra"
+                    className="block w-full border rounded px-2 py-1 mt-1 text-sm text-slate-800"
+                  />
+                </label>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <LienzoPizarra empresa={empresa} />
+    </div>
+  );
+}
+
+export default function Ratios({ recursos = [] }) {
   const [hasta, setHasta] = useState(hoy());
   const [desde, setDesde] = useState(inicioAnio(hoy()));
   const [datos, setDatos] = useState(null);
@@ -478,12 +1026,14 @@ export default function Ratios() {
       {error && <p className="mt-4 text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3">{error}</p>}
 
       <div className="flex gap-1 mt-5 border-b">
-        {[["ratios", "Ratios"], ["indicadores", "Indicadores económicos y escenarios"]].map(([k, t]) => (
+        {[["ratios", "Ratios"], ["pizarra", "Pizarra"], ["manoobra", "Control y análisis de mano de obra"], ["indicadores", "Indicadores económicos y escenarios"]].map(([k, t]) => (
           <button key={k} onClick={() => setPestana(k)} className={`px-4 py-2 text-sm -mb-px border-b-2 ${pestana === k ? "border-blue-700 text-blue-800 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>
             {t}
           </button>
         ))}
       </div>
+      {pestana === "pizarra" && <Pizarra datos={datos} etiqActual={etiqActual} etiqPrev={etiqPrev} />}
+      {pestana === "manoobra" && <ManoObra desde={desde} hasta={hasta} recursos={recursos} />}
       {pestana === "indicadores" && <Indicadores datos={datos} />}
 
       {pestana === "ratios" && datos && (

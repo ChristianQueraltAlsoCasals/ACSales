@@ -10,7 +10,7 @@
  *    (qué código es extra, vacaciones, baja…), jornada y festivos.
  */
 import React, { useEffect, useMemo, useState } from "react";
-import { ConfiguracionHoras, TarifasHoras, FestivosLinea, listaFestivos } from "./horasExtra.jsx";
+import { ConfiguracionHoras, TarifasHoras, FestivosLinea, listaFestivos, agruparAmiantoPorDia, normNum } from "./horasExtra.jsx";
 
 const CATS = {
   normal: { txt: "Normal", color: "" },
@@ -67,8 +67,14 @@ export default function ControlHoras() {
   const [guardado, setGuardado] = useState("");
   const [plegados, setPlegados] = useState({}); // recurso -> plegado (por defecto se ven las filas por tipo de línea)
   const [diaDetalle, setDiaDetalle] = useState(null); // { r, dias: [..], titulo }
+  const [amianto, setAmianto] = useState(null); // { partes, precioDefecto, error? }
+  const [verAmianto, setVerAmianto] = useState(false); // popup con lo que ha traído la API
   useEffect(() => {
-    const esc = (e) => e.key === "Escape" && setDiaDetalle(null);
+    const esc = (e) => {
+      if (e.key !== "Escape") return;
+      setDiaDetalle(null);
+      setVerAmianto(false);
+    };
     window.addEventListener("keydown", esc);
     return () => window.removeEventListener("keydown", esc);
   }, []);
@@ -79,6 +85,24 @@ export default function ControlHoras() {
       if (j.ajustes) setAjustes((a) => ({ ...a, ...j.ajustes }));
     }).catch(() => setError({ error: "No se pudo conectar con el backend. ¿Está arrancado (INICIAR.bat)?" }));
   }, []);
+
+  // Partes con amianto (ALSOAPP) del mismo periodo que las horas de BC
+  useEffect(() => {
+    if (!datos?.desde || !datos?.hasta) return;
+    let cancel = false;
+    setAmianto((a) => (a ? { ...a, cargando: true } : { partes: [], cargando: true }));
+    fetch(`/api/horas/amianto?desde=${encodeURIComponent(datos.desde)}&hasta=${encodeURIComponent(datos.hasta)}`)
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
+        if (!cancel) setAmianto({ partes: j.partes || [], precioDefecto: j.precioDefecto || 30 });
+      })
+      .catch((e) => { if (!cancel) setAmianto({ partes: [], error: String(e.message || e) }); });
+    return () => { cancel = true; };
+  }, [datos?.desde, datos?.hasta]);
+
+  const amiantoMap = useMemo(() => agruparAmiantoPorDia(amianto?.partes), [amianto]);
+  const diasAmiantoDe = (recurso) => amiantoMap.get(normNum(recurso))?.dias?.length || 0;
 
   async function cargar() {
     setCargando(true); setError(null);
@@ -269,10 +293,18 @@ export default function ControlHoras() {
 
       {calc && (
         <>
-          <div className="flex gap-1 mt-5 border-b">
-            {[["cuadro", "Cuadro de horas"], ["extras", "Extras y ausencias"], ["detalle", "Detalle"], ["tipos", "Tipos de trabajo y jornada"], ["config", "Configuración"], ["tarifas", "Tarifas y pago"]].map(([k, t]) => (
-              <button key={k} onClick={() => setPestana(k)} className={`px-4 py-2 text-sm -mb-px border-b-2 ${pestana === k ? "border-blue-700 text-blue-800 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>{t}</button>
-            ))}
+          <div className="flex flex-wrap items-center gap-2 mt-5 border-b">
+            <div className="flex gap-1">
+              {[["cuadro", "Cuadro de horas"], ["extras", "Extras y ausencias"], ["detalle", "Detalle"], ["tipos", "Tipos de trabajo y jornada"], ["config", "Configuración"], ["tarifas", "Tarifas y pago"]].map(([k, t]) => (
+                <button key={k} onClick={() => setPestana(k)} className={`px-4 py-2 text-sm -mb-px border-b-2 ${pestana === k ? "border-blue-700 text-blue-800 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>{t}</button>
+              ))}
+            </div>
+            {(pestana === "extras" || pestana === "tarifas") && (
+              <button type="button" onClick={() => setVerAmianto(true)}
+                className="ml-auto mb-1 px-2 py-1 rounded border text-xs text-amber-800 bg-amber-50 hover:bg-amber-100 border-amber-200">
+                Ver partes amianto{amianto?.cargando ? "…" : amianto?.partes ? ` (${amianto.partes.length})` : ""}
+              </button>
+            )}
           </div>
 
           {(pestana === "cuadro" || pestana === "extras") && (
@@ -395,6 +427,7 @@ export default function ControlHoras() {
 
           {pestana === "extras" && (
             <section className="mt-3 bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+              {amianto?.error && <p className="px-3 py-2 text-xs text-amber-700 bg-amber-50 border-b">Amianto: {amianto.error}</p>}
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-left text-xs text-slate-500 bg-slate-50">
@@ -404,10 +437,11 @@ export default function ControlHoras() {
                     {AUSENCIAS.map((a) => <th key={a} className="px-3 py-2 text-right">{CATS[a].txt}</th>)}
                     <th className="px-3 py-2 text-right">Faltan (días incompletos)</th>
                     <th className="px-3 py-2 text-right">Días sin imputar</th>
+                    <th className="px-3 py-2 text-right" title="Días distintos con parte esAmiant=1 (app)">Días amianto</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {visibles.filter((r) => r.t.extras || r.t.exceso || r.t.ausencias || r.t.faltan || r.t.sinImputar).map((r) => (
+                  {visibles.filter((r) => r.t.extras || r.t.exceso || r.t.ausencias || r.t.faltan || r.t.sinImputar || diasAmiantoDe(r.recurso)).map((r) => (
                     <tr key={r.recurso} className="border-t border-slate-100">
                       <td className="px-3 py-1.5"><button onClick={() => { setSel(r.recurso); setPestana("detalle"); }} className="hover:underline font-medium text-slate-700">{r.nombre}</button></td>
                       <td className="px-3 text-right text-purple-700">{h(r.t.extras)}</td>
@@ -415,6 +449,7 @@ export default function ControlHoras() {
                       {AUSENCIAS.map((a) => <td key={a} className={`px-3 text-right ${CATS[a].color}`}>{h(r.t.porAus[a])}</td>)}
                       <td className="px-3 text-right text-amber-700">{h(r.t.faltan)}</td>
                       <td className="px-3 text-right text-red-600">{r.t.sinImputar || ""}</td>
+                      <td className="px-3 text-right font-medium text-amber-800">{diasAmiantoDe(r.recurso) || ""}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -426,10 +461,11 @@ export default function ControlHoras() {
                     {AUSENCIAS.map((a) => <td key={a} className="px-3 text-right">{h(visibles.reduce((t, r) => t + (r.t.porAus[a] || 0), 0))}</td>)}
                     <td className="px-3 text-right">{h(visibles.reduce((t, r) => t + r.t.faltan, 0))}</td>
                     <td className="px-3 text-right">{visibles.reduce((t, r) => t + r.t.sinImputar, 0) || ""}</td>
+                    <td className="px-3 text-right">{visibles.reduce((t, r) => t + diasAmiantoDe(r.recurso), 0) || ""}</td>
                   </tr>
                 </tfoot>
               </table>
-              <p className="text-xs text-slate-400 px-3 py-2">«Extras declaradas» = horas con un tipo de trabajo clasificado como extra. «Exceso» = horas normales por encima de la jornada o en fin de semana/festivo (posibles extras sin declarar). La clasificación se cambia en «Tipos de trabajo y jornada».</p>
+              <p className="text-xs text-slate-400 px-3 py-2">«Extras declaradas» = horas con un tipo de trabajo clasificado como extra. «Exceso» = horas normales por encima de la jornada o en fin de semana/festivo (posibles extras sin declarar). «Días amianto» = días distintos con parte de la app marcado esAmiant (fecha de creación del parte). La clasificación se cambia en «Tipos de trabajo y jornada».</p>
             </section>
           )}
 
@@ -475,7 +511,7 @@ export default function ControlHoras() {
             <ConfiguracionHoras ajustes={ajustes} guardarAjustes={guardarAjustes} trabajadores={calc.lista} codigos={calc.tipos.map((t) => t.cod).filter(Boolean)} />
           )}
           {pestana === "tarifas" && (
-            <TarifasHoras trabajadores={calc.lista} codigos={calc.tipos.map((t) => t.cod || "(sin tipo)")} ajustes={ajustes} desde={datos.desde} hasta={datos.hasta} />
+            <TarifasHoras trabajadores={calc.lista} codigos={calc.tipos.map((t) => t.cod || "(sin tipo)")} ajustes={ajustes} desde={datos.desde} hasta={datos.hasta} amianto={amianto} />
           )}
 
           {pestana === "tipos" && (
@@ -515,6 +551,59 @@ export default function ControlHoras() {
             </div>
           )}
         </>
+      )}
+
+      {verAmianto && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setVerAmianto(false)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-4xl w-full max-h-[85vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="px-4 py-3 border-b flex items-center justify-between sticky top-0 bg-white">
+              <div>
+                <div className="font-semibold text-slate-800">Partes amianto cargados de la app</div>
+                <div className="text-xs text-slate-500">
+                  Periodo {datos ? `${fmtF(datos.desde)} – ${fmtF(datos.hasta)}` : "—"} ·
+                  {amianto?.error ? ` Error: ${amianto.error}` : ` ${amianto?.partes?.length ?? 0} partes con esAmiant = 1`}
+                  {amianto?.cargando ? " · cargando…" : ""}
+                </div>
+              </div>
+              <button type="button" onClick={() => setVerAmianto(false)} className="text-slate-400 hover:text-slate-700 text-lg px-2">✕</button>
+            </div>
+            {!amianto?.partes?.length ? (
+              <p className="p-4 text-sm text-slate-500">
+                {amianto?.error
+                  ? amianto.error
+                  : "No hay partes de amianto en este periodo (o aún no se han cargado). Prueba a ampliar las fechas y pulsar «Cargar desde BC»."}
+              </p>
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-slate-500 bg-slate-50">
+                    <th className="px-3 py-2">Fecha</th>
+                    <th className="px-3 py-2">Cód. trabajador</th>
+                    <th className="px-3 py-2">Trabajador</th>
+                    <th className="px-3 py-2">OT</th>
+                    <th className="px-3 py-2">Nº parte</th>
+                    <th className="px-3 py-2">id parte</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...amianto.partes].sort((a, b) => (a.fecha < b.fecha ? 1 : a.fecha > b.fecha ? -1 : 0)).map((p) => (
+                    <tr key={p.id} className="border-t border-slate-100">
+                      <td className="px-3 py-1.5 whitespace-nowrap">{fmtF(p.fecha)}</td>
+                      <td className="px-3 py-1.5 font-mono text-xs">{p.codiTreballador}</td>
+                      <td className="px-3 py-1.5">{p.treballador}</td>
+                      <td className="px-3 py-1.5">{p.idOT || "—"}</td>
+                      <td className="px-3 py-1.5 font-mono text-xs">{p.codigoParte || "—"}</td>
+                      <td className="px-3 py-1.5 text-slate-400 text-xs">{p.id}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div className="px-4 py-2 border-t text-xs text-slate-400 sticky bottom-0 bg-white">
+              Estos son los datos crudos de ALSOAPP. Se agrupan por trabajador y día (1 día = 1 plus, aunque haya varios partes el mismo día).
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

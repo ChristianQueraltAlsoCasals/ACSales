@@ -68,7 +68,7 @@ async function copiarConFirma(texto) {
   }
 }
 
-function htmlPerEnviar(texto) {
+export function htmlPerEnviar(texto) {
   const cuerpo = cuerpoSinFirma(texto);
   const parrafos = escaparHtml(cuerpo).split(/\n{2,}/).map((p) => "<p>" + p.replace(/\n/g, "<br>") + "</p>").join("");
   const legal = escaparHtml(FIRMA_LEGAL).replace(/\n/g, "<br>");

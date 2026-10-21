@@ -39,6 +39,14 @@ try {
   console.warn("⚠️  'pdf-lib' no está instalado — 'Subir Documento' (Recepción) no funcionará hasta ejecutar: npm install pdf-lib");
 }
 
+// El visor de Business Central no abre los PDF que pdf-lib escribe con
+// object streams. El navegador sí. Solo se usa al guardar el PDF que se
+// adjunta a un pedido o a una factura. Los lotes que se mandan a leer
+// siguen con save() normal.
+function guardarPdfParaBc(doc) {
+  return doc.save({ useObjectStreams: false });
+}
+
 const app = express();
 app.use(express.json({ limit: "500mb" })); // fichas + líneas con TODAS las columnas: el estado puede ser grande
 app.use(cookieParser());
@@ -1415,8 +1423,19 @@ app.post("/api/correo/enviar", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   }
-  const { para, asunto, cuerpoHtml, adjunto, incluirFirma, respuestaA } = req.body || {};
+  const { para, cc, asunto, cuerpoHtml, adjunto, incluirFirma, respuestaA } = req.body || {};
   const destinatarios = Array.isArray(para) ? para.filter(Boolean) : [];
+  const enPara = new Set(destinatarios.map((e) => String(e).trim().toLowerCase()));
+  const copiasVistas = new Set();
+  const copias = (Array.isArray(cc) ? cc : [])
+    .map((e) => String(e || "").trim())
+    .filter((e) => {
+      const k = e.toLowerCase();
+      if (!e || enPara.has(k) || copiasVistas.has(k)) return false;
+      copiasVistas.add(k);
+      return true;
+    });
+  const ccRecipients = copias.map((email) => ({ emailAddress: { address: email } }));
   if (!destinatarios.length) return res.status(400).json({ error: "Falta al menos un destinatario en 'para'." });
   if (!asunto) return res.status(400).json({ error: "Falta 'asunto'." });
 
@@ -1456,6 +1475,7 @@ app.post("/api/correo/enviar", async (req, res) => {
         subject: asunto,
         body: { contentType: "HTML", content: (cuerpoHtml || "") + citado },
         toRecipients: destinatarios.map((email) => ({ emailAddress: { address: email } })),
+        ...(ccRecipients.length ? { ccRecipients } : {}),
       });
       if (!parche.ok) throw new Error(`Graph respondió ${parche.status} al escribir la respuesta: ${(await parche.text()).slice(0, 300)}`);
       if (firma) {
@@ -1478,14 +1498,15 @@ app.post("/api/correo/enviar", async (req, res) => {
           : "";
         throw new Error(`Graph respondió ${env.status} enviando la respuesta${pista}: ${(await env.text()).slice(0, 300)}`);
       }
-      console.log(`[correo/enviar] respuesta de=${buzon} "${asunto}" → ${destinatarios.join(", ")}`);
-      return res.json({ ok: true, de: buzon, para: destinatarios });
+      console.log(`[correo/enviar] respuesta de=${buzon} "${asunto}" → ${destinatarios.join(", ")}${copias.length ? ` cc=${copias.join(", ")}` : ""}`);
+      return res.json({ ok: true, de: buzon, para: destinatarios, cc: copias });
     }
 
     const mensaje = {
       subject: asunto,
       body: { contentType: "HTML", content: cuerpoHtml || "" },
       toRecipients: destinatarios.map((email) => ({ emailAddress: { address: email } })),
+      ...(ccRecipients.length ? { ccRecipients } : {}),
     };
     const adjuntos = [];
     if (firma) adjuntos.push(firma);
@@ -1511,8 +1532,8 @@ app.post("/api/correo/enviar", async (req, res) => {
         : "";
       throw new Error(`Graph respondió ${r.status} enviando el correo${pista}: ${detalle.slice(0, 300)}`);
     }
-    console.log(`[correo/enviar] de=${buzon} "${asunto}" → ${destinatarios.join(", ")}${adjunto?.base64 ? " (con adjunto)" : ""}`);
-    res.json({ ok: true, de: buzon, para: destinatarios });
+    console.log(`[correo/enviar] de=${buzon} "${asunto}" → ${destinatarios.join(", ")}${copias.length ? ` cc=${copias.join(", ")}` : ""}${adjunto?.base64 ? " (con adjunto)" : ""}`);
+    res.json({ ok: true, de: buzon, para: destinatarios, cc: copias });
   } catch (err) {
     console.error("Error enviando correo:", err);
     res.status(500).json({ error: "Error enviando el correo.", detalle: String(err.message || err) });
@@ -3173,7 +3194,7 @@ app.post("/api/recepcion/extraer", async (req, res) => {
         const nuevo = await PDFDocument.create();
         const copiadas = await nuevo.copyPages(srcPdf, g.paginas.map((p) => p - 1));
         copiadas.forEach((p) => nuevo.addPage(p));
-        const bytes = await nuevo.save();
+        const bytes = await guardarPdfParaBc(nuevo);
         pdfBase64 = Buffer.from(bytes).toString("base64");
       }
       if (!g.pedido) {
@@ -5298,7 +5319,7 @@ async function extraerFacturaHttp(req, res) {
           const nuevo = await PDFDocument.create();
           const copiadas = await nuevo.copyPages(srcPdf, g.paginas.map((p) => p - 1));
           copiadas.forEach((p) => nuevo.addPage(p));
-          pdfBase64 = Buffer.from(await nuevo.save()).toString("base64");
+          pdfBase64 = Buffer.from(await guardarPdfParaBc(nuevo)).toString("base64");
         }
         facturasFinal.push({
           ...g,
@@ -5313,7 +5334,7 @@ async function extraerFacturaHttp(req, res) {
       const nuevo = await PDFDocument.create();
       const copiadas = await nuevo.copyPages(srcPdf, g.paginas.map((p) => p - 1));
       copiadas.forEach((p) => nuevo.addPage(p));
-      const bytes = await nuevo.save();
+      const bytes = await guardarPdfParaBc(nuevo);
       const pdfBase64 = Buffer.from(bytes).toString("base64");
 
       // Antes de analizar pedidos o proponer cómo entrarla: si este nº de
