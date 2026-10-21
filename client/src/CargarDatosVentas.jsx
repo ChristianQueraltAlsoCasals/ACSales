@@ -4633,7 +4633,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     const ratioPropia = taxesProvisionales ? 0 : (infoUn?.ratio_propia ?? 0);
     const pctGeneral = taxesProvisionales ? PCT_ESTRUCTURA : (tasasEst?.pctGeneral ?? 0);
     const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller);
-    const costeDirecto = costeMaterial + manoObra + compradoNoVendido;
+    const costeDirecto = costeMaterial + manoObra;
     const vo = calcularVentaObjetivo(costeDirecto, ratioPropia, pctGeneral);
     const baseVo = vo.ventaObjetivo;
     // Mateixes cel·les que la fila Venda objectiu (NO % × ingressos).
@@ -5077,10 +5077,10 @@ function DetalleOT({ ficha, fichas, onVolver }) {
             )}
 
             {/* Venda objectiu — casilla NUEVA (no altera KPIs de cabecera).
-                Coste directe = material (compra+taller−stock) + MO×21,50 + comprat sense facturar.
+                Coste directe = material + taller + MO×21,50 − coste no facturado añadido.
                 % estructura compartido con la fila de métricas (arriba). */}
             {(() => {
-              const costeDirecto = costeMaterial + manoObra + compradoNoVendido;
+              const costeDirecto = costeMaterial + manoObra;
               const coefVenta = coefVentaPosible(ficha.general?.cliente);
               const vo = calcularVentaObjetivo(costeDirecto, ratioPropia, pctGeneral, MARGEN_OBJETIVO_VENTA, coefVenta);
               const gap = vo.ventaObjetivo != null ? ingresos - vo.ventaObjetivo : null;
@@ -5112,16 +5112,17 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                       <Metrica
                         label="Coste directe"
                         valor={eur(costeDirecto)}
-                        sub={`mat. ${eur(costeMaterial)} + MO ${eur(manoObra)}${compradoNoVendido > 0 ? ` + rebut ${eur(compradoNoVendido)}` : ""}${clicHint}`}
+                        sub={`mat. ${eur(materiales)}${compradoNoVendido > 0 ? ` − coste no facturado ${eur(compradoNoVendido)}` : ""}${costeTaller > 0 ? ` + taller ${eur(costeTaller)}` : ""} + MO ${eur(manoObra)}${clicHint}`}
                         title="Desglossar coste directe"
                         onClick={() => setDesglose({
                           titulo: `Coste directe · ${eur(costeDirecto)}`,
                           subtitulo: "Base de la Venta Objetivo",
                           filas: [],
                           formula: [
-                            { label: "Material net (PC − stock + taller)", valor: eur(costeMaterial) },
+                            { label: "Materials PC", valor: eur(materiales) },
+                            ...(compradoNoVendido > 0 ? [{ label: "− Coste No Facturado", valor: eur(compradoNoVendido) }] : []),
+                            ...(costeTaller > 0 ? [{ label: "+ Material taller", valor: eur(costeTaller) }] : []),
                             { label: "+ Mà d'obra (h × 21,50)", valor: eur(manoObra) },
-                            ...(compradoNoVendido > 0 ? [{ label: "+ Rebut (comprat no venut)", valor: eur(compradoNoVendido) }] : []),
                             { label: "= Coste directe", valor: eur(costeDirecto), destacado: true },
                           ],
                           total: costeDirecto,
