@@ -64,6 +64,7 @@ import {
 } from "./mapeoArticulos.js";
 import { OTS_DEMO } from "./datosDemo.js";
 import { generarBorradorFactura, htmlBorradorFactura } from "./borradorFactura.js";
+import { excelValoracionPresupuesto as generarExcelValoracion } from "./excelValoracionPresupuesto.js";
 import Recepcion from "./recepcion.jsx";
 import FacturasCompra from "./facturasCompra.jsx";
 import FacturasVenta from "./facturasVenta.jsx";
@@ -856,7 +857,8 @@ function IntelligentAgentCard({ bcData = {}, estadoInicial = null }) {
       const r = await fetch(`/api/bc/proyectos${params.toString() ? "?" + params.toString() : ""}`);
       if (!r.ok) throw new Error(`El backend respondió ${r.status}`);
       const json = await r.json();
-      const adaptadas = adaptarFilasJob(json.data || []);
+      // Also: AC… · Ferros: FCA… (el valor por defecto de adaptarFilasJob es solo AC)
+      const adaptadas = adaptarFilasJob(json.data || [], undefined, prefijoOT());
       const etiquetaRango =
         anyoDesde || anyoHasta ? ` (${anyoDesde || "…"}–${anyoHasta || "…"})` : "";
       setOtFiles((prev) => {
@@ -1756,7 +1758,7 @@ function construirHtmlValoracion(v) {
   const ingresos = Number(v.ingresos) || 0;
   const costeMat = Number(v.costeMaterial) || 0;
   const costeMO = Number(v.manoObra) || 0;
-  const vo = v.ventaObjetivo;
+  const vp = v.ventaPosible;
   const eProp = v.estrPropia;
   const eGen = v.estrGeneral;
   const eMarge = v.estrMarge;
@@ -1822,7 +1824,7 @@ function construirHtmlValoracion(v) {
   return `<div style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;max-width:1100px;margin:0 0 18px 0;">
     <h2 style="font-size:18px;margin:0 0 10px 0;color:#0f2740;">Valoració econòmica</h2>
     <table cellpadding="0" cellspacing="0" style="width:100%;margin-bottom:12px;"><tr>
-      ${tarjeta("Venta Objetivo", eurTxt(vo), v.un ? `UN ${v.un}` : "Coste ÷ (1 − estructures − 12 %)")}
+      ${tarjeta("Venta Posible", eurTxt(vp), [v.coefVenta != null ? `coste × ${Number(v.coefVenta).toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "criteris mínims pressupost", v.un ? `UN ${v.un}` : ""].filter(Boolean).join(" · "))}
       ${tarjeta("Estructura pròpia", eurTxt(eProp), `${pctTxt(v.ratioPropia)} s/ objectiu`)}
       ${tarjeta("Estructura general", eurTxt(eGen), `${pctTxt(v.pctGeneral)} s/ objectiu`)}
       ${tarjeta("Suma estructura", eurTxt(eSuma), `pròpia + general s/ objectiu`)}
@@ -1857,7 +1859,7 @@ function textoValoracion(v) {
     : null;
   return (
     `Valoració econòmica:\n` +
-    `  · Venta Objetivo: ${eurTxt(v.ventaObjetivo)}\n` +
+    `  · Venta Posible: ${eurTxt(v.ventaPosible)}\n` +
     `  · Estructura pròpia: ${eurTxt(v.estrPropia)} (${pctTxt(v.ratioPropia)} s/ objectiu)\n` +
     `  · Estructura general: ${eurTxt(v.estrGeneral)} (${pctTxt(v.pctGeneral)} s/ objectiu)\n` +
     `  · Suma estructura: ${eurTxt(eSuma)}\n` +
@@ -2296,6 +2298,10 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
       const cuerpoHtml = borrador.htmlRevision
         ? `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;">${intro}</div>${borrador.htmlRevision}`
         : intro;
+      const ficheros = [
+        ...((borrador.adjuntosExtra || []).filter((a) => a?.base64)),
+        ...(borrador.adjunto?.base64 ? [borrador.adjunto] : []),
+      ].map((a) => ({ nombre: a.nombre, base64: a.base64, mime: a.mime }));
       const r = await fetch("/api/correo/enviar", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2304,9 +2310,7 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
           cc: copias,
           asunto: asunto.trim(),
           cuerpoHtml,
-          adjunto: borrador.adjunto
-            ? { nombre: borrador.adjunto.nombre, base64: borrador.adjunto.base64, mime: borrador.adjunto.mime }
-            : null,
+          ...(ficheros.length > 1 ? { adjuntos: ficheros } : { adjunto: ficheros[0] || null }),
         }),
       });
       const json = await r.json().catch(() => ({}));
@@ -2383,17 +2387,21 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
             </div>
           )}
           {!sinAdjunto && (
-          <div className="flex items-center gap-2 text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
-            <FileText size={14} className="text-purple-600 flex-shrink-0" />
-            {borrador.adjunto ? (
-              <span>Adjunto: <strong>{borrador.adjunto.nombre}</strong></span>
-            ) : estadoAdjunto?.cargando ? (
-              <span>Preparando el borrador de factura…</span>
-            ) : estadoAdjunto?.error ? (
-              <span className="text-amber-700">{estadoAdjunto.error}</span>
-            ) : (
-              <span className="text-amber-700">Sin adjunto — el correo se enviará sin valoración.</span>
-            )}
+          <div className="flex items-start gap-2 text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+            <FileText size={14} className="text-purple-600 flex-shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              {[...((borrador.adjuntosExtra || [])), borrador.adjunto].filter((a) => a?.nombre).length ? (
+                [...((borrador.adjuntosExtra || [])), borrador.adjunto].filter((a) => a?.nombre).map((a) => (
+                  <div key={a.nombre}>Adjunto: <strong>{a.nombre}</strong></div>
+                ))
+              ) : estadoAdjunto?.cargando ? (
+                <span>Preparando los adjuntos…</span>
+              ) : estadoAdjunto?.error ? (
+                <span className="text-amber-700">{estadoAdjunto.error}</span>
+              ) : (
+                <span className="text-amber-700">Sin adjunto — el correo se enviará sin valoración.</span>
+              )}
+            </div>
           </div>
           )}
           {error && <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
@@ -2405,7 +2413,7 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
           <button
             type="button"
             onClick={enviar}
-            disabled={enviando || estadoAdjunto?.cargando}
+            disabled={enviando || estadoAdjunto?.cargando || estadoAdjunto?.bloquear}
             className="text-sm font-semibold px-4 py-1.5 rounded-md text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-50 inline-flex items-center gap-1.5"
           >
             <Send size={14} />
@@ -2417,10 +2425,17 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
   );
 }
 
-function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = null, className, title, children }) {
+async function excelValoracionPresupuesto(ficha, v) {
+  const ot = codigoOTParaBC(ficha) || String(ficha?.numeroOT || "");
+  return generarExcelValoracion({ ...ficha, _otExcel: ot }, v);
+}
+
+
+function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = null, excelValoracion = null, excelPendiente = false, className, title, children }) {
   const [abierto, setAbierto] = useState(false);
   const [enviado, setEnviado] = useState(false);
   const [adjunto, setAdjunto] = useState(null);
+  const [excelAdj, setExcelAdj] = useState(null);
   const [estadoAdjunto, setEstadoAdjunto] = useState(null);
   const dep = departamentoDeFicha(ficha);
   const diferencias = dif || difMaterialDeFicha(ficha);
@@ -2435,26 +2450,56 @@ function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = 
   const abrir = () => {
     setAbierto(true);
     setAdjunto(null);
+    setExcelAdj(null);
+    if (excelPendiente) {
+      setEstadoAdjunto({ error: "Las horas y la tarifa todavía se están leyendo. Cierra esto, espera un momento y vuelve a abrirlo.", bloquear: true });
+      return;
+    }
     setEstadoAdjunto({ cargando: true });
-    adjuntoBorradorDeFicha(ficha)
-      .then((a) => { setAdjunto(a); setEstadoAdjunto(null); })
-      .catch((e) => setEstadoAdjunto({ error: e.message || String(e) }));
+    const trabajos = [
+      adjuntoBorradorDeFicha(ficha)
+        .then((a) => ({ pdf: a }))
+        .catch((e) => ({ errorPdf: e.message || String(e) })),
+    ];
+    if (excelValoracion) {
+      trabajos.push(
+        excelValoracionPresupuesto(ficha, excelValoracion)
+          .then((a) => ({ xls: a }))
+          .catch((e) => ({ errorXls: e.message || String(e) }))
+      );
+    }
+    Promise.all(trabajos).then((partes) => {
+      const pdf = partes.find((p) => p.pdf)?.pdf || null;
+      const xls = partes.find((p) => p.xls)?.xls || null;
+      const errorXls = partes.find((p) => p.errorXls)?.errorXls || null;
+      const errorPdf = partes.find((p) => p.errorPdf)?.errorPdf || null;
+      setAdjunto(pdf);
+      setExcelAdj(xls);
+      if (excelValoracion) setEstadoAdjunto(errorXls ? { error: errorXls } : null);
+      else setEstadoAdjunto(errorPdf ? { error: errorPdf } : null);
+    });
   };
 
   const borradorBase = borradorConRevision(ficha, diferencias);
   const textoVal = textoValoracion(valoracion);
-  const borrador = textoVal
-    ? {
-        ...borradorBase,
-        cuerpoTexto: (() => {
-          const marca = "Quedem a l'espera";
-          const i = borradorBase.cuerpoTexto.indexOf(marca);
-          return i === -1
-            ? `${borradorBase.cuerpoTexto}\n\n${textoVal}`
-            : `${borradorBase.cuerpoTexto.slice(0, i)}${textoVal}\n${borradorBase.cuerpoTexto.slice(i)}`;
-        })(),
-      }
-    : borradorBase;
+  const cuerpoBase = textoVal
+    ? (() => {
+        const marca = "Quedem a l'espera";
+        const i = borradorBase.cuerpoTexto.indexOf(marca);
+        return i === -1
+          ? `${borradorBase.cuerpoTexto}\n\n${textoVal}`
+          : `${borradorBase.cuerpoTexto.slice(0, i)}${textoVal}\n${borradorBase.cuerpoTexto.slice(i)}`;
+      })()
+    : borradorBase.cuerpoTexto;
+  const borrador = {
+    ...borradorBase,
+    cuerpoTexto: excelValoracion
+      ? cuerpoBase.replace(
+          "Us adjuntem el borrador de factura d'aquesta OT.",
+          "Us adjuntem la valoració en Excel d'aquesta OT."
+        )
+      : cuerpoBase,
+  };
 
   return (
     <span className="inline-flex items-center justify-center gap-1">
@@ -2471,7 +2516,7 @@ function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = 
         <ModalCorreoResponsableOT
           titulo="Confirmar facturación"
           estadoAdjunto={estadoAdjunto}
-          borrador={{ ...borrador, adjunto, htmlRevision }}
+          borrador={{ ...borrador, adjunto, adjuntosExtra: excelAdj ? [excelAdj] : [], htmlRevision }}
           onCerrar={() => setAbierto(false)}
           onEnviado={(info) => { setAbierto(false); setEnviado(true); onRegistrado?.(info); }}
         />
@@ -4230,6 +4275,26 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     ? Number(movsUso.horas) || 0
     : null;
 
+  const [tarifaMO, setTarifaMO] = useState(null);
+  useEffect(() => {
+    if (!esPresupuesto) {
+      setTarifaMO(null);
+      return;
+    }
+    let cancelado = false;
+    setTarifaMO({ cargando: true, error: null, grupos: {}, nombres: {}, precios: {} });
+    fetch("/api/ot/tarifa-mano-obra")
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
+        if (!cancelado) setTarifaMO({ cargando: false, error: null, grupos: j.grupos || {}, nombres: j.nombres || {}, precios: j.precios || {} });
+      })
+      .catch((err) => {
+        if (!cancelado) setTarifaMO({ cargando: false, error: err.message || String(err), grupos: {}, nombres: {}, precios: {} });
+      });
+    return () => { cancelado = true; };
+  }, [esPresupuesto]);
+
   const clienteFactura = ficha.general?.cliente || "";
   const clienteNumeroFactura = (lineasBC?.ventaRaw || []).map((r) => r["Sell_to_Customer_No"]).find(Boolean) || "";
   const crearFacturaDeEstaOT = async () => {
@@ -4545,13 +4610,119 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     });
   }, [ficha, lineasBC]);
 
+  const valoracionPresupuesto = useMemo(() => {
+    if (!esPresupuesto) return null;
+    const grupos = tarifaMO?.grupos || {};
+    const nombres = tarifaMO?.nombres || {};
+    const precios = tarifaMO?.precios || {};
+    const grupoDe = (rec) => {
+      const r = String(rec || "").trim();
+      if (!r) return "";
+      if (grupos[r]) return grupos[r];
+      const pad = r.padStart(4, "0");
+      if (grupos[pad]) return grupos[pad];
+      const n = parseInt(r, 10);
+      if (n && grupos[String(n)]) return grupos[String(n)];
+      return "";
+    };
+    const nombreDe = (rec, desc) => {
+      const r = String(rec || "").trim();
+      return nombres[r] || nombres[r.padStart(4, "0")] || desc || r;
+    };
+    const horas = (movsUso?.filas || []).map((f) => {
+      const grupo = grupoDe(f.recurso);
+      const tipo = String(f.tipoTrabajo || "").trim();
+      const precio = grupo && tipo ? precios[`${grupo}|${tipo}`] : null;
+      const cantidad = Number(f.cantidad) || 0;
+      return {
+        ...f,
+        grupo,
+        nombre: nombreDe(f.recurso, f.descripcion),
+        precio: precio == null ? null : precio,
+        coste: cantidad * 21.5,
+        venta: precio == null ? null : cantidad * precio,
+      };
+    });
+    const compras = compraReal.map((l) => {
+      const importe = Number(l.importe ?? l["Importe línea"]) || 0;
+      const cantidad = Number(l.cantidad ?? l["Cantidad"]) || 0;
+      const costeUnitario = Number(l.costeUnitario ?? l["Coste unitario"]) || (cantidad ? importe / cantidad : 0);
+      const dtos = Array.isArray(l.dtos)
+        ? l.dtos
+        : [Number(l["% Dto. 1"]) || 0, Number(l["% Dto. 2"]) || 0, Number(l["% Dto. 3"]) || 0];
+      return {
+        documento: l.numeroDocumento ?? l["Nº documento"] ?? "",
+        numero: l.numero ?? l["Nº"] ?? "",
+        descripcion: l.descripcion ?? l["Descripción"] ?? "",
+        proveedor: l.proveedor ?? l["Nombre de proveedor de compra"] ?? "",
+        cantidad,
+        importe,
+        costeUnitario,
+        fecha: l.fechaPedido ?? l["Fecha pedido"] ?? l.fechaRegistro ?? "",
+        dtos,
+        venta: importe * 1.68,
+      };
+    });
+    const costeMO = horas.reduce((a, h) => a + h.coste, 0);
+    const ventaMOConocida = horas.reduce((a, h) => a + (h.venta || 0), 0);
+    const sinTarifa = horas.filter((h) => h.venta == null).length;
+    const costeCompras = compras.reduce((a, c) => a + c.importe, 0);
+    const ventaCompras = costeCompras * 1.68;
+    return {
+      horas,
+      compras,
+      totalHoras: horas.reduce((a, h) => a + (Number(h.cantidad) || 0), 0),
+      costeMO,
+      ventaMO: sinTarifa ? null : ventaMOConocida,
+      ventaMOConocida,
+      sinTarifa,
+      costeCompras,
+      ventaCompras,
+      costeConjunto: costeMO + costeCompras,
+      ventaConjunta: sinTarifa ? null : ventaMOConocida + ventaCompras,
+    };
+  }, [esPresupuesto, tarifaMO, movsUso, compraReal]);
+
   const dif = useMemo(() => compararMaterialOT(ventaMaterial, compraReal), [ventaMaterial, compraReal]);
   const costeAplicado = costeNoFacturadoSeleccionado(dif, clavesCosteNF);
+
+  // Precio corregido a mano en la tarjeta Material taller. Se guarda en
+  // este navegador, por OT y artículo. El valor guardado es el coste unitario.
+  const LS_PRECIO_TALLER = "acsales_precio_taller_manual_v1";
+  const [preciosTaller, setPreciosTaller] = useState({});
+  useEffect(() => {
+    try {
+      const all = JSON.parse(localStorage.getItem(LS_PRECIO_TALLER) || "{}");
+      const deOt = all[noBC];
+      setPreciosTaller(deOt && typeof deOt === "object" ? deOt : {});
+    } catch {
+      setPreciosTaller({});
+    }
+  }, [noBC]);
+  const guardarPrecioTaller = (codigo, descripcion, importeLinea, cantidad) => {
+    const clave = String(codigo || descripcion || "").trim().toLowerCase();
+    if (!clave) return;
+    setPreciosTaller((prev) => {
+      const next = { ...prev };
+      if (importeLinea == null || importeLinea === "") delete next[clave];
+      else {
+        const uds = Number(cantidad) || 0;
+        next[clave] = uds ? Number(importeLinea) / uds : Number(importeLinea);
+      }
+      try {
+        const all = JSON.parse(localStorage.getItem(LS_PRECIO_TALLER) || "{}");
+        all[noBC] = next;
+        localStorage.setItem(LS_PRECIO_TALLER, JSON.stringify(all));
+      } catch { /* si el navegador no deja guardar, vale para esta visita */ }
+      return next;
+    });
+  };
 
   // MATERIAL DEL TALLER — regla de Maria (15/07/2026): los artículos
   // VENDIDOS SIN COMPRA asociada (SIN COSTE) se han cogido del taller y
   // deben contar como coste real de la OT. Valoración: ÚLTIMA COMPRA del
   // artículo en la memoria; si no hay ninguna, precio de venta ÷ 1,75.
+  // Si Maria escribe un importe en la tarjeta, ese precio manda.
   const materialTaller = useMemo(() => {
     return (dif.items || [])
       .filter((it) => it.estado === "sin_coste")
@@ -4560,16 +4731,19 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         const pvUnit = uds > 0 ? (Number(it.importeVenta) || 0) / uds : 0;
         const compras = historialCompraArticulo(it.codigo, it.descripcion, fichas).filter((c) => c.costeUnitario > 0);
         const unit = compras.length ? compras[0].costeUnitario : pvUnit / 1.75;
+        const clave = String(it.codigo || it.descripcion || "").trim().toLowerCase();
+        const tieneManual = Object.prototype.hasOwnProperty.call(preciosTaller, clave) && Number.isFinite(Number(preciosTaller[clave]));
+        const unitFinal = tieneManual ? Number(preciosTaller[clave]) : unit;
         return {
           numero: it.codigo,
           descripcion: it.descripcion,
           cantidad: uds,
-          costeUnitario: unit,
-          importe: unit * uds,
-          _origenCoste: compras.length ? "última compra" : "venta ÷ 1,75",
+          costeUnitario: unitFinal,
+          importe: unitFinal * uds,
+          _origenCoste: tieneManual ? "precio manual" : (compras.length ? "última compra" : "venta ÷ 1,75"),
         };
       });
-  }, [dif, fichas]);
+  }, [dif, fichas, preciosTaller]);
   const costeTaller = materialTaller.reduce((a, l) => a + l.importe, 0);
 
   const ESTADO_UI = {
@@ -4634,7 +4808,8 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     const pctGeneral = taxesProvisionales ? PCT_ESTRUCTURA : (tasasEst?.pctGeneral ?? 0);
     const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller);
     const costeDirecto = costeMaterial + manoObra;
-    const vo = calcularVentaObjetivo(costeDirecto, ratioPropia, pctGeneral);
+    const coefVenta = coefVentaPosible(ficha.general?.cliente);
+    const vo = calcularVentaObjetivo(costeDirecto, ratioPropia, pctGeneral, MARGEN_OBJETIVO_VENTA, coefVenta);
     const baseVo = vo.ventaObjetivo;
     // Mateixes cel·les que la fila Venda objectiu (NO % × ingressos).
     const estrPropia = baseVo != null ? baseVo * ratioPropia : null;
@@ -4645,6 +4820,8 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       costeMaterial,
       manoObra,
       ventaObjetivo: baseVo,
+      ventaPosible: vo.ventaCoef,
+      coefVenta,
       estrPropia,
       estrGeneral,
       estrMarge,
@@ -4712,9 +4889,10 @@ function DetalleOT({ ficha, fichas, onVolver }) {
           · Ingresos y horas: de las LÍNEAS REALES de BC si están cargadas
             (botón «Cargar líneas desde BC»); si no, de la memoria (parcial).
           · Mano de obra a COSTE = horas vendidas (líneas Recurso) × 21,50 €/h
-          · Estructura = % (pròpia UN + general) de Venda objectiu × venta
+          · Estructura = estructura pròpia + estructura general (las dos, sobre Venta Objetivo)
           · Margen bruto = venta − materiales − mano de obra
-          · Resultado = margen bruto − estructura */}
+          · Barra de venta = el más alto entre Venta Actual y Venta Posible
+          · Resultado de la barra = esa venta − coste (material + mano de obra + estructura) */}
       {(() => {
         const TARIFA_COSTE_MO = 21.5;
         const PCT_ESTRUCTURA = 0.22; // solo fallback provisional (igual que Venda objectiu)
@@ -4736,7 +4914,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         // líneas de compra reales (PC) deduplicadas (memoria + BC).
         const materiales = compraReal.reduce((a, l) => a + (Number(l.importe ?? l["Importe línea"]) || 0), 0);
         const compradoNoVendido = costeAplicado;
-        // % estructura = mismo que Venda objectiu (pròpia UN + general).
+        // Estructura de la barra = estructura pròpia + general, las dos sobre Venta Objetivo.
         const un = actividadDeFicha(ficha);
         const taxesProvisionales = tasasEstEstado !== "ok";
         const infoUn = (!taxesProvisionales && tasasEst?.porUn && un) ? tasasEst.porUn[un] : null;
@@ -4744,17 +4922,25 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         const pctGeneral = taxesProvisionales ? PCT_ESTRUCTURA : (tasasEst?.pctGeneral ?? 0);
         const pctEstructura = ratioPropia + pctGeneral;
         const pctTxt = (x) => `${((Number(x) || 0) * 100).toLocaleString("es-ES", { maximumFractionDigits: 1 })} %`;
-        const estructura = ingresos * pctEstructura;
         const margenBruto = ingresos - (materiales - compradoNoVendido) - costeTaller - manoObra;
-        const resultado = margenBruto - estructura;
-        const pct = ingresos > 0 ? Math.round((resultado / ingresos) * 100) : null;
-        const col = (v) => (v < 0 ? "text-red-600" : "text-emerald-600");
         const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller);
+        const costeDirectoBarra = costeMaterial + manoObra;
+        const coefBarra = coefVentaPosible(ficha.general?.cliente);
+        const voBarra = calcularVentaObjetivo(costeDirectoBarra, ratioPropia, pctGeneral, MARGEN_OBJETIVO_VENTA, coefBarra);
+        const ventaObjetivoBarra = voBarra.ventaObjetivo;
+        const estructura = ventaObjetivoBarra != null ? ventaObjetivoBarra * pctEstructura : 0;
+        const col = (v) => (v < 0 ? "text-red-600" : "text-emerald-600");
         const coste = costeMaterial + manoObra + estructura;
+        const ventaPosibleBarra = voBarra.ventaCoef || 0;
+        const ventaActualBarra = Number(ingresos) || 0;
+        const usaActual = ventaActualBarra >= ventaPosibleBarra;
+        const vendaBarra = Math.max(ventaActualBarra, ventaPosibleBarra);
+        const resultado = vendaBarra - coste;
+        const pct = vendaBarra > 0 ? Math.round((resultado / vendaBarra) * 100) : null;
         const gana = resultado > 0.5;
         const pierde = resultado < -0.5;
-        const tope = Math.max(ingresos, coste, 1);
-        const anchoVenta = Math.min(100, Math.round((Math.max(ingresos, 0) / tope) * 100));
+        const tope = Math.max(vendaBarra, coste, 1);
+        const anchoVenta = Math.min(100, Math.round((Math.max(vendaBarra, 0) / tope) * 100));
         const anchoCoste = Math.min(100, Math.round((Math.max(coste, 0) / tope) * 100));
         // Segmentos de la barra Cost (proporción sobre el coste total; el ancho total = anchoCoste)
         const pctSeg = (v) => (coste > 0 ? Math.max(0, (Math.max(v, 0) / coste) * 100) : 0);
@@ -4934,14 +5120,14 @@ function DetalleOT({ ficha, fichas, onVolver }) {
               </div>
               <div className="mt-3 space-y-1.5">
                 <div className="flex items-center gap-2">
-                  <span className="w-12 text-[10px] font-semibold text-slate-500">Venda</span>
+                  <span className="w-14 text-[10px] font-semibold text-slate-500" title={usaActual ? "Venta Actual: és més alta que la Venta Posible" : "Venta Posible: és més alta que la Venta Actual"}>{usaActual ? "Actual" : "Posible"}</span>
                   <div className="flex-1 h-2.5 bg-white/80 rounded-full overflow-hidden">
                     <div className="h-2.5 bg-blue-500 rounded-full" style={{ width: `${anchoVenta}%` }} />
                   </div>
-                  <span className="w-16 text-right text-[11px] font-bold text-slate-700 tabular-nums">{eur(ingresos)}</span>
+                  <span className="w-16 text-right text-[11px] font-bold text-slate-700 tabular-nums">{eur(vendaBarra)}</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="w-12 text-[10px] font-semibold text-slate-500">Cost</span>
+                  <span className="w-14 text-[10px] font-semibold text-slate-500">Cost</span>
                   <div className="flex-1 h-2.5 bg-white/80 rounded-full overflow-hidden">
                     <div className="h-2.5 flex rounded-full overflow-hidden" style={{ width: `${anchoCoste}%` }}>
                       {segMaterial > 0 && <div className="h-full bg-amber-500" style={{ width: `${segMaterial}%` }} title={`Material: ${eur(costeMaterial)}`} />}
@@ -5004,7 +5190,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                   tipoHistorial: "compra",
                 })}
               />
-              {costeTaller > 0 && (
+              {materialTaller.length > 0 && (
                 <Metrica
                   label="Material taller"
                   valor={`+ ${eur(costeTaller)}`}
@@ -5012,8 +5198,9 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                   colorClase="text-amber-600"
                   title="Desglossar material taller"
                   onClick={() => setDesglose({
+                    esTaller: true,
                     titulo: `Material taller · + ${eur(costeTaller)}`,
-                    subtitulo: "Venut sense compra (cost estimat)",
+                    subtitulo: "Venut sense compra. Pots corregir l'import de la línia; buit torna al càlcul automàtic.",
                     filas: filasTaller,
                     total: costeTaller,
                     totalLabel: "Total = cel·la Material taller",
@@ -5524,7 +5711,11 @@ function DetalleOT({ ficha, fichas, onVolver }) {
             ficha={ficha}
             dif={dif}
             valoracion={valoracionCorreo}
-            title="Abre el correo al responsable con la valoración, la revisión de material y el borrador de factura en PDF"
+            excelValoracion={esPresupuesto ? valoracionPresupuesto : null}
+            excelPendiente={esPresupuesto && (!movsUso || movsUso.cargando || !tarifaMO || tarifaMO.cargando)}
+            title={esPresupuesto
+              ? "Abre el correo al responsable con la revisión de material y la valoración en Excel"
+              : "Abre el correo al responsable con la valoración, la revisión de material y el borrador de factura en PDF"}
             className="flex items-center gap-1.5 text-[11px] font-semibold text-blue-700 bg-white border border-blue-300 rounded-md px-2.5 py-1 hover:bg-blue-50"
           >
             <Mail size={12} /> Revisió material
@@ -5578,6 +5769,102 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         <PartesTrabajoOT lineasRaw={lineasBC?.ventaRaw} ficha={ficha} fichas={fichas} onClicArticulo={(codigo, descripcion) => setHistorial({ tipo: "venta", codigo, descripcion })} />
       )}
 
+      {esPresupuesto && (
+        <div className="bg-white border border-indigo-200 rounded-lg p-4 mt-3">
+          <div className="flex items-baseline justify-between gap-2 flex-wrap mb-2">
+            <div className="text-xs font-bold text-slate-800">Valoració del pressupost {ficha.general.presupuesto}</div>
+            <div className="text-[10px] text-slate-400">Mà d'obra: cost 21,50 €/h · venda segons tarifa general i tipus d'hora · Material: cost de les compres × 1,68</div>
+          </div>
+          {(movsUso?.cargando || tarifaMO?.cargando) && <div className="text-[11px] text-slate-500">Llegint hores i tarifa…</div>}
+          {(movsUso?.error || tarifaMO?.error) && (
+            <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 mb-2">
+              {movsUso?.error || tarifaMO?.error}
+            </div>
+          )}
+          {valoracionPresupuesto && (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3 text-[11px]">
+                {[
+                  ["Hores", valoracionPresupuesto.totalHoras.toLocaleString("es-ES", { maximumFractionDigits: 2 })],
+                  ["Cost mà d'obra", eur(valoracionPresupuesto.costeMO)],
+                  ["Venda mà d'obra", eur(valoracionPresupuesto.ventaMO)],
+                  ["Cost compres", eur(valoracionPresupuesto.costeCompras)],
+                  ["Venda compres", eur(valoracionPresupuesto.ventaCompras)],
+                  ["Cost conjunt", eur(valoracionPresupuesto.costeConjunto)],
+                  ["Venda conjunta", eur(valoracionPresupuesto.ventaConjunta)],
+                ].map(([eti, val]) => (
+                  <div key={eti} className="bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
+                    <div className="text-[9px] font-semibold text-slate-400 uppercase">{eti}</div>
+                    <div className="font-bold text-slate-800 tabular-nums">{val}</div>
+                  </div>
+                ))}
+              </div>
+              {valoracionPresupuesto.sinTarifa > 0 && (
+                <div className="text-[11px] text-amber-800 mb-2">
+                  {valoracionPresupuesto.sinTarifa} línia(es) d'hores sense tarifa (falta el grup del recurs o el tipus d'hora). La venda de mà d'obra no es tanca.
+                </div>
+              )}
+              <div className="text-[11px] font-semibold text-slate-600 mb-1">Hores ({valoracionPresupuesto.horas.length})</div>
+              <div className="max-h-48 overflow-auto border border-slate-200 rounded mb-3">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-slate-100 text-slate-500 sticky top-0">
+                    <tr>
+                      <th className="text-left px-2 py-1">Recurs</th>
+                      <th className="text-left px-2 py-1">Tipus</th>
+                      <th className="text-right px-2 py-1">Hores</th>
+                      <th className="text-right px-2 py-1">Cost</th>
+                      <th className="text-right px-2 py-1">€/h</th>
+                      <th className="text-right px-2 py-1">Venda</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {valoracionPresupuesto.horas.map((h, i) => (
+                      <tr key={i} className="border-t border-slate-100">
+                        <td className="px-2 py-1">{h.nombre} <span className="text-slate-400">{h.recurso}{h.grupo ? ` · ${h.grupo}` : ""}</span></td>
+                        <td className="px-2 py-1">{h.tipoTrabajo || "—"}</td>
+                        <td className="px-2 py-1 text-right tabular-nums">{h.cantidad}</td>
+                        <td className="px-2 py-1 text-right tabular-nums">{eur(h.coste)}</td>
+                        <td className="px-2 py-1 text-right tabular-nums">{h.precio == null ? "—" : eur(h.precio)}</td>
+                        <td className="px-2 py-1 text-right tabular-nums font-semibold">{eur(h.venta)}</td>
+                      </tr>
+                    ))}
+                    {valoracionPresupuesto.horas.length === 0 && !movsUso?.cargando && (
+                      <tr><td colSpan={6} className="px-2 py-2 text-slate-400">No hi ha hores d'ús en aquesta OT.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="text-[11px] font-semibold text-slate-600 mb-1">Compres ({valoracionPresupuesto.compras.length})</div>
+              <div className="max-h-48 overflow-auto border border-slate-200 rounded">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-slate-100 text-slate-500 sticky top-0">
+                    <tr>
+                      <th className="text-left px-2 py-1">Document</th>
+                      <th className="text-left px-2 py-1">Descripció</th>
+                      <th className="text-right px-2 py-1">Cost</th>
+                      <th className="text-right px-2 py-1">Venda × 1,68</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {valoracionPresupuesto.compras.map((c, i) => (
+                      <tr key={i} className="border-t border-slate-100">
+                        <td className="px-2 py-1 whitespace-nowrap">{c.documento}</td>
+                        <td className="px-2 py-1 truncate max-w-xs" title={c.descripcion}>{c.descripcion || c.numero || "—"}</td>
+                        <td className="px-2 py-1 text-right tabular-nums">{eur(c.importe)}</td>
+                        <td className="px-2 py-1 text-right tabular-nums font-semibold">{eur(c.venta)}</td>
+                      </tr>
+                    ))}
+                    {valoracionPresupuesto.compras.length === 0 && (
+                      <tr><td colSpan={4} className="px-2 py-2 text-slate-400">No hi ha línies de compra en aquesta OT.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {historial && (
         <ModalHistorialArticulo
           {...historial}
@@ -5592,11 +5879,25 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       {desglose && (
         <ModalDesgloseCelda
           {...desglose}
-          filas={desglose.esCosteNF ? costeNFVista.filas : desglose.filas}
-          total={desglose.esCosteNF ? costeAplicado : desglose.total}
-          titulo={desglose.esCosteNF
+          filas={desglose.esTaller
+            ? materialTaller.map((l) => ({
+                codigo: String(l.numero || "").trim(),
+                descripcion: String(l.descripcion || "").trim(),
+                cantidad: Number(l.cantidad) || 0,
+                importe: Number(l.importe) || 0,
+                nota: l._origenCoste || "",
+                editable: true,
+              }))
+            : desglose.esCosteNF ? costeNFVista.filas : desglose.filas}
+          total={desglose.esTaller ? costeTaller : desglose.esCosteNF ? costeAplicado : desglose.total}
+          titulo={desglose.esTaller
+            ? `Material taller · + ${eur(costeTaller)}`
+            : desglose.esCosteNF
             ? `Coste No Facturado · ${costeAplicado > 0 ? "− " + eur(costeAplicado) : eur(0)}`
             : desglose.titulo}
+          onEditarImporte={desglose.esTaller
+            ? (f, importe) => guardarPrecioTaller(f.codigo, f.descripcion, importe, f.cantidad)
+            : null}
           modoCoste={!!desglose.esCosteNF}
           onAnadirLinea={desglose.esCosteNF ? (clave) => cambiarCosteNF([clave], true) : null}
           onQuitarLinea={desglose.esCosteNF ? (clave) => cambiarCosteNF([clave], false) : null}
@@ -5611,6 +5912,41 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         />
       )}
     </div>
+  );
+}
+
+function parseEuroEscrito(txt) {
+  let s = String(txt || "").trim().replace(/€/g, "").replace(/\s/g, "");
+  if (!s) return null;
+  if (s.includes(",") && s.includes(".")) s = s.replace(/\./g, "").replace(",", ".");
+  else if (s.includes(",")) s = s.replace(",", ".");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function PrecioLineaTaller({ importe, onGuardar }) {
+  const texto = (n) => (Number(n) || 0).toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const [txt, setTxt] = useState(texto(importe));
+  const [foco, setFoco] = useState(false);
+  useEffect(() => { if (!foco) setTxt(texto(importe)); }, [importe, foco]);
+  return (
+    <input
+      value={txt}
+      onChange={(e) => setTxt(e.target.value)}
+      onFocus={() => setFoco(true)}
+      onBlur={() => {
+        setFoco(false);
+        const s = txt.trim();
+        if (!s) { onGuardar(null); return; }
+        const n = parseEuroEscrito(s);
+        if (n == null) { setTxt(texto(importe)); return; }
+        onGuardar(n);
+      }}
+      onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+      title="Import de la línia. Deixa'l buit per tornar al càlcul automàtic."
+      aria-label="Import de la línia"
+      className="w-20 text-right text-[11px] tabular-nums font-semibold text-slate-800 border border-amber-300 rounded px-1 py-0.5 bg-white focus:outline-none focus:ring-1 focus:ring-amber-400"
+    />
   );
 }
 
@@ -5629,11 +5965,13 @@ function ModalDesgloseCelda({
   onQuitarLinea,
   onAnadirTodas,
   onQuitarTodas,
+  onEditarImporte = null,
 }) {
   const tieneDoc = (filas || []).some((f) => f.documento);
   const tieneProv = (filas || []).some((f) => f.proveedor);
   const tieneFecha = (filas || []).some((f) => f.fecha);
   const tieneNota = (filas || []).some((f) => f.nota);
+  const editable = (filas || []).some((f) => f.editable);
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={onCerrar}>
       <div
@@ -5694,7 +6032,7 @@ function ModalDesgloseCelda({
                 <span className="flex-1 min-w-0">Descripció</span>
                 {tieneNota && <span className="w-24 shrink-0">Origen cost</span>}
                 <span className="w-12 text-right shrink-0">Cant.</span>
-                <span className="w-20 text-right shrink-0">Import</span>
+                <span className={`${editable ? "w-28" : "w-20"} text-right shrink-0`}>Import</span>
                 {modoCoste && <span className="w-16 shrink-0" />}
               </div>
               {filas.map((f, i) => (
@@ -5725,7 +6063,23 @@ function ModalDesgloseCelda({
                     <span className="w-24 shrink-0 text-[10px] text-slate-400 truncate" title={f.nota}>{f.nota || "—"}</span>
                   )}
                   <span className="w-12 text-right shrink-0 tabular-nums text-slate-600">{f.cantidad != null ? f.cantidad : "—"}</span>
-                  <span className="w-20 text-right shrink-0 tabular-nums font-semibold text-slate-800">{eur(f.importe)}</span>
+                  {f.editable && onEditarImporte ? (
+                    <span className="w-28 shrink-0 inline-flex items-center justify-end gap-1">
+                      <PrecioLineaTaller importe={f.importe} onGuardar={(n) => onEditarImporte(f, n)} />
+                      {f.nota === "precio manual" && (
+                        <button
+                          type="button"
+                          title="Tornar al càlcul automàtic"
+                          onClick={() => onEditarImporte(f, null)}
+                          className="text-[9px] text-slate-400 hover:text-slate-700"
+                        >
+                          auto
+                        </button>
+                      )}
+                    </span>
+                  ) : (
+                    <span className="w-20 text-right shrink-0 tabular-nums font-semibold text-slate-800">{eur(f.importe)}</span>
+                  )}
                   {modoCoste && (
                     <button
                       type="button"

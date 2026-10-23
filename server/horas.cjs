@@ -453,6 +453,7 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
         filas.push({
           fecha: String(campo(f, ["Posting_Date", "Fecha_registro", "PostingDate"])).slice(0, 10),
           documento: String(campo(f, ["Document_No", "No_documento", "DocumentNo"])),
+          tarea: String(campo(f, ["Job_Task_No", "No_tarea_proyecto", "JobTaskNo"])),
           recurso: String(campo(f, ["No", "No_", "Nº"])),
           descripcion: String(campo(f, ["Description", "Descripción", "Descripcion"])),
           tipoTrabajo: String(campo(f, ["Work_Type_Code", "Cod_tipo_trabajo", "WorkTypeCode"])),
@@ -466,6 +467,46 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
     } catch (e) {
       console.error("Error /api/horas/ot-uso:", e);
       res.status(500).json({ error: "No se pudieron leer las horas de Movs. proyecto.", detalle: String(e.message || e) });
+    }
+  });
+
+  // Tarifa general de mano de obra (lista GENERAL, familia de recurso)
+  // y el grupo de cada recurso (MOINS01, MOMA02…). La ficha de una OT con
+  // presupuesto cruza las horas reales con este precio según el tipo de hora.
+  app.get("/api/ot/tarifa-mano-obra", async (req, res) => {
+    try {
+      const token = await obtenerTokenBC();
+      const recursos = await leerTodo(
+        `${raiz()}/Ficha_recurso_Excel?$select=No,Name,Resource_Group_No`,
+        token,
+        20000
+      );
+      const grupos = {};
+      const nombres = {};
+      for (const r of recursos) {
+        const no = String(r.No || "").trim();
+        if (!no) continue;
+        grupos[no] = String(r.Resource_Group_No || "").trim();
+        nombres[no] = String(r.Name || "").trim();
+      }
+      const filtro = encodeURIComponent("Price_List_Code eq 'GENERAL' and Asset_Type eq 'Resource Group'");
+      const lineas = await leerTodo(
+        `${raiz()}/Price_List_Lines_Excel?$filter=${filtro}&$select=Product_No,Work_Type_Code,Unit_Price`,
+        token,
+        5000
+      );
+      const precios = {};
+      for (const l of lineas) {
+        const prod = String(l.Product_No || "").trim();
+        const tipo = String(l.Work_Type_Code || "").trim();
+        const precio = Number(l.Unit_Price);
+        if (!prod || !tipo || !(precio > 0)) continue;
+        precios[`${prod}|${tipo}`] = precio;
+      }
+      res.json({ grupos, nombres, precios, lineas: Object.keys(precios).length, recursos: Object.keys(grupos).length });
+    } catch (e) {
+      console.error("Error /api/ot/tarifa-mano-obra:", e);
+      res.status(500).json({ error: "No se ha podido leer la tarifa de mano de obra.", detalle: String(e.message || e) });
     }
   });
 };

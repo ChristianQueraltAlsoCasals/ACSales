@@ -12,9 +12,16 @@ import React, { useEffect, useRef, useState } from "react";
 import Indicadores from "./indicadores.jsx";
 import CuadroDireccion from "./cuadroDireccion.jsx";
 import ManoObra from "./manoObra.jsx";
+import PanelOrigen from "./PanelOrigen.jsx";
+import { contextoOrigen, explicarOrigen, idDeFila } from "./origenCifra.js";
 
 const hoy = () => new Date().toISOString().slice(0, 10);
 const inicioAnio = (iso) => `${String(iso || hoy()).slice(0, 4)}-01-01`;
+const menosUnAño = (iso) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCFullYear(d.getUTCFullYear() - 1);
+  return d.toISOString().slice(0, 10);
+};
 const eur = (v) => (v == null || !isFinite(v) ? "—" : v.toLocaleString("es-ES", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }));
 const eur2 = (v) => (v == null || !isFinite(v) ? "—" : v.toLocaleString("es-ES", { style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const div = (a, b) => (b && isFinite(a / b) ? a / b : null);
@@ -218,7 +225,26 @@ function colorSemaforo(v, rango) {
   return "text-red-600";
 }
 
-function Tabla({ titulo, nota, filas, filasPrev, etiqActual, etiqPrev, explic, onExplicar, onCerrar }) {
+function CifraTabla({ activo, onClick, className, children }) {
+  return (
+    <button type="button" onClick={onClick} title="Ver de dónde sale esta cifra" className={`bg-transparent border-0 p-0 cursor-pointer hover:underline decoration-dotted underline-offset-2 ${activo ? "underline decoration-sky-700" : ""} ${className || ""}`}>
+      {children}
+    </button>
+  );
+}
+
+function Tabla({ titulo, nota, filas, filasPrev, etiqActual, etiqPrev, explic, onExplicar, onCerrar, datos, b, bp }) {
+  const [abierto, setAbierto] = useState(null);
+  const pulsar = (nombre, periodo, valor) => {
+    setAbierto((s) => (s && s.nombre === nombre && s.periodo === periodo ? null : { nombre, periodo, valor }));
+  };
+  const periodoOtro = abierto?.periodo === "anterior" ? "actual" : "anterior";
+  const arbolAbierto = abierto ? explicarOrigen(idDeFila(abierto.nombre), contextoOrigen({
+    datos, b, bp, periodo: abierto.periodo, etiqueta: abierto.periodo === "anterior" ? etiqPrev : etiqActual,
+  }), abierto.valor) : null;
+  const arbolOtro = abierto ? explicarOrigen(idDeFila(abierto.nombre), contextoOrigen({
+    datos, b, bp, periodo: periodoOtro, etiqueta: periodoOtro === "anterior" ? etiqPrev : etiqActual,
+  })) : null;
   return (
     <section className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
       <div className="px-4 py-3 border-b bg-slate-50">
@@ -236,8 +262,8 @@ function Tabla({ titulo, nota, filas, filasPrev, etiqActual, etiqPrev, explic, o
           <tr className="text-left text-xs text-slate-500">
             <th className="px-4 py-2 font-medium">Ratio</th>
             <th className="px-4 py-2 font-medium">Fórmula</th>
-            <th className="px-4 py-2 font-medium text-right">{etiqActual}</th>
-            <th className="px-4 py-2 font-medium text-right">{etiqPrev}</th>
+            <th className="px-4 py-2 font-medium text-right" title="Pulsa un importe para ver de dónde sale">{etiqActual}</th>
+            <th className="px-4 py-2 font-medium text-right" title="Pulsa un importe para ver de dónde sale">{etiqPrev}</th>
           </tr>
         </thead>
         <tbody>
@@ -254,9 +280,20 @@ function Tabla({ titulo, nota, filas, filasPrev, etiqActual, etiqPrev, explic, o
                     <BotonExplicame cargando={explic[clave]?.cargando} onClick={() => onExplicar(clave, filaIA)} />
                   </td>
                   <td className="px-4 py-2 font-mono text-xs text-slate-500">{formula}</td>
-                  <td className={`px-4 py-2 text-right font-semibold whitespace-nowrap ${colorSemaforo(v, rango)}`}>{FORMATOS[fmt](v)}</td>
-                  <td className="px-4 py-2 text-right text-slate-400 whitespace-nowrap">{FORMATOS[fmt](vp)}</td>
+                  <td className="px-4 py-2 text-right whitespace-nowrap">
+                    <CifraTabla activo={abierto?.nombre === nombre && abierto?.periodo === "actual"} onClick={() => pulsar(nombre, "actual", v)} className={`font-semibold ${colorSemaforo(v, rango)}`}>{FORMATOS[fmt](v)}</CifraTabla>
+                  </td>
+                  <td className="px-4 py-2 text-right whitespace-nowrap">
+                    <CifraTabla activo={abierto?.nombre === nombre && abierto?.periodo === "anterior"} onClick={() => pulsar(nombre, "anterior", vp)} className="text-slate-400">{FORMATOS[fmt](vp)}</CifraTabla>
+                  </td>
                 </tr>
+                {abierto?.nombre === nombre && (
+                  <tr>
+                    <td colSpan={4} className="px-4 pb-3">
+                      <PanelOrigen arbol={arbolAbierto} otro={arbolOtro} onCerrar={() => setAbierto(null)} />
+                    </td>
+                  </tr>
+                )}
                 {explic[clave] && (
                   <tr>
                     <td colSpan={4} className="px-4 pb-3">
@@ -297,7 +334,18 @@ function CeldaExistencias({ texto, contable, onChange, onBlur, onRestaurar, suav
   );
 }
 
-function Masas({ b, bp, eContable, eContablePrev, descuadre, stockTxt, onStock, explic, onExplicar, onCerrar, etiqActual, etiqPrev }) {
+function Masas({ b, bp, eContable, eContablePrev, descuadre, stockTxt, onStock, explic, onExplicar, onCerrar, etiqActual, etiqPrev, datos }) {
+  const [abierto, setAbierto] = useState(null);
+  const pulsar = (nombre, periodo, valor) => {
+    setAbierto((s) => (s && s.nombre === nombre && s.periodo === periodo ? null : { nombre, periodo, valor }));
+  };
+  const periodoOtro = abierto?.periodo === "anterior" ? "actual" : "anterior";
+  const arbolAbierto = abierto ? explicarOrigen(idDeFila(abierto.nombre), contextoOrigen({
+    datos, b, bp, periodo: abierto.periodo, etiqueta: abierto.periodo === "anterior" ? etiqPrev : etiqActual,
+  }), abierto.valor) : null;
+  const arbolOtro = abierto ? explicarOrigen(idDeFila(abierto.nombre), contextoOrigen({
+    datos, b, bp, periodo: periodoOtro, etiqueta: periodoOtro === "anterior" ? etiqPrev : etiqActual,
+  })) : null;
   const filas = [
     ["Activo fijo (AF)", "Naves, máquinas, vehículos y equipos que duran más de un año. Ejemplo: la furgoneta y la maquinaria del taller.", b.AF, bp.AF],
     ["Existencias (E)", "Material en el almacén que todavía no se ha usado. Ejemplo: tubos y racores en stock.", b.E, bp.E],
@@ -339,15 +387,32 @@ function Masas({ b, bp, eContable, eContablePrev, descuadre, stockTxt, onStock, 
                   </td>
                   <td className="px-4 py-2 text-right whitespace-nowrap">
                     {n === "Existencias (E)" ? (
-                      <CeldaExistencias texto={stockTxt.actual} contable={eContable} suave={false} onChange={(t) => onStock("actual", t)} onBlur={() => onStock("actual", "blur")} onRestaurar={() => onStock("actual", null)} />
-                    ) : eur(v)}
+                      <div>
+                        <CeldaExistencias texto={stockTxt.actual} contable={eContable} suave={false} onChange={(t) => onStock("actual", t)} onBlur={() => onStock("actual", "blur")} onRestaurar={() => onStock("actual", null)} />
+                        <button type="button" onClick={() => pulsar(n, "actual", v)} className="mt-1 text-[11px] underline text-sky-800">Ver cuentas</button>
+                      </div>
+                    ) : (
+                      <CifraTabla activo={abierto?.nombre === n && abierto?.periodo === "actual"} onClick={() => pulsar(n, "actual", v)} className={destacado ? "font-bold" : "font-semibold"}>{eur(v)}</CifraTabla>
+                    )}
                   </td>
                   <td className="px-4 py-2 text-right text-slate-400 whitespace-nowrap">
                     {n === "Existencias (E)" ? (
-                      <CeldaExistencias texto={stockTxt.anterior} contable={eContablePrev} suave onChange={(t) => onStock("anterior", t)} onBlur={() => onStock("anterior", "blur")} onRestaurar={() => onStock("anterior", null)} />
-                    ) : eur(vp)}
+                      <div>
+                        <CeldaExistencias texto={stockTxt.anterior} contable={eContablePrev} suave onChange={(t) => onStock("anterior", t)} onBlur={() => onStock("anterior", "blur")} onRestaurar={() => onStock("anterior", null)} />
+                        <button type="button" onClick={() => pulsar(n, "anterior", vp)} className="mt-1 text-[11px] underline text-sky-800">Ver cuentas</button>
+                      </div>
+                    ) : (
+                      <CifraTabla activo={abierto?.nombre === n && abierto?.periodo === "anterior"} onClick={() => pulsar(n, "anterior", vp)}>{eur(vp)}</CifraTabla>
+                    )}
                   </td>
                 </tr>
+                {abierto?.nombre === n && (
+                  <tr>
+                    <td colSpan={3} className="px-4 pb-3">
+                      <PanelOrigen arbol={arbolAbierto} otro={arbolOtro} onCerrar={() => setAbierto(null)} />
+                    </td>
+                  </tr>
+                )}
                 {explic[clave] && (
                   <tr>
                     <td colSpan={3} className="px-4 pb-3">
@@ -810,7 +875,7 @@ function Pizarra({ datos, etiqActual, etiqPrev }) {
   };
 
   const anadir = () => {
-    const calc = datos ? calcularPizarra(texto, datos) : { error: "Pulsa Calcular para cargar las cuentas." };
+    const calc = datos ? calcularPizarra(texto, datos) : { error: "Pulsa Actualizar para cargar las cuentas." };
     if (calc.error) return;
     guardar([{ id: Date.now(), formula: texto.trim(), conclusion: "" }, ...lineas]);
   };
@@ -824,7 +889,7 @@ function Pizarra({ datos, etiqActual, etiqPrev }) {
         Escribe un rango de cuentas y una operación. Los ingresos del grupo 7 salen en positivo, como las ventas de esta pantalla.
         El periodo es el de las fechas de arriba{etiqActual ? ` (${etiqActual})` : ""}.
       </p>
-      {!datos && <p className="mt-3 text-sm text-slate-600">Pulsa Calcular para cargar las cuentas. Después podrás hacer el cálculo.</p>}
+      {!datos && <p className="mt-3 text-sm text-slate-600">Pulsa Actualizar para cargar las cuentas. Después podrás hacer el cálculo.</p>}
       <div className="mt-3 flex flex-wrap items-end gap-2">
         <label className="text-sm text-slate-600 flex-1 min-w-[240px]">
           Cálculo
@@ -918,6 +983,8 @@ function Pizarra({ datos, etiqActual, etiqPrev }) {
 export default function Ratios({ recursos = [] }) {
   const [hasta, setHasta] = useState(hoy());
   const [desde, setDesde] = useState(inicioAnio(hoy()));
+  const [hastaComp, setHastaComp] = useState(menosUnAño(hoy()));
+  const [desdeComp, setDesdeComp] = useState(menosUnAño(inicioAnio(hoy())));
   const [datos, setDatos] = useState(null);
   const [cargando, setCargando] = useState(false);
   const [error, setError] = useState("");
@@ -965,22 +1032,48 @@ export default function Ratios({ recursos = [] }) {
   };
   const cerrarExplic = (clave) => setExplic((s) => { const n = { ...s }; delete n[clave]; return n; });
 
-  const cargar = async (refrescar = false) => {
+  const aplicarFechas = (j) => {
+    if (j?.desde) setDesde(j.desde);
+    if (j?.hasta) setHasta(j.hasta);
+    if (j?.desdePrev) setDesdeComp(j.desdePrev);
+    if (j?.hastaPrev) setHastaComp(j.hastaPrev);
+  };
+
+  const cargarGuardado = async () => {
     setCargando(true);
     setError("");
     try {
-      if (desde > hasta) throw new Error("La fecha inicial no puede ser posterior a la fecha final.");
-      const r = await fetch(`/api/contabilidad/ratios?desde=${desde}&hasta=${hasta}${refrescar ? "&refrescar=1" : ""}`);
+      const r = await fetch("/api/contabilidad/ratios/ultimo");
+      if (r.status === 404) { setDatos(null); return; }
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — ") || `Error ${r.status}`);
       setDatos(j);
+      aplicarFechas(j);
     } catch (e) {
       setError(String(e.message || e).includes("Failed to fetch") ? "No se pudo conectar con el backend. ¿Está arrancado (INICIAR.bat)?" : String(e.message || e));
     } finally {
       setCargando(false);
     }
   };
-  useEffect(() => { cargar(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const actualizar = async () => {
+    setCargando(true);
+    setError("");
+    try {
+      if (desde > hasta) throw new Error("En el periodo a analizar, la fecha inicial no puede ser posterior a la final.");
+      if (desdeComp > hastaComp) throw new Error("En la comparación, la fecha inicial no puede ser posterior a la final.");
+      const r = await fetch(`/api/contabilidad/ratios?desde=${desde}&hasta=${hasta}&desdePrev=${desdeComp}&hastaPrev=${hastaComp}&refrescar=1`);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — ") || `Error ${r.status}`);
+      setDatos(j);
+      aplicarFechas(j);
+    } catch (e) {
+      setError(String(e.message || e).includes("Failed to fetch") ? "No se pudo conectar con el backend. ¿Está arrancado (INICIAR.bat)?" : String(e.message || e));
+    } finally {
+      setCargando(false);
+    }
+  };
+  useEffect(() => { cargarGuardado(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fmtF = (s) => (s ? s.split("-").reverse().join("/") : "");
   const bVista = datos ? conExistencias(datos.actual.balance, parseImporte(stockTxt.actual)) : null;
@@ -996,33 +1089,52 @@ export default function Ratios({ recursos = [] }) {
       <p className="text-slate-500 text-sm mt-1 max-w-5xl">
         Fórmulas de los apuntes (cuenta de resultados, rentabilidades, Dupont, situación, rotación, periodos medios y
         apalancamientos) calculadas con los movimientos de contabilidad de Business Central{datos?.empresa ? ` de ${datos.empresa}` : ""}.
-        Balance a la fecha final; cuenta de resultados entre las dos fechas, comparada con el mismo periodo del año anterior.
+        El balance es a la fecha final de cada periodo. La cuenta de resultados, entre el desde y el hasta.
       </p>
 
-      <div className="flex items-end gap-3 mt-4">
-        <label className="text-sm text-slate-600">
-          Desde fecha
-          <input type="date" value={desde} max={hasta} onChange={(e) => setDesde(e.target.value)} className="block border rounded px-2 py-1 mt-1" />
-        </label>
-        <label className="text-sm text-slate-600">
-          Hasta fecha
-          <input type="date" value={hasta} min={desde} onChange={(e) => setHasta(e.target.value)} className="block border rounded px-2 py-1 mt-1" />
-        </label>
-        <button onClick={() => cargar(false)} disabled={cargando} className="px-4 py-2 rounded bg-blue-700 text-white text-sm disabled:opacity-50">
-          {cargando ? "Calculando…" : "Calcular"}
-        </button>
-        <button onClick={() => cargar(true)} disabled={cargando} className="px-3 py-2 rounded border text-sm disabled:opacity-50" title="Vuelve a leer los movimientos de BC (sin caché)">
-          ↻ Releer BC
+      <div className="flex flex-wrap items-end gap-x-4 gap-y-2 mt-4">
+        <div className="text-sm text-slate-600">
+          <div className="text-xs font-semibold text-slate-700">A analizar</div>
+          <div className="flex gap-2 mt-1">
+            <label>
+              Desde
+              <input type="date" value={desde} max={hasta} onChange={(e) => setDesde(e.target.value)} className="block border rounded px-2 py-1" />
+            </label>
+            <label>
+              Hasta
+              <input type="date" value={hasta} min={desde} onChange={(e) => setHasta(e.target.value)} className="block border rounded px-2 py-1" />
+            </label>
+          </div>
+        </div>
+        <div className="text-sm text-slate-600">
+          <div className="text-xs font-semibold text-slate-700">Comparación</div>
+          <div className="flex gap-2 mt-1">
+            <label>
+              Desde
+              <input type="date" value={desdeComp} max={hastaComp} onChange={(e) => setDesdeComp(e.target.value)} className="block border rounded px-2 py-1" />
+            </label>
+            <label>
+              Hasta
+              <input type="date" value={hastaComp} min={desdeComp} onChange={(e) => setHastaComp(e.target.value)} className="block border rounded px-2 py-1" />
+            </label>
+          </div>
+        </div>
+        <button onClick={actualizar} disabled={cargando} className="px-4 py-2 rounded bg-blue-700 text-white text-sm disabled:opacity-50" title="Vuelve a leer los movimientos de contabilidad y guarda el resultado">
+          {cargando && datos ? "Actualizando…" : cargando ? "Leyendo…" : "Actualizar"}
         </button>
         {datos && (
           <span className="text-xs text-slate-400 ml-2">
-            {datos.movimientos.toLocaleString("es-ES")} movimientos leídos
+            Guardado{datos.calculado ? ` el ${new Date(datos.calculado).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" })}` : ""}.
+            {" "}{datos.movimientos.toLocaleString("es-ES")} movimientos
             {datos.movsCierreExcluidos ? ` · ${datos.movsCierreExcluidos} de regularización/cierre excluidos de la cuenta de resultados` : ""}
-            {datos.deCache ? " · (caché)" : ""}
           </span>
         )}
       </div>
-      {cargando && !datos && <p className="text-sm text-slate-500 mt-4">Leyendo los movimientos de contabilidad de BC… la primera vez puede tardar un par de minutos.</p>}
+      {datos && (desde !== datos.desde || hasta !== datos.hasta || desdeComp !== datos.desdePrev || hastaComp !== datos.hastaPrev) && (
+        <p className="text-sm text-amber-800 mt-3">Las fechas de arriba no son las de las cifras que se ven. Pulsa Actualizar para leer esos periodos y guardarlos.</p>
+      )}
+      {!datos && !cargando && !error && <p className="text-sm text-slate-500 mt-4">No hay cifras guardadas. Pulsa Actualizar para leer la contabilidad. Puede tardar un par de minutos. Después se quedan guardadas.</p>}
+      {cargando && !datos && <p className="text-sm text-slate-500 mt-4">Leyendo las cifras guardadas…</p>}
       {error && <p className="mt-4 text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3">{error}</p>}
 
       <div className="flex gap-1 mt-5 border-b">
@@ -1050,10 +1162,11 @@ export default function Ratios({ recursos = [] }) {
           )}
           {vista === "analisis" && (
         <div className="grid gap-5 mt-6">
+          <p className="text-xs text-slate-500">Pulsa un importe para ver de qué cuentas sale. La fórmula, el comentario y «Explícame» se quedan. El importe de la derecha es el mismo periodo del año anterior.</p>
           {g.map((grupo, i) => (
-            <Tabla key={grupo.titulo} {...grupo} filasPrev={gp[i].filas} etiqActual={etiqActual} etiqPrev={etiqPrev} explic={explic} onExplicar={explicarRatio} onCerrar={cerrarExplic} />
+            <Tabla key={grupo.titulo} {...grupo} filasPrev={gp[i].filas} etiqActual={etiqActual} etiqPrev={etiqPrev} explic={explic} onExplicar={explicarRatio} onCerrar={cerrarExplic} datos={datos} b={bVista} bp={bpVista} />
           ))}
-          <Masas b={bVista} bp={bpVista} eContable={datos.actual.balance.E} eContablePrev={datos.anterior.balance.E} descuadre={datos.actual.balance.descuadre} stockTxt={stockTxt} onStock={fijarStock} explic={explic} onExplicar={explicarRatio} onCerrar={cerrarExplic} etiqActual={etiqActual} etiqPrev={etiqPrev} />
+          <Masas b={bVista} bp={bpVista} eContable={datos.actual.balance.E} eContablePrev={datos.anterior.balance.E} descuadre={datos.actual.balance.descuadre} stockTxt={stockTxt} onStock={fijarStock} explic={explic} onExplicar={explicarRatio} onCerrar={cerrarExplic} etiqActual={etiqActual} etiqPrev={etiqPrev} datos={datos} />
           <p className="text-xs text-slate-400">
             Criterios: activo en positivo, pasivo y patrimonio neto en positivo. El patrimonio neto incluye el resultado del ejercicio aunque no esté cerrado.
             Colores (verde/ámbar/rojo) solo en los ratios que tienen valor ideal en los apuntes.

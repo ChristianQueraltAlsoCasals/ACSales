@@ -10,11 +10,37 @@
  * rotación, periodos medios, apalancamientos, punto muerto).
  *
  * Solo LECTURA. Se calcula también el mismo periodo del año anterior
- * para comparar. Resultado en caché 30 min por empresa + fecha.
+ * para comparar. El último resultado se guarda en disco por empresa:
+ * al abrir la pantalla se enseña ese resultado. Solo «Actualizar» vuelve a leer BC.
  */
+const fs = require("fs");
+const path = require("path");
+
 module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE }) {
   const cache = new Map();
   const cacheNombres = new Map(); // empresa -> {ts, mapa}
+  const dirGuardado = path.join(__dirname, "data", "ratios");
+
+  function rutaGuardado() {
+    const seguro = String(EMPRESA_ID() || "defecto").replace(/[^\w.-]/g, "_");
+    return path.join(dirGuardado, seguro + ".json");
+  }
+
+  function leerGuardado() {
+    try {
+      return JSON.parse(fs.readFileSync(rutaGuardado(), "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  function escribirGuardado(datos) {
+    fs.mkdirSync(dirGuardado, { recursive: true });
+    const copia = { ...datos, guardado: true };
+    delete copia.deCache;
+    fs.writeFileSync(rutaGuardado(), JSON.stringify(copia));
+    return copia;
+  }
 
   // Nombres de las cuentas (API v2.0 accounts) para el simulador de escenarios
   async function nombresCuentas(token) {
@@ -155,13 +181,14 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
     return puntos;
   }
 
-  // Recorre los movimientos una sola vez y acumula para el año actual y el anterior
-  async function calcular(hasta, desde) {
-    const hastaPrev = menosUnAño(hasta);
-    const desdePrev = menosUnAño(desde);
+  // Recorre los movimientos una sola vez y acumula el periodo a analizar y el de comparación.
+  async function calcular(hasta, desde, hastaPrev, desdePrev) {
+    hastaPrev = hastaPrev || menosUnAño(hasta);
+    desdePrev = desdePrev || menosUnAño(desde);
+    const corte = hastaPrev > hasta ? hastaPrev : hasta;
     const token = await obtenerTokenBC();
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/generalLedgerEntries`;
-    let url = `${base}?$select=postingDate,accountNumber,debitAmount,creditAmount,documentNumber&$filter=${encodeURIComponent(`postingDate le ${hasta}`)}`;
+    let url = `${base}?$select=postingDate,accountNumber,debitAmount,creditAmount,documentNumber&$filter=${encodeURIComponent(`postingDate le ${corte}`)}`;
 
     const bal = new Map(), balPrev = new Map(), pyg = new Map(), pygPrev = new Map();
     // Deltas mensuales solo para la serie del cuadro de mando. No alteran bal/pyg.
@@ -185,7 +212,7 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
         const f = String(e.postingDate || "").slice(0, 10);
         const v = (Number(e.debitAmount) || 0) - (Number(e.creditAmount) || 0);
         const esPyg = cta.startsWith("6") || cta.startsWith("7");
-        suma(bal, cta, v);
+        if (f <= hasta) suma(bal, cta, v);
         if (f <= hastaPrev) suma(balPrev, cta, v);
         const mes = f.slice(0, 7);
         if (mes.length === 7) {
@@ -200,7 +227,7 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
           if (esPyg) d.movs.push([cta, v, f]);
         }
         if (esPyg) {
-          if (f >= desde) suma(pyg, cta, v);
+          if (f >= desde && f <= hasta) suma(pyg, cta, v);
           if (f >= desdePrev && f <= hastaPrev) suma(pygPrev, cta, v);
         }
       }
@@ -212,7 +239,7 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
       if (!d.tiene129) continue;
       for (const [cta, v, f] of d.movs) {
         movsCierre++;
-        if (f >= desde) suma(pyg, cta, -v);
+        if (f >= desde && f <= hasta) suma(pyg, cta, -v);
         if (f >= desdePrev && f <= hastaPrev) suma(pygPrev, cta, -v);
         const mes = String(f).slice(0, 7);
         if (deltaPyg.has(mes)) suma(deltaPyg.get(mes), cta, -v);
@@ -235,21 +262,30 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
       actual: masas(bal, pyg, dias(desde, hasta)),
       anterior: masas(balPrev, pygPrev, dias(desdePrev, hastaPrev)),
       serie,
-      cuentas: { pyg: r2(pyg), pygPrev: r2(pygPrev), bal: r2(bal), nombres },
+      cuentas: { pyg: r2(pyg), pygPrev: r2(pygPrev), bal: r2(bal), balPrev: r2(balPrev), nombres },
       calculado: new Date().toISOString(),
     };
   }
+
+  app.get("/api/contabilidad/ratios/ultimo", (req, res) => {
+    const guardado = leerGuardado();
+    if (!guardado) return res.status(404).json({ error: "No hay cifras guardadas." });
+    res.json(guardado);
+  });
 
   app.get("/api/contabilidad/ratios", async (req, res) => {
     const fechaOk = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
     const hasta = fechaOk(req.query.hasta) ? req.query.hasta : new Date().toISOString().slice(0, 10);
     const desde = fechaOk(req.query.desde) ? req.query.desde : `${hasta.slice(0, 4)}-01-01`;
-    if (desde > hasta) return res.status(400).json({ error: "La fecha inicial no puede ser posterior a la fecha final." });
-    const clave = `${EMPRESA_ID()}|${desde}|${hasta}`;
+    const hastaPrev = fechaOk(req.query.hastaPrev) ? req.query.hastaPrev : menosUnAño(hasta);
+    const desdePrev = fechaOk(req.query.desdePrev) ? req.query.desdePrev : menosUnAño(desde);
+    if (desde > hasta) return res.status(400).json({ error: "En el periodo a analizar, la fecha inicial no puede ser posterior a la final." });
+    if (desdePrev > hastaPrev) return res.status(400).json({ error: "En la comparación, la fecha inicial no puede ser posterior a la final." });
+    const clave = `${EMPRESA_ID()}|${desde}|${hasta}|${desdePrev}|${hastaPrev}|ctas`;
     const c = cache.get(clave);
     if (c && !req.query.refrescar && Date.now() - c.ts < 30 * 60 * 1000) return res.json({ ...c.datos, deCache: true });
     try {
-      const datos = await calcular(hasta, desde);
+      const datos = escribirGuardado(await calcular(hasta, desde, hastaPrev, desdePrev));
       cache.set(clave, { ts: Date.now(), datos });
       console.log(`[contabilidad/ratios] ${datos.empresa} hasta ${hasta}: ${datos.movimientos} movimientos (${datos.movsCierreExcluidos} de cierre excluidos)`);
       res.json(datos);
@@ -264,7 +300,7 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
   app.get("/api/contabilidad/circulante-terceros", async (req, res) => {
     const clave = EMPRESA_ID();
     const c = cacheTerceros.get(clave);
-    if (c && Date.now() - c.ts < 30 * 60 * 1000 && req.query.refrescar !== "1") return res.json(c.datos);
+    if (c && c.datos?.conFacturas && Date.now() - c.ts < 30 * 60 * 1000 && req.query.refrescar !== "1") return res.json(c.datos);
     try {
       const token = await obtenerTokenBC();
       const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
@@ -297,28 +333,49 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
           const due = String(f.dueDate || "").slice(0, 10);
           const ant = diasEntre(inv, hoy);
           const plazo = diasEntre(inv, due);
-          const g = map.get(nombre) || { nombre, pendiente: 0, antP: 0, plazoP: 0, conAnt: 0, conPlazo: 0 };
+          const g = map.get(nombre) || { nombre, pendiente: 0, antP: 0, plazoP: 0, conAnt: 0, conPlazo: 0, facturas: [] };
           g.pendiente += imp;
           if (ant != null) { g.antP += ant * imp; g.conAnt += imp; }
           if (plazo != null) { g.plazoP += plazo * imp; g.conPlazo += imp; }
+          g.facturas.push({
+            numero: String(f.number || ""),
+            fecha: inv,
+            vencimiento: due,
+            importe: imp,
+            dias: ant,
+            plazo,
+          });
           map.set(nombre, g);
         }
         const total = [...map.values()].reduce((s, g) => s + g.pendiente, 0);
-        return [...map.values()].map((g) => ({
-          nombre: g.nombre,
-          pendiente: Math.round(g.pendiente),
-          dias: g.conAnt ? Math.round(g.antP / g.conAnt) : null,
-          plazo: g.conPlazo ? Math.round(g.plazoP / g.conPlazo) : null,
-          peso: total ? g.pendiente / total : null,
-        })).sort((a, b) => b.pendiente - a.pendiente).slice(0, 8);
+        return [...map.values()].map((g) => {
+          const todas = g.facturas.slice().sort((a, b) => b.importe - a.importe);
+          return {
+            nombre: g.nombre,
+            pendiente: Math.round(g.pendiente),
+            dias: g.conAnt ? Math.round(g.antP / g.conAnt) : null,
+            plazo: g.conPlazo ? Math.round(g.plazoP / g.conPlazo) : null,
+            peso: total ? g.pendiente / total : null,
+            facturas: todas.slice(0, 40).map((x) => ({
+              numero: x.numero,
+              fecha: x.fecha,
+              vencimiento: x.vencimiento,
+              importe: Math.round(x.importe * 100) / 100,
+              dias: x.dias,
+              plazo: x.plazo,
+            })),
+            facturasTotal: todas.length,
+          };
+        }).sort((a, b) => b.pendiente - a.pendiente).slice(0, 8);
       };
       const [ventas, compras] = await Promise.all([
-        leer("salesInvoices", "customerName,customerNumber,invoiceDate,dueDate,status,totalAmountIncludingTax"),
-        leer("purchaseInvoices", "vendorName,vendorNumber,invoiceDate,dueDate,status,totalAmountIncludingTax"),
+        leer("salesInvoices", "number,customerName,customerNumber,invoiceDate,dueDate,status,totalAmountIncludingTax"),
+        leer("purchaseInvoices", "number,vendorName,vendorNumber,invoiceDate,dueDate,status,totalAmountIncludingTax"),
       ]);
       const datos = {
         clientes: agrupar(ventas, (f) => f.customerName || f.customerNumber),
         proveedores: agrupar(compras, (f) => f.vendorName || f.vendorNumber),
+        conFacturas: true,
         calculado: new Date().toISOString(),
       };
       cacheTerceros.set(clave, { ts: Date.now(), datos });
