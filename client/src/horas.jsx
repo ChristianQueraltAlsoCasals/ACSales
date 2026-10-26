@@ -12,6 +12,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { ConfiguracionHoras, TarifasHoras, FestivosLinea, listaFestivos, agruparAmiantoPorDia, normNum } from "./horasExtra.jsx";
 import { indiceRecursos } from "./manoObra.jsx";
+import { puedeTarifasPago } from "./permisos.js";
 
 const CATS = {
   normal: { txt: "Normal", color: "" },
@@ -54,7 +55,8 @@ const fmtF = (s) => (s ? s.split("-").reverse().join("/") : "");
 const DIAS = ["D", "L", "M", "X", "J", "V", "S"];
 const SIN_DEPTO = "Sin departamento";
 
-export default function ControlHoras({ recursos = [] }) {
+export default function ControlHoras({ recursos = [], usuario = null }) {
+  const veTarifas = puedeTarifasPago(usuario);
   const [datos, setDatos] = useState(null);
   const [ajustes, setAjustes] = useState({ tipos: {}, jornada: 8, jornadaViernes: null, festivos: [] });
   const [desde, setDesde] = useState(inicioMes());
@@ -81,6 +83,10 @@ export default function ControlHoras({ recursos = [] }) {
     window.addEventListener("keydown", esc);
     return () => window.removeEventListener("keydown", esc);
   }, []);
+
+  useEffect(() => {
+    if (!veTarifas && pestana === "tarifas") setPestana("cuadro");
+  }, [veTarifas, pestana]);
 
   useEffect(() => {
     fetch("/api/horas/estado").then((r) => r.json()).then((j) => {
@@ -316,11 +322,18 @@ export default function ControlHoras({ recursos = [] }) {
         <>
           <div className="flex flex-wrap items-center gap-2 mt-5 border-b">
             <div className="flex gap-1">
-              {[["cuadro", "Cuadro de horas"], ["extras", "Extras y ausencias"], ["detalle", "Detalle"], ["tipos", "Tipos de trabajo y jornada"], ["config", "Configuración"], ["tarifas", "Tarifas y pago"]].map(([k, t]) => (
+              {[
+                ["cuadro", "Cuadro de horas"],
+                ["extras", "Extras y ausencias"],
+                ["detalle", "Detalle"],
+                ["tipos", "Tipos de trabajo y jornada"],
+                ["config", "Configuración"],
+                ...(veTarifas ? [["tarifas", "Tarifas y pago"]] : []),
+              ].map(([k, t]) => (
                 <button key={k} onClick={() => setPestana(k)} className={`px-4 py-2 text-sm -mb-px border-b-2 ${pestana === k ? "border-blue-700 text-blue-800 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>{t}</button>
               ))}
             </div>
-            {(pestana === "extras" || pestana === "tarifas") && (
+            {(pestana === "extras" || (veTarifas && pestana === "tarifas")) && (
               <button type="button" onClick={() => setVerAmianto(true)}
                 className="ml-auto mb-1 px-2 py-1 rounded border text-xs text-amber-800 bg-amber-50 hover:bg-amber-100 border-amber-200">
                 Ver partes amianto{amianto?.cargando ? "…" : amianto?.partes ? ` (${amianto.partes.length})` : ""}
@@ -545,7 +558,7 @@ export default function ControlHoras({ recursos = [] }) {
           {pestana === "config" && (
             <ConfiguracionHoras ajustes={ajustes} guardarAjustes={guardarAjustes} trabajadores={calc.lista} codigos={calc.tipos.map((t) => t.cod).filter(Boolean)} />
           )}
-          {pestana === "tarifas" && (
+          {veTarifas && pestana === "tarifas" && (
             <TarifasHoras trabajadores={calc.lista} codigos={calc.tipos.map((t) => t.cod || "(sin tipo)")} ajustes={ajustes} desde={datos.desde} hasta={datos.hasta} amianto={amianto} />
           )}
 

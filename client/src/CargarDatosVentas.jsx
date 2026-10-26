@@ -7713,7 +7713,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           {panel("tareas", <Tareas pendienteAlta={tareaPendiente} />)}
           {panel("ia", <ChatIA />)}
           {panel("ratios", <Ratios recursos={data.recursos?.rows || []} />)}
-          {panel("horas", <ControlHoras recursos={data.recursos?.rows || []} />)}
+          {panel("horas", <ControlHoras recursos={data.recursos?.rows || []} usuario={usuario} />)}
           {panel("memoria", (
             <>
               <div className="flex items-center gap-2">

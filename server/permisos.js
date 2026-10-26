@@ -1,21 +1,22 @@
 // Permisos ACsales según ACconstelation (`accions` + rol del portal).
 
-const ACCIONES = ["solo_control_horas"];
+const ACCIONES = ["solo_control_horas", "tarifas_pago"];
 
 function bool(v) {
   return v === true || v === 1 || v === "1" || v === "true";
 }
 
 function accionsVacias() {
-  return { solo_control_horas: false };
+  return { solo_control_horas: false, tarifas_pago: false };
 }
 
 /**
- * Acceso completo a la app: la flag restrictiva queda en false.
- * (Admin/super nunca deben quedar bloqueados en solo Control de horas.)
+ * Acceso completo a la app:
+ *  - solo_control_horas = false (flag restrictiva apagada)
+ *  - tarifas_pago = true (puede ver la pestaña confidencial)
  */
 function accionsTodas() {
-  return { solo_control_horas: false };
+  return { solo_control_horas: false, tarifas_pago: true };
 }
 
 /** Normaliza la respuesta del portal. Admin del portal → app completa. */
@@ -23,9 +24,9 @@ function normalizarAccions(raw, portalRol) {
   if (String(portalRol || "") === "admin") return accionsTodas();
   const out = accionsVacias();
   if (!raw || typeof raw !== "object") return out;
-  if (raw.solo_control_horas !== undefined) {
-    out.solo_control_horas = bool(raw.solo_control_horas);
-  }
+  ACCIONES.forEach((k) => {
+    if (raw[k] !== undefined) out[k] = bool(raw[k]);
+  });
   return out;
 }
 
@@ -55,16 +56,6 @@ function esAdminPortal(usuario) {
   return !!usuario && (esSuperApp(usuario) || usuario.portal_rol === "admin");
 }
 
-/** Acción concreta del catálogo (true explícito). Admin/super → true salvo flags restrictivas. */
-function puede(usuario, clave) {
-  if (!usuario || !clave) return false;
-  if (clave === "solo_control_horas") {
-    return soloControlHoras(usuario);
-  }
-  if (esAdminPortal(usuario)) return true;
-  return Boolean(accionsDe(usuario)[clave]);
-}
-
 /**
  * Usuarios con la acción `solo_control_horas` (y sin ser admin/super)
  * solo pueden ver Control de horas.
@@ -73,6 +64,22 @@ function soloControlHoras(usuario) {
   if (!usuario) return false;
   if (esAdminPortal(usuario)) return false;
   return Boolean(accionsDe(usuario).solo_control_horas);
+}
+
+/** Puede ver/editar la pestaña confidencial Tarifas y pago. */
+function puedeTarifasPago(usuario) {
+  if (!usuario) return false;
+  if (esAdminPortal(usuario)) return true;
+  return Boolean(accionsDe(usuario).tarifas_pago);
+}
+
+/** Acción concreta del catálogo. */
+function puede(usuario, clave) {
+  if (!usuario || !clave) return false;
+  if (clave === "solo_control_horas") return soloControlHoras(usuario);
+  if (clave === "tarifas_pago") return puedeTarifasPago(usuario);
+  if (esAdminPortal(usuario)) return true;
+  return Boolean(accionsDe(usuario)[clave]);
 }
 
 module.exports = {
@@ -86,4 +93,5 @@ module.exports = {
   esAdminPortal,
   esSuperApp,
   soloControlHoras,
+  puedeTarifasPago,
 };

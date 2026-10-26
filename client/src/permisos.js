@@ -1,5 +1,5 @@
 /** Acciones del catálogo ACconstelation (deben coincidir con el servidor). */
-export const ACCIONES = ["solo_control_horas"];
+export const ACCIONES = ["solo_control_horas", "tarifas_pago"];
 
 function bool(v) {
   return v === true || v === 1 || v === "1" || v === "true";
@@ -20,4 +20,12 @@ export const soloControlHoras = (u) => {
   if (!u || esAdminPortal(u)) return false;
   if (!u.accions || typeof u.accions !== "object") return false;
   return bool(u.accions.solo_control_horas);
+};
+
+/** Puede ver/editar la pestaña confidencial Tarifas y pago. */
+export const puedeTarifasPago = (u) => {
+  if (!u) return false;
+  if (esAdminPortal(u)) return true;
+  if (!u.accions || typeof u.accions !== "object") return false;
+  return bool(u.accions.tarifas_pago);
 };
