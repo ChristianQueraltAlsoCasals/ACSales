@@ -77,6 +77,7 @@ import Ratios from "./ratios.jsx";
 import IAFlotante from "./iaFlotante.jsx";
 import ControlHoras from "./horas.jsx";
 import { SelectorEmpresa, empresaGuardada } from "./empresa.jsx";
+import { soloControlHoras } from "./permisos.js";
 import Papa from "papaparse";
 
 /**
@@ -7368,8 +7369,12 @@ class CapturaErrores extends React.Component {
 }
 
 export default function CargarDatosVentas({ usuario = null, onLogout = null }) {
-  // Ventana nueva de OTs (pestaña propia): #/ots
-  const esVentanaOTs = typeof window !== "undefined" && window.location.hash === "#/ots";
+  // Ventana nueva de OTs (pestaña propia): #/ots — no disponible con solo_control_horas
+  const restringidoHoras = soloControlHoras(usuario);
+  const esVentanaOTs =
+    !restringidoHoras &&
+    typeof window !== "undefined" &&
+    window.location.hash === "#/ots";
   return (
     <CapturaErrores>
       {esVentanaOTs ? <PantallaOTs /> : <PantallaPrincipal usuario={usuario} onLogout={onLogout} />}
@@ -7398,13 +7403,15 @@ function recortarFilas(sourceId, filas) {
 }
 
 function PantallaPrincipal({ usuario = null, onLogout = null }) {
+  const soloHoras = soloControlHoras(usuario);
   const [data, setData] = useState(() =>
     Object.fromEntries(SOURCES.map((s) => [s.id, { cached: [], totalRows: 0, rows: [] }]))
   );
   const [estadoInicial, setEstadoInicial] = useState(null);
 
-  // Restaurar el estado persistido (una vez, al montar)
+  // Restaurar el estado persistido (una vez, al montar). No aplica a solo_control_horas.
   useEffect(() => {
+    if (soloHoras) return;
     (async () => {
       try {
         const r = await fetch("/api/estado");
@@ -7424,7 +7431,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
         /* backend apagado: sin restauración */
       }
     })();
-  }, []);
+  }, [soloHoras]);
 
   const persistirBcData = (next) => {
     fetch("/api/estado", {
@@ -7495,12 +7502,19 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
     return { loaded, totalRows };
   }, [data]);
 
-  const [seccion, setSeccion] = useState("cargar"); // cargar | memoria | explorador | recepcion
-  const [vistas, setVistas] = useState(() => new Set(["cargar"]));
+  const [seccion, setSeccion] = useState(soloHoras ? "horas" : "cargar"); // cargar | memoria | explorador | recepcion | horas
+  const [vistas, setVistas] = useState(() => new Set([soloHoras ? "horas" : "cargar"]));
   const abrirSeccion = (id) => {
+    if (soloHoras && id !== "horas") return;
     setVistas((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     setSeccion(id);
   };
+
+  useEffect(() => {
+    if (!soloHoras) return;
+    setSeccion("horas");
+    setVistas(new Set(["horas"]));
+  }, [soloHoras]);
   const [actualizandoRecep, setActualizandoRecep] = useState(false);
   const [actualizandoFacVenta, setActualizandoFacVenta] = useState(false);
   const [tareaPendiente, setTareaPendiente] = useState(null); // tarea creada desde Correo
@@ -7621,37 +7635,43 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
             <SelectorEmpresa />
           </div>
           <nav className="bc-nav-menu">
-            {navItem("cargar", "Cargar datos", Database)}
-            {navItem("memoria", "Memoria histórica", History)}
-            {navItem("explorador", "Explorador de OTs", Search)}
-            {navItem("recepcion", "Recepción de material", Package)}
-            {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
-            {navItem("precios", "Precios de artículos", Tag)}
-            {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
-            {navItem("facturasventa", "Facturas de venta", FileText)}
-            {navItem("correo", "Correo", Mail)}
-            {navItem("tareas", "Mis tareas", CheckSquare)}
-            {navItem("ia", "Asistente IA", Bot)}
-            {navItem("ratios", "Ratios financieros", BarChart3)}
-            {navItem("horas", "Control de horas", Timer)}
+            {soloHoras ? (
+              navItem("horas", "Control de horas", Timer)
+            ) : (
+              <>
+                {navItem("cargar", "Cargar datos", Database)}
+                {navItem("memoria", "Memoria histórica", History)}
+                {navItem("explorador", "Explorador de OTs", Search)}
+                {navItem("recepcion", "Recepción de material", Package)}
+                {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
+                {navItem("precios", "Precios de artículos", Tag)}
+                {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
+                {navItem("facturasventa", "Facturas de venta", FileText)}
+                {navItem("correo", "Correo", Mail)}
+                {navItem("tareas", "Mis tareas", CheckSquare)}
+                {navItem("ia", "Asistente IA", Bot)}
+                {navItem("ratios", "Ratios financieros", BarChart3)}
+                {navItem("horas", "Control de horas", Timer)}
 
-            <div className="bc-nav-grupo">Hoja de ruta</div>
-            {[
-              "Explorar datos",
-              "Pedidos de venta",
-              "Análisis de rentabilidad",
-              "Precios de artículos",
-              "Análisis por cliente",
-              "Comparar periodos",
-            ].map((item) => (
-              <div
-                key={item}
-                className="bc-nav-item desactivada"
-                title="Pendiente de construir — hoja de ruta"
-              >
-                {item}
-              </div>
-            ))}
+                <div className="bc-nav-grupo">Hoja de ruta</div>
+                {[
+                  "Explorar datos",
+                  "Pedidos de venta",
+                  "Análisis de rentabilidad",
+                  "Precios de artículos",
+                  "Análisis por cliente",
+                  "Comparar periodos",
+                ].map((item) => (
+                  <div
+                    key={item}
+                    className="bc-nav-item desactivada"
+                    title="Pendiente de construir — hoja de ruta"
+                  >
+                    {item}
+                  </div>
+                ))}
+              </>
+            )}
           </nav>
         </aside>
 
@@ -7760,7 +7780,9 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           ))}
         </main>
       </div>
-      <AsistenteUnico seccion={seccion} fichas={estadoInicial?.fichas?.length ? new Map(estadoInicial.fichas) : null} />
+      {!soloHoras && (
+        <AsistenteUnico seccion={seccion} fichas={estadoInicial?.fichas?.length ? new Map(estadoInicial.fichas) : null} />
+      )}
     </div>
   );
 }
