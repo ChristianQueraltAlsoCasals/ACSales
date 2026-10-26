@@ -60,20 +60,10 @@ const PORT = process.env.PORT || 3000;
 
 // Auth ERP + ACconstelation (mismo patrón que achuman / aclogistics)
 const { router: authRouter, requiereSesion } = require("./auth");
-const { soloControlHoras } = require("./permisos");
 app.use("/api/auth", authRouter);
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
   return requiereSesion(req, res, next);
-});
-/** Usuarios con solo_control_horas: únicamente endpoints de Control de horas. */
-app.use("/api", (req, res, next) => {
-  if (req.path.startsWith("/auth")) return next();
-  if (!req.usuario || !soloControlHoras(req.usuario)) return next();
-  if (req.path.startsWith("/horas")) return next();
-  return res.status(403).json({
-    error: "Solo tienes permiso para Control de horas en ACsales.",
-  });
 });
 
 // ---------------------------------------------------------------------
@@ -6569,8 +6559,6 @@ const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@also
 require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep, escribirRecep, BUZON_PERSONAL });
 require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL });
 require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa });
-require("./ot-capas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE });
-require("./ots-app.cjs")({ app, EMPRESA_NOMBRE });
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)
 app.get(/^\/(?!api).*/, (req, res) => {

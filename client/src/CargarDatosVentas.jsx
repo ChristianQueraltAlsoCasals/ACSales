@@ -53,7 +53,6 @@ import {
   mapaDeConocimiento,
   clasificarLineaVenta,
   clasificarLineaCompra,
-  deduplicarLineasVentaPedidoFactura,
   IA_CONFIG,
 } from "./agenteInteligente.js";
 import {
@@ -78,7 +77,6 @@ import Ratios from "./ratios.jsx";
 import IAFlotante from "./iaFlotante.jsx";
 import ControlHoras from "./horas.jsx";
 import { SelectorEmpresa, empresaGuardada } from "./empresa.jsx";
-import { soloControlHoras } from "./permisos.js";
 import Papa from "papaparse";
 
 /**
@@ -967,15 +965,13 @@ function IntelligentAgentCard({ bcData = {}, estadoInicial = null }) {
             };
           });
 
-    // Pedido vivo (PV) + factura registrada (P…) del mismo artículo/OT
-    // no deben sumar cantidad dos veces (Material vendido / taller).
     const lineasVenta = usandoDemo
       ? OTS_DEMO.lineasVenta
-      : deduplicarLineasVentaPedidoFactura([
+      : [
           ...adaptarLineasVentaAPI(lineasVentaAPI),
           ...adaptarLineasVentaAPI(lineasVentaReg), // registradas: histórico facturado
           ...adaptarFacturasPDF(pdfFacturas),
-        ]);
+        ];
     const lineasCompra = usandoDemo
       ? OTS_DEMO.lineasCompra
       : [
@@ -3679,15 +3675,12 @@ function Quesito({ titulo, nota, partes }) {
 }
 
 function PantallaOTs({ incrustada = false }) {
-  // Búsqueda en caliente contra ALSOAPP (/api/app/ots) — sin precargar el año.
-  const [items, setItems] = useState([]);
-  const [total, setTotal] = useState(0);
-  const [totalPages, setTotalPages] = useState(1);
+  const [fichas, setFichas] = useState(null);
   const [cargando, setCargando] = useState(true);
   const [error, setError] = useState(null);
   const [seleccionada, setSeleccionada] = useState(null);
-  const [opciones, setOpciones] = useState({ departaments: [], estats: [], tipus: [] });
 
+  // Filtros
   const [fCliente, setFCliente] = useState("");
   const [fTexto, setFTexto] = useState("");
   const [fDepartament, setFDepartament] = useState("");
@@ -3701,67 +3694,106 @@ function PantallaOTs({ incrustada = false }) {
   const [creandoFacturas, setCreandoFacturas] = useState(false);
   const [progresoFacturas, setProgresoFacturas] = useState(null);
   const [resultadoFacturas, setResultadoFacturas] = useState(null);
-  const POR_PAGINA = 50;
-
-  const fichas = useMemo(() => {
-    const m = new Map();
-    for (const f of items) m.set(f.numeroOT, f);
-    return m;
-  }, [items]);
+  const POR_PAGINA = 100;
 
   useEffect(() => {
-    let cancel = false;
     (async () => {
       try {
-        const r = await fetch("/api/app/ots/meta");
-        if (!r.ok) return;
-        const j = await r.json();
-        if (cancel) return;
-        setOpciones({
-          departaments: j.departamentos || [],
-          estats: j.estados || [],
-          tipus: j.tipus || [],
-        });
-      } catch { /* meta opcional */ }
+        const r = await fetch("/api/estado");
+        if (!r.ok) throw new Error(`backend ${r.status}`);
+        const est = await r.json();
+        if (est.fichas?.length) setFichas(new Map(est.fichas));
+        else setError("Aún no hay memoria construida. Ve a la pantalla principal, carga los datos y pulsa «Construir memoria histórica».");
+      } catch (err) {
+        setError(`No se pudo cargar la memoria (${err.message}). ¿Está el backend arrancado (npm start)?`);
+      }
+      setCargando(false);
     })();
-    return () => { cancel = true; };
   }, []);
 
-  useEffect(() => {
-    let cancel = false;
-    const t = setTimeout(async () => {
-      setCargando(true);
-      setError(null);
-      try {
-        const params = new URLSearchParams();
-        params.set("page", String(pagina + 1));
-        params.set("pageSize", String(POR_PAGINA));
-        if (fTexto.trim()) params.set("q", fTexto.trim());
-        if (fCliente.trim()) params.set("cliente", fCliente.trim());
-        if (fDepartament) params.set("departamento", fDepartament);
-        if (fEstat) params.set("estado", fEstat);
-        if (fTipus) params.set("tipus", fTipus);
-        if (fDesde) params.set("desde", fDesde);
-        if (fHasta) params.set("hasta", fHasta);
-        const r = await fetch(`/api/app/ots?${params}`);
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
-        if (cancel) return;
-        setItems(j.items || []);
-        setTotal(Number(j.total) || 0);
-        setTotalPages(Number(j.totalPages) || 1);
-      } catch (err) {
-        if (cancel) return;
-        setItems([]);
-        setTotal(0);
-        setError(err.message || String(err));
-      }
-      if (!cancel) setCargando(false);
-    }, 320);
-    return () => { cancel = true; clearTimeout(t); };
-  }, [fCliente, fTexto, fDepartament, fEstat, fTipus, fDesde, fHasta, pagina]);
+  const opciones = useMemo(() => {
+    if (!fichas) return { departaments: [], estats: [], tipus: [] };
+    const dep = new Set(), est = new Set(), tip = new Set();
+    for (const f of fichas.values()) {
+      if (f.general.departamento) dep.add(f.general.departamento);
+      if (f.general.estadoApp) est.add(f.general.estadoApp);
+      if (f.general.tipoTrabajo) tip.add(f.general.tipoTrabajo);
+    }
+    return { departaments: [...dep].sort(), estats: [...est].sort(), tipus: [...tip].sort() };
+  }, [fichas]);
 
-  const visibles = items;
+  const filtradas = useMemo(() => {
+    if (!fichas) return [];
+    const qC = fCliente.trim().toLowerCase();
+    const qT = fTexto.trim().toLowerCase();
+    let arr = [...fichas.values()];
+    if (qC) arr = arr.filter((f) => (f.general.cliente || "").toLowerCase().includes(qC));
+    if (qT)
+      arr = arr.filter(
+        (f) =>
+          f.numeroOT.toLowerCase().includes(qT) ||
+          (f.general.presupuesto || "").toLowerCase().includes(qT) ||
+          (f.general.descripcion || "").toLowerCase().includes(qT)
+      );
+    if (fDepartament) arr = arr.filter((f) => f.general.departamento === fDepartament);
+    if (fEstat) arr = arr.filter((f) => f.general.estadoApp === fEstat);
+    if (fTipus) arr = arr.filter((f) => f.general.tipoTrabajo === fTipus);
+    if (fDesde || fHasta) arr = arr.filter((f) => otEnRangoFecha(f, fDesde, fHasta));
+    arr.sort((a, b) => (parseInt(b.numeroOT) || 0) - (parseInt(a.numeroOT) || 0));
+    return arr;
+  }, [fichas, fCliente, fTexto, fDepartament, fEstat, fTipus, fDesde, fHasta]);
+
+  const clasePorOT = useMemo(() => {
+    if (!fichas) return new Map();
+    const m = new Map();
+    for (const f of fichas.values()) m.set(f.numeroOT, claseMaterialComprado(f));
+    return m;
+  }, [fichas]);
+
+  const paraGraficos = useMemo(() => {
+    if (!fichas) return [];
+    const qC = fCliente.trim().toLowerCase();
+    const qT = fTexto.trim().toLowerCase();
+    let arr = [...fichas.values()];
+    if (qC) arr = arr.filter((f) => (f.general.cliente || "").toLowerCase().includes(qC));
+    if (qT) arr = arr.filter((f) => f.numeroOT.toLowerCase().includes(qT) || (f.general.presupuesto || "").toLowerCase().includes(qT) || (f.general.descripcion || "").toLowerCase().includes(qT));
+    if (fDepartament) arr = arr.filter((f) => f.general.departamento === fDepartament);
+    if (fTipus) arr = arr.filter((f) => f.general.tipoTrabajo === fTipus);
+    if (fDesde || fHasta) arr = arr.filter((f) => otEnRangoFecha(f, fDesde, fHasta));
+    return arr;
+  }, [fichas, fCliente, fTexto, fDepartament, fTipus, fDesde, fHasta]);
+
+  const partesEstado = useMemo(() => {
+    const cuenta = new Map();
+    for (const f of paraGraficos) {
+      const est = f.general.estadoApp || "(sin estado)";
+      cuenta.set(est, (cuenta.get(est) || 0) + 1);
+    }
+    return [...cuenta.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([etiqueta, valor], i) => ({
+        etiqueta,
+        valor,
+        color: HEX_ESTADO_APP[etiqueta] || PALETA_ESTADO[i % PALETA_ESTADO.length],
+      }));
+  }, [paraGraficos]);
+
+  const partesMaterial = useMemo(() => {
+    let noAnadido = 0;
+    let anadido = 0;
+    for (const f of paraGraficos) {
+      const clase = clasePorOT.get(f.numeroOT);
+      if (clase === "no_anadido") noAnadido++;
+      else if (clase === "anadido") anadido++;
+    }
+    return [
+      { etiqueta: "Comprado y no añadido", valor: noAnadido, color: "#dc2626" },
+      { etiqueta: "Comprado y añadido", valor: anadido, color: "#059669" },
+    ];
+  }, [paraGraficos, clasePorOT]);
+
+  const totalPaginas = Math.max(1, Math.ceil(filtradas.length / POR_PAGINA));
+  const visibles = filtradas.slice(pagina * POR_PAGINA, (pagina + 1) * POR_PAGINA);
 
   const toggleOT = (id) => {
     setConfirmarFacturas(false);
@@ -3774,7 +3806,7 @@ function PantallaOTs({ incrustada = false }) {
   };
 
   const crearFacturasSeleccionadas = async () => {
-    if (seleccionOTs.size === 0 || creandoFacturas) return;
+    if (!fichas || seleccionOTs.size === 0 || creandoFacturas) return;
     const elegidas = [...seleccionOTs].map((id) => fichas.get(id)).filter(Boolean);
     setCreandoFacturas(true);
     setConfirmarFacturas(false);
@@ -3809,7 +3841,7 @@ function PantallaOTs({ incrustada = false }) {
     setCreandoFacturas(false);
   };
 
-  if (seleccionada) {
+  if (seleccionada && fichas) {
     const ficha = fichas.get(seleccionada);
     if (ficha) {
       const detalle = <DetalleOT ficha={ficha} fichas={fichas} onVolver={() => setSeleccionada(null)} />;
@@ -3831,14 +3863,9 @@ function PantallaOTs({ incrustada = false }) {
     <>
     <div className={incrustada ? "" : "min-h-screen bg-slate-100 p-6"}>
       <div className={incrustada ? "" : "max-w-[1400px] mx-auto"}>
-        <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <div className="flex items-center gap-3 mb-4">
           <h1 className="text-xl font-bold text-slate-800">Explorador de OTs</h1>
-          <span className="text-sm text-slate-500">
-            {cargando ? "Buscando…" : `${total.toLocaleString()} OT(s) en App`}
-          </span>
-          <span className="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2 py-0.5">
-            ALSOAPP en caliente · sin precargar el año
-          </span>
+          {fichas && <span className="text-sm text-slate-500">{filtradas.length.toLocaleString()} de {fichas.size.toLocaleString()} OTs</span>}
           {incrustada ? (
             <button
               onClick={() => window.open(window.location.pathname + "#/ots", "_blank")}
@@ -3852,14 +3879,28 @@ function PantallaOTs({ incrustada = false }) {
           )}
         </div>
 
-        {error && <div className="text-sm text-amber-800 bg-amber-50 border border-amber-300 rounded-md px-4 py-3 mb-3">{error}</div>}
+        {cargando && <div className="text-sm text-slate-500">Cargando memoria...</div>}
+        {error && <div className="text-sm text-amber-800 bg-amber-50 border border-amber-300 rounded-md px-4 py-3">{error}</div>}
 
-        <>
-            {/* Filtros — buscan en ALSOAPP al escribir */}
+        {fichas && (
+          <>
+            <div className="flex gap-3 mb-3 flex-wrap">
+              <Quesito
+                titulo="OTs por estado"
+                nota="Cantidad de OTs en cada Estat App."
+                partes={partesEstado}
+              />
+              <Quesito
+                titulo="Material comprado"
+                nota="Solo OTs con compra. «No añadido» = alguna línea comprada que no está en la venta."
+                partes={partesMaterial}
+              />
+            </div>
+            {/* Filtros */}
             <div className="flex gap-2 mb-3 flex-wrap">
               <input value={fCliente} onChange={(e) => { setFCliente(e.target.value); setPagina(0); }} placeholder="Filtrar client.."
                 className="text-sm border border-slate-300 rounded-md px-3 py-1.5 w-52 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
-              <input value={fTexto} onChange={(e) => { setFTexto(e.target.value); setPagina(0); }} placeholder="OT / pressupost / descripció.."
+              <input value={fTexto} onChange={(e) => { setFTexto(e.target.value); setPagina(0); }} placeholder="Filtrar OT / pressupost / descripció.."
                 className="text-sm border border-slate-300 rounded-md px-3 py-1.5 w-64 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
               <select value={fDepartament} onChange={(e) => { setFDepartament(e.target.value); setPagina(0); }}
                 className="text-sm border border-slate-300 rounded-md px-2 py-1.5 bg-white">
@@ -3876,17 +3917,17 @@ function PantallaOTs({ incrustada = false }) {
                 <option value="">Tipus de feina...</option>
                 {opciones.tipus.map((d) => <option key={d} value={d}>{d}</option>)}
               </select>
-              <label className="flex items-center gap-1 text-[11px] text-slate-500" title="Fecha de creación en la App">
+              <label className="flex items-center gap-1 text-[11px] text-slate-500" title="Año de la OT, el que va en el número (p. ej. /2026)">
                 Desde
                 <input type="date" value={fDesde} onChange={(e) => { setFDesde(e.target.value); setPagina(0); }}
                   className="text-sm border border-slate-300 rounded-md px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
               </label>
-              <label className="flex items-center gap-1 text-[11px] text-slate-500" title="Fecha de creación en la App">
+              <label className="flex items-center gap-1 text-[11px] text-slate-500" title="Año de la OT, el que va en el número (p. ej. /2026)">
                 Hasta
                 <input type="date" value={fHasta} onChange={(e) => { setFHasta(e.target.value); setPagina(0); }}
                   className="text-sm border border-slate-300 rounded-md px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" />
               </label>
-              <span className="self-center text-[10px] text-slate-400">fecha creación App</span>
+              <span className="self-center text-[10px] text-slate-400" title="La fecha de la OT es el año de su número, por ejemplo AC015138/2026">año de la OT</span>
               {(fCliente || fTexto || fDepartament || fEstat || fTipus || fDesde || fHasta) && (
                 <button onClick={() => { setFCliente(""); setFTexto(""); setFDepartament(""); setFEstat(""); setFTipus(""); setFDesde(""); setFHasta(""); setPagina(0); }}
                   className="text-sm text-slate-500 border border-slate-300 rounded-md px-3 py-1.5 bg-white hover:bg-slate-50">
@@ -4009,8 +4050,10 @@ function PantallaOTs({ incrustada = false }) {
                       <td className="px-2 py-1.5 whitespace-nowrap">
                         {f.general.segmento && <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5">{f.general.segmento}</span>}
                       </td>
-                      <td className="px-2 py-1.5 text-right whitespace-nowrap font-semibold text-slate-700" title="P despessa App + MO×21,50 (detalle BC al abrir la OT)">
+                      <td className="px-2 py-1.5 text-right whitespace-nowrap font-semibold text-slate-700">
                         {(() => {
+                          // Gasto asociado = materiales (compras reales PC)
+                          // + mano de obra a coste (horas × 21,50 €/h)
                           const materiales = Number(f.compra?.costeRealOT) || 0;
                           const mo = (Number(f.venta?.horas?.cantidad) || 0) * 21.5;
                           const gasto = materiales + mo;
@@ -4035,30 +4078,20 @@ function PantallaOTs({ incrustada = false }) {
               </table>
             </div>
 
-            {cargando && visibles.length === 0 && (
-              <div className="text-sm text-slate-500 py-6 text-center">Buscando en ALSOAPP…</div>
-            )}
-            {!cargando && visibles.length === 0 && !error && (
-              <div className="text-sm text-slate-500 py-6 text-center">Ninguna OT con estos filtros. Prueba el nº (p. ej. 14839) o el cliente.</div>
-            )}
-
             {/* Paginación */}
             <div className="flex items-center gap-2 mt-3 text-xs text-slate-600">
-              <span>
-                {total === 0
-                  ? "0 resultados"
-                  : `${(pagina * POR_PAGINA + 1).toLocaleString()}–${Math.min((pagina + 1) * POR_PAGINA, total).toLocaleString()} de ${total.toLocaleString()}`}
-              </span>
-              <button disabled={pagina === 0 || cargando} onClick={() => setPagina((p) => p - 1)}
+              <span>{(pagina * POR_PAGINA + 1).toLocaleString()}–{Math.min((pagina + 1) * POR_PAGINA, filtradas.length).toLocaleString()} de {filtradas.length.toLocaleString()}</span>
+              <button disabled={pagina === 0} onClick={() => setPagina((p) => p - 1)}
                 className="border border-slate-300 rounded px-2 py-1 bg-white disabled:opacity-40 hover:bg-slate-50">◀</button>
-              <button disabled={pagina >= totalPages - 1 || cargando} onClick={() => setPagina((p) => p + 1)}
+              <button disabled={pagina >= totalPaginas - 1} onClick={() => setPagina((p) => p + 1)}
                 className="border border-slate-300 rounded px-2 py-1 bg-white disabled:opacity-40 hover:bg-slate-50">▶</button>
-              <span className="text-slate-400">página {pagina + 1} de {totalPages}</span>
+              <span className="text-slate-400">página {pagina + 1} de {totalPaginas}</span>
             </div>
-        </>
+          </>
+        )}
       </div>
     </div>
-    {!incrustada && <ChatOT fichas={fichas} />}
+    {!incrustada && fichas && <ChatOT fichas={fichas} />}
     </>
   );
 }
@@ -4176,39 +4209,9 @@ function DetalleOT({ ficha, fichas, onVolver }) {
   const [creandoFactura, setCreandoFactura] = useState(false);
   const [confirmarFactura, setConfirmarFactura] = useState(false);
   const [avisoFactura, setAvisoFactura] = useState(null);
-  const [capasApp, setCapasApp] = useState(null);
-  const [cargandoCapas, setCargandoCapas] = useState(false);
-  const [avisoCapas, setAvisoCapas] = useState(null);
-  const [exportandoExcel, setExportandoExcel] = useState(false);
-  const [avisoExcelOT, setAvisoExcelOT] = useState(null);
   const noBC = codigoOTParaBC(ficha);
 
   useEffect(() => { setClavesCosteNF(leerCosteNF(noBC)); }, [noBC]);
-
-  const cargarCapasApp = async (ventaRaw) => {
-    setCargandoCapas(true);
-    setAvisoCapas(null);
-    try {
-      const r = await fetch(`/api/ot/capas?no=${encodeURIComponent(noBC)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ venta: ventaRaw || lineasBC?.ventaRaw || [] }),
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
-      setCapasApp(j);
-      if (j.aviso_bc) setAvisoCapas(j.aviso_bc);
-    } catch (err) {
-      setCapasApp(null);
-      setAvisoCapas(err.message || String(err));
-    }
-    setCargandoCapas(false);
-  };
-
-  useEffect(() => {
-    cargarCapasApp([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [noBC]);
 
   const cambiarCosteNF = (claves, anadir) => {
     setClavesCosteNF((prev) => {
@@ -4559,239 +4562,18 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         throw new Error(j.error || `Error ${r.status}`);
       }
       const json = await r.json();
-      const ventaRaw = json.venta || [];
       setLineasBC({
-        venta: adaptarLineasVentaAPI(ventaRaw),
+        venta: adaptarLineasVentaAPI(json.venta || []),
         compra: adaptarLineasCompraAPI(json.compra || []),
         // Líneas de venta CRUDAS (todas las columnas, todas las líneas,
         // incluidas las de texto): alimentan la vista "Factura" de la OT.
-        ventaRaw,
+        ventaRaw: json.venta || [],
       });
       if (json.avisos?.length) setAvisoBC(json.avisos.join(" · "));
-      // Recalcular capas App↔BC con las líneas de venta frescas
-      cargarCapasApp(ventaRaw);
     } catch (err) {
       setAvisoBC(`No se pudieron cargar las líneas desde BC (${err.message}).`);
     }
     setCargandoBC(false);
-  };
-
-  /** Excel de cruce material: Venta | Compra | App faena | App taller | Cruce (todo por código). */
-  const exportarExcelMaterialOT = async () => {
-    setExportandoExcel(true);
-    setAvisoExcelOT(null);
-    try {
-      // Asegurar capas frescas (detalle App faena/taller) si aún no hay
-      let capas = capasApp;
-      if (!capas?.detalle_app) {
-        const r = await fetch(`/api/ot/capas?no=${encodeURIComponent(noBC)}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ venta: lineasBC?.ventaRaw || [] }),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j.error || `Capas ${r.status}`);
-        capas = j;
-        setCapasApp(j);
-      }
-
-      const XLSX = await import("xlsx");
-      const wb = XLSX.utils.book_new();
-      const otLabel = String(noBC || ficha?.ot || "OT").replace(/[\\/:*?"<>|]/g, "-");
-
-      const codArt = (l) =>
-        String(l.numero ?? l["Nº"] ?? l.articulo ?? l.codigo ?? "").trim().toUpperCase();
-      const descArt = (l) =>
-        String(l.descripcion ?? l["Descripción"] ?? l.article ?? "").trim();
-      const qtyArt = (l) => Number(l.cantidad ?? l["Cantidad"] ?? l.qty ?? 0) || 0;
-      const impArt = (l) => Number(l.importe ?? l["Importe línea"] ?? l.importe_coste ?? 0) || 0;
-      const docArt = (l) => String(l.numeroDocumento ?? l["Nº documento"] ?? l.documento ?? "").trim();
-
-      // —— 0) LEEME ——
-      const leeme = [
-        ["Excel material OT", otLabel],
-        ["Generado", new Date().toLocaleString("es-ES")],
-        [],
-        ["Hojas"],
-        ["1_Cruce", "UNA FILA POR CÓDIGO. Aquí encuentras lo que falta entre venta / compra / App. Ordenado: primero las raras."],
-        ["2_Venta_BC", "Todas las líneas de material vendido (pedido/factura BC o memoria)."],
-        ["3_Compra_BC", "Todas las líneas de compra real (PC)."],
-        ["4_App_faena", "Artículos en partes de TRABAJO de la App (gastado en obra)."],
-        ["5_App_taller", "Artículos preparados en partes de recogida (Material taller = SI)."],
-        [],
-        ["Cómo usarlo"],
-        ["1", "Abre 1_Cruce y mira la columna «Situación»."],
-        ["2", "«solo venta» = está en BC pero no en App → busca si falta el parte o el código."],
-        ["3", "«solo App» = está en faena/taller pero no vendido → ¿falta línea de venta?"],
-        ["4", "Marca la columna «Revisado» (pon X) conforme vas comprobando."],
-        ["5", "Si una hoja sale vacía, pulsa antes «Cargar líneas desde BC» o «Actualizar capas»."],
-        [],
-        ["Conteos"],
-        ["Líneas venta material", ventaMaterial.length],
-        ["Líneas compra", compraReal.length],
-        ["Líneas App faena", (capas?.detalle_app?.faena || []).length],
-        ["Líneas App taller prep", (capas?.detalle_app?.taller_prep || []).length],
-      ];
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(leeme), "0_LEEME");
-
-      // —— 2) Venta ——
-      const filasVenta = ventaMaterial.map((l) => ({
-        Codigo: codArt(l),
-        Descripcion: descArt(l),
-        Qty: qtyArt(l),
-        Importe: impArt(l),
-        Documento: docArt(l),
-        Origen: lineasBC ? "BC / memoria" : "memoria",
-        Revisado: "",
-      }));
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filasVenta.length ? filasVenta : [{ Codigo: "(sin líneas)" }]), "2_Venta_BC");
-
-      // —— 3) Compra ——
-      const filasCompra = compraReal.map((l) => ({
-        Codigo: codArt(l),
-        Descripcion: descArt(l),
-        Qty: qtyArt(l),
-        Importe: impArt(l),
-        Documento: docArt(l),
-        Revisado: "",
-      }));
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filasCompra.length ? filasCompra : [{ Codigo: "(sin líneas)" }]), "3_Compra_BC");
-
-      // —— 4) App faena ——
-      const filasFaena = (capas?.detalle_app?.faena || []).map((l) => ({
-        Parte: l.parte || "",
-        Codigo: String(l.articulo || "").trim().toUpperCase(),
-        Descripcion: l.descripcion || "",
-        Qty: Number(l.qty) || 0,
-        PrecioC: Number(l.precio_c) || 0,
-        Importe_coste: Number(l.importe_coste) || 0,
-        Validado: l.validated ? "Sí" : "No",
-        Tambien_en_taller: l.tambien_en_taller_prep ? "Sí" : "No",
-        Revisado: "",
-      }));
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filasFaena.length ? filasFaena : [{ Codigo: "(sin líneas App faena)" }]), "4_App_faena");
-
-      // —— 5) App taller ——
-      const filasTaller = (capas?.detalle_app?.taller_prep || []).map((l) => ({
-        Parte: l.parte || "",
-        Codigo: String(l.articulo || "").trim().toUpperCase(),
-        Descripcion: l.descripcion || "",
-        Qty_preparada: Number(l.qty_preparada) || 0,
-        Qty_gastada_faena: Number(l.qty_gastada_faena) || 0,
-        PrecioC: Number(l.precio_c) || 0,
-        Validado: l.validated ? "Sí" : "No",
-        Revisado: "",
-      }));
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filasTaller.length ? filasTaller : [{ Codigo: "(sin líneas App taller)" }]), "5_App_taller");
-
-      // —— 1) Cruce por código ——
-      const mapa = new Map();
-      const ensure = (cod, desc) => {
-        const k = String(cod || "").trim().toUpperCase() || `DESC:${String(desc || "").trim().toLowerCase()}`;
-        if (!mapa.has(k)) {
-          mapa.set(k, {
-            Codigo: String(cod || "").trim().toUpperCase(),
-            Descripcion: desc || "",
-            Qty_venta: 0,
-            Importe_venta: 0,
-            Qty_compra: 0,
-            Importe_compra: 0,
-            Qty_faena: 0,
-            Importe_faena: 0,
-            Qty_taller_prep: 0,
-            Qty_taller_gast_faena: 0,
-            Partes_faena: new Set(),
-            Partes_taller: new Set(),
-            Docs_venta: new Set(),
-            Docs_compra: new Set(),
-          });
-        }
-        const row = mapa.get(k);
-        if (desc && !row.Descripcion) row.Descripcion = desc;
-        return row;
-      };
-
-      for (const l of ventaMaterial) {
-        const row = ensure(codArt(l), descArt(l));
-        row.Qty_venta += qtyArt(l);
-        row.Importe_venta += impArt(l);
-        if (docArt(l)) row.Docs_venta.add(docArt(l));
-      }
-      for (const l of compraReal) {
-        const row = ensure(codArt(l), descArt(l));
-        row.Qty_compra += qtyArt(l);
-        row.Importe_compra += impArt(l);
-        if (docArt(l)) row.Docs_compra.add(docArt(l));
-      }
-      for (const l of capas?.detalle_app?.faena || []) {
-        const row = ensure(l.articulo, l.descripcion);
-        row.Qty_faena += Number(l.qty) || 0;
-        row.Importe_faena += Number(l.importe_coste) || 0;
-        if (l.parte) row.Partes_faena.add(String(l.parte));
-      }
-      for (const l of capas?.detalle_app?.taller_prep || []) {
-        const row = ensure(l.articulo, l.descripcion);
-        row.Qty_taller_prep += Number(l.qty_preparada) || 0;
-        // gastada ya agregada a nivel artículo en API; tomar max por si hay varias líneas prep
-        row.Qty_taller_gast_faena = Math.max(row.Qty_taller_gast_faena, Number(l.qty_gastada_faena) || 0);
-        if (l.parte) row.Partes_taller.add(String(l.parte));
-      }
-
-      const filasCruce = [...mapa.values()].map((r) => {
-        const enV = r.Qty_venta > 0;
-        const enC = r.Qty_compra > 0;
-        const enF = r.Qty_faena > 0;
-        const enT = r.Qty_taller_prep > 0;
-        const enApp = enF || enT;
-        let situacion = "OK (varios sitios)";
-        const sitios = [enV && "venta", enC && "compra", enF && "faena", enT && "taller"].filter(Boolean);
-        if (sitios.length === 1) situacion = `solo ${sitios[0]}`;
-        else if (enV && enApp && !enC) situacion = "venta + App (sin compra)";
-        else if (enV && enC && !enApp) situacion = "venta + compra (no App)";
-        else if (!enV && enApp) situacion = "solo App (no venta)";
-        else if (enV && !enApp) situacion = "solo venta (no App)";
-        const rareza =
-          sitios.length <= 1 ? 0
-            : (!enV && enApp) || (enV && !enApp) ? 1
-              : 2;
-        return {
-          Situacion: situacion,
-          Codigo: r.Codigo || "(sin código)",
-          Descripcion: r.Descripcion,
-          Qty_venta: r.Qty_venta,
-          Qty_compra: r.Qty_compra,
-          Qty_App_faena: r.Qty_faena,
-          Qty_App_taller_prep: r.Qty_taller_prep,
-          Qty_App_taller_gast: r.Qty_taller_gast_faena,
-          En_venta: enV ? "Sí" : "",
-          En_compra: enC ? "Sí" : "",
-          En_App_faena: enF ? "Sí" : "",
-          En_App_taller: enT ? "Sí" : "",
-          Importe_venta: Math.round(r.Importe_venta * 100) / 100,
-          Importe_compra: Math.round(r.Importe_compra * 100) / 100,
-          Importe_faena: Math.round(r.Importe_faena * 100) / 100,
-          Partes_faena: [...r.Partes_faena].join(", "),
-          Partes_taller: [...r.Partes_taller].join(", "),
-          Docs_venta: [...r.Docs_venta].join(", "),
-          Docs_compra: [...r.Docs_compra].join(", "),
-          Revisado: "",
-          _rareza: rareza,
-        };
-      });
-      filasCruce.sort((a, b) => a._rareza - b._rareza || String(a.Codigo).localeCompare(String(b.Codigo)));
-      const cruceExport = filasCruce.map(({ _rareza, ...rest }) => rest);
-      XLSX.utils.book_append_sheet(
-        wb,
-        XLSX.utils.json_to_sheet(cruceExport.length ? cruceExport : [{ Codigo: "(sin datos)" }]),
-        "1_Cruce"
-      );
-
-      XLSX.writeFile(wb, `material_OT_${otLabel}_${new Date().toISOString().slice(0, 10)}.xlsx`);
-      setAvisoExcelOT(`Excel listo: ${filasCruce.length} códigos en Cruce · venta ${filasVenta.length} · faena ${filasFaena.length} · taller ${filasTaller.length}`);
-    } catch (err) {
-      setAvisoExcelOT(`No se pudo generar el Excel: ${err.message || err}`);
-    }
-    setExportandoExcel(false);
   };
 
   // VENDIDO (material): líneas ya en la ficha + BC bajo demanda.
@@ -4799,25 +4581,19 @@ function DetalleOT({ ficha, fichas, onVolver }) {
   // (el precio se actualizó después). Si se suman, las unidades del correo
   // salen dobladas. Si el mismo artículo del mismo documento ya viene en
   // la lectura de BC, manda esa lectura y la copia guardada no se cuenta.
-  // Además: si coexisten PV (pedido) y factura/otro del mismo artículo,
-  // solo se cuenta un lado (ver deduplicarLineasVentaPedidoFactura).
   const ventaMaterial = useMemo(() => {
     const memoria = [...(ficha.venta.materiales.lineas || [])];
     const deBC = lineasBC ? lineasBC.venta.filter((l) => clasificarLineaVenta(l) === "material") : [];
-    let merged;
-    if (!deBC.length) merged = memoria;
-    else {
-      const clave = (l) => {
-        const doc = l.numeroDocumento ?? l["Nº documento"] ?? "";
-        const art = (l.numero ?? l["Nº"] ?? "").toString().trim()
-          || String(l.descripcion ?? l["Descripción"] ?? "").trim().toLowerCase();
-        return `${doc}|${art}`;
-      };
-      const enBC = new Set(deBC.map(clave));
-      merged = [...memoria.filter((l) => !enBC.has(clave(l))), ...deBC];
-    }
-    return deduplicarLineasVentaPedidoFactura(merged, noBC);
-  }, [ficha, lineasBC, noBC]);
+    if (!deBC.length) return memoria;
+    const clave = (l) => {
+      const doc = l.numeroDocumento ?? l["Nº documento"] ?? "";
+      const art = (l.numero ?? l["Nº"] ?? "").toString().trim()
+        || String(l.descripcion ?? l["Descripción"] ?? "").trim().toLowerCase();
+      return `${doc}|${art}`;
+    };
+    const enBC = new Set(deBC.map(clave));
+    return [...memoria.filter((l) => !enBC.has(clave(l))), ...deBC];
+  }, [ficha, lineasBC]);
 
   // PEDIDO (compras reales, PC/Order — las ofertas OC no cuentan como pedido).
   // Se DEDUPLICAN las líneas: la misma línea puede llegar dos veces (la
@@ -4942,94 +4718,32 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     });
   };
 
-  // MATERIAL DEL TALLER (coste estimado):
-  //  1) App 100% real — preparado en parte Material taller=SI (capas + sobra).
-  //  2) Vendido en BC sin compra PC (sin_coste) — posible taller/almacén.
-  // Si el mismo artículo está en App, manda App (no se duplica).
-  // Valoración: precio manual > unitario capas/faena > última compra > venta÷1,75.
+  // MATERIAL DEL TALLER — regla de Maria (15/07/2026): los artículos
+  // VENDIDOS SIN COMPRA asociada (SIN COSTE) se han cogido del taller y
+  // deben contar como coste real de la OT. Valoración: ÚLTIMA COMPRA del
+  // artículo en la memoria; si no hay ninguna, precio de venta ÷ 1,75.
+  // Si Maria escribe un importe en la tarjeta, ese precio manda.
   const materialTaller = useMemo(() => {
-    const porCod = new Map();
-
-    const valorar = (codigo, descripcion, uds, unitHint, origen) => {
-      const u = Number(uds) || 0;
-      if (u <= 0) return null;
-      const clave = String(codigo || descripcion || "").trim().toLowerCase();
-      const tieneManual =
-        Object.prototype.hasOwnProperty.call(preciosTaller, clave) && Number.isFinite(Number(preciosTaller[clave]));
-      let unit = Number(unitHint) || 0;
-      let origenCoste = origen;
-      if (tieneManual) {
-        unit = Number(preciosTaller[clave]);
-        origenCoste = "precio manual";
-      } else if (!(unit > 0)) {
-        const compras = historialCompraArticulo(codigo, descripcion, fichas).filter((c) => c.costeUnitario > 0);
-        if (compras.length) {
-          unit = compras[0].costeUnitario;
-          origenCoste = "última compra";
-        } else {
-          const itVenta = (dif.items || []).find(
-            (x) => String(x.codigo || "").trim().toUpperCase() === String(codigo || "").trim().toUpperCase()
-          );
-          const udsV = Number(itVenta?.udsVendidas) || 0;
-          const pvUnit = udsV > 0 ? (Number(itVenta?.importeVenta) || 0) / udsV : 0;
-          unit = pvUnit > 0 ? pvUnit / 1.75 : 0;
-          origenCoste = pvUnit > 0 ? "venta ÷ 1,75" : origen;
-        }
-      }
-      return {
-        numero: codigo,
-        descripcion: descripcion || "",
-        cantidad: u,
-        costeUnitario: unit,
-        importe: unit * u,
-        _origenCoste: origenCoste,
-        _origen: origen,
-      };
-    };
-
-    // 1) Taller App (capas): líneas merge + sobra → qty = preparado
-    const tallerSec = capasApp?.secciones?.material_taller || {};
-    for (const est of Object.keys(tallerSec)) {
-      for (const lin of tallerSec[est]?.lineas || []) {
-        const cod = String(lin.articulo || "").trim();
-        if (!cod) continue;
-        const prep = Number(lin.preparado) || Number(lin.qty) || 0;
-        const qtyFact = Number(lin.qty) || 0;
-        const unitCapas = qtyFact > 0 ? (Number(lin.importe_coste) || 0) / qtyFact : 0;
-        const fila = valorar(cod, lin.descripcion, prep, unitCapas, "app_taller");
-        if (fila) porCod.set(cod.toUpperCase(), fila);
-      }
-    }
-    for (const r of capasApp?.taller_sobra || []) {
-      const cod = String(r.articulo || "").trim();
-      if (!cod) continue;
-      const key = cod.toUpperCase();
-      if (porCod.has(key)) continue; // ya viene del merge con preparado
-      const fila = valorar(cod, r.descripcion, Number(r.qty_preparada) || 0, 0, "app_taller");
-      if (fila) porCod.set(key, fila);
-    }
-
-    // 2) Vendido sin compra (no duplicar si ya está por App)
-    for (const it of dif.items || []) {
-      if (it.estado !== "sin_coste") continue;
-      const cod = String(it.codigo || "").trim();
-      const key = (cod || String(it.descripcion || "").trim()).toUpperCase();
-      if (!key || porCod.has(key)) continue;
-      const uds = Number(it.udsVendidas) || 0;
-      const pvUnit = uds > 0 ? (Number(it.importeVenta) || 0) / uds : 0;
-      const fila = valorar(cod || it.descripcion, it.descripcion, uds, pvUnit > 0 ? pvUnit / 1.75 : 0, "venta_sin_compra");
-      if (fila) {
-        if (!(Number(fila.costeUnitario) > 0) && pvUnit > 0) {
-          fila.costeUnitario = pvUnit / 1.75;
-          fila.importe = fila.costeUnitario * fila.cantidad;
-          fila._origenCoste = "venta ÷ 1,75";
-        }
-        porCod.set(key, fila);
-      }
-    }
-
-    return [...porCod.values()];
-  }, [dif, fichas, preciosTaller, capasApp]);
+    return (dif.items || [])
+      .filter((it) => it.estado === "sin_coste")
+      .map((it) => {
+        const uds = Number(it.udsVendidas) || 0;
+        const pvUnit = uds > 0 ? (Number(it.importeVenta) || 0) / uds : 0;
+        const compras = historialCompraArticulo(it.codigo, it.descripcion, fichas).filter((c) => c.costeUnitario > 0);
+        const unit = compras.length ? compras[0].costeUnitario : pvUnit / 1.75;
+        const clave = String(it.codigo || it.descripcion || "").trim().toLowerCase();
+        const tieneManual = Object.prototype.hasOwnProperty.call(preciosTaller, clave) && Number.isFinite(Number(preciosTaller[clave]));
+        const unitFinal = tieneManual ? Number(preciosTaller[clave]) : unit;
+        return {
+          numero: it.codigo,
+          descripcion: it.descripcion,
+          cantidad: uds,
+          costeUnitario: unitFinal,
+          importe: unitFinal * uds,
+          _origenCoste: tieneManual ? "precio manual" : (compras.length ? "última compra" : "venta ÷ 1,75"),
+        };
+      });
+  }, [dif, fichas, preciosTaller]);
   const costeTaller = materialTaller.reduce((a, l) => a + l.importe, 0);
 
   const ESTADO_UI = {
@@ -5743,16 +5457,8 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         );
       })()}
 
-      {/* Capas App ↔ BC (horas / material obra / taller) */}
-      <CapasAppOT
-        capas={capasApp}
-        cargando={cargandoCapas}
-        aviso={avisoCapas}
-        onRecargar={() => cargarCapasApp(lineasBC?.ventaRaw || [])}
-      />
-
-      {/* Cargar líneas frescas desde BC + Excel cruce material */}
-      <div className="flex items-center gap-2 mb-3 flex-wrap">
+      {/* Cargar líneas frescas desde BC */}
+      <div className="flex items-center gap-2 mb-3">
         <button
           onClick={cargarLineasBC}
           disabled={cargandoBC}
@@ -5761,22 +5467,12 @@ function DetalleOT({ ficha, fichas, onVolver }) {
           <RefreshCw size={12} className={cargandoBC ? "animate-spin" : ""} />
           {cargandoBC ? "Cargando..." : lineasBC ? "Actualizar líneas desde BC" : "Cargar líneas desde BC"}
         </button>
-        <button
-          type="button"
-          onClick={exportarExcelMaterialOT}
-          disabled={exportandoExcel || cargandoCapas}
-          title="Descarga Excel con Venta, Compra, App faena, App taller y Cruce por código (para marcar a mano)"
-          className="flex items-center gap-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 rounded-md px-3 py-1.5 hover:bg-emerald-100 disabled:opacity-60"
-        >
-          {exportandoExcel ? "Generando Excel…" : "Excel material OT"}
-        </button>
         {lineasBC && (
           <span className="text-[11px] text-slate-500">
             BC: {lineasBC.venta.length} línea(s) venta · {lineasBC.compra.length} de compra
           </span>
         )}
         {avisoBC && <span className="text-[11px] text-amber-700">⚠ {avisoBC}</span>}
-        {avisoExcelOT && <span className="text-[11px] text-emerald-800">{avisoExcelOT}</span>}
         <button
           type="button"
           onClick={() => { setAvisoFactura(null); setConfirmarFactura(true); }}
@@ -5995,7 +5691,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         />
         {materialTaller.length > 0 && (
           <TablaLineasMaterial
-            titulo={`🏭 Material del taller — ${materialTaller.length} (App seguro + vendido sin compra)`}
+            titulo={`🏭 Material del taller (coste estimado) — ${materialTaller.length}`}
             lineas={materialTaller}
             onClicArticulo={(codigo, descripcion) => setHistorial({ tipo: "compra", codigo, descripcion })}
           />
@@ -6710,105 +6406,6 @@ function FacturaOT({ lineasRaw, ficha, noBC }) {
 // obra, artículos...) hasta el siguiente "parte" o el fin del documento.
 const RE_PARTE_TRABAJO = /n[ºo]\.?\s*parte de trabajo[:\s]+(\S+)\s+ot[:\s]+(\S+)\s+fecha[:\s]+(\d{2}\/\d{2}\/\d{4})/i;
 
-/** Panel capas App↔BC: Registrado BC / Validado App no BC / No validado App */
-function CapasAppOT({ capas, cargando, aviso, onRecargar }) {
-  const [abierto, setAbierto] = useState(true);
-  const ESTADOS = [
-    { key: "registrado_bc", label: "Registrado BC", cls: "bg-emerald-50 border-emerald-200 text-emerald-900" },
-    { key: "validado_app_no_bc", label: "Validado App (no BC)", cls: "bg-amber-50 border-amber-200 text-amber-900" },
-    { key: "no_validado_app", label: "No validado App", cls: "bg-rose-50 border-rose-200 text-rose-900" },
-  ];
-  const SECCIONES = [
-    { key: "horas", label: "Horas", esHoras: true },
-    { key: "material_obra", label: "Material obra", esHoras: false },
-    { key: "material_taller", label: "Material taller", esHoras: false },
-  ];
-
-  const fmt = (n) => (n == null || Number.isNaN(n) ? "—" : eur(n));
-  const fmtH = (n) => `${(Number(n) || 0).toLocaleString("es-ES", { maximumFractionDigits: 2 })} h`;
-
-  return (
-    <div className="bg-white border border-indigo-200 rounded-lg p-3 mb-3">
-      <div className="flex items-center gap-2 mb-2 flex-wrap">
-        <button
-          type="button"
-          className="text-xs font-bold text-indigo-900 hover:underline"
-          onClick={() => setAbierto((v) => !v)}
-        >
-          {abierto ? "▾" : "▸"} Capas App ↔ BC
-        </button>
-        <span className="text-[10px] text-slate-400">
-          Coste MO × {capas?.tarifa_mo ?? 21.5} €/h · taller = preparado (recogida) fusionado con gastado (faena)
-        </span>
-        <button
-          type="button"
-          onClick={onRecargar}
-          disabled={cargando}
-          className="ml-auto text-[11px] font-semibold text-indigo-700 border border-indigo-300 rounded px-2 py-0.5 hover:bg-indigo-50 disabled:opacity-50"
-        >
-          {cargando ? "Cargando…" : "Actualizar capas"}
-        </button>
-      </div>
-      {aviso && <div className="text-[11px] text-amber-700 mb-2">⚠ {aviso}</div>}
-      {cargando && !capas && <div className="text-[11px] text-slate-400">Leyendo partes ALSOAPP…</div>}
-      {abierto && capas && (
-        <>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-2">
-            {SECCIONES.map((sec) => {
-              const s = capas.secciones?.[sec.key];
-              if (!s) return null;
-              return (
-                <div key={sec.key} className="border border-slate-200 rounded-md p-2">
-                  <div className="text-[11px] font-bold text-slate-700 mb-1.5">{sec.label}</div>
-                  {ESTADOS.map((e) => {
-                    const b = s[e.key] || {};
-                    const valor = sec.esHoras
-                      ? `${fmtH(b.horas)} · ${fmt(b.importe_coste)}`
-                      : `${fmt(b.importe_coste)}${b.qty ? ` · ${Number(b.qty).toLocaleString("es-ES")} ud` : ""}`;
-                    const n = (b.lineas || []).length;
-                    return (
-                      <div key={e.key} className={`text-[10px] border rounded px-1.5 py-1 mb-1 ${e.cls}`}>
-                        <div className="font-semibold">{e.label}</div>
-                        <div className="tabular-nums">{valor}{n ? ` · ${n} línea(s)` : ""}</div>
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            })}
-          </div>
-          {capas.totales && (
-            <div className="text-[11px] text-slate-700 bg-slate-50 border border-slate-200 rounded px-2 py-1.5 mb-2">
-              <b>Total coste directo (capas):</b>{" "}
-              {fmt(capas.totales.coste_directo)}
-              <span className="text-slate-400">
-                {" "}(MO {fmt(capas.totales.coste_mo)} + obra {fmt(capas.totales.coste_material_obra)} + taller {fmt(capas.totales.coste_material_taller)})
-              </span>
-            </div>
-          )}
-          {(capas.taller_sobra || []).length > 0 && (
-            <div className="text-[11px] border border-slate-200 rounded p-2 mb-1">
-              <div className="font-semibold text-slate-700 mb-1">Taller preparado no gastado (no facturar)</div>
-              {capas.taller_sobra.map((r, i) => (
-                <div key={i} className="text-slate-600 tabular-nums" title={r.descripcion || ""}>
-                  <span className="font-mono">{r.articulo}</span>
-                  {r.descripcion ? <> · <span className="text-slate-700">{r.descripcion}</span></> : null}
-                  {" · "}prep. {r.qty_preparada} · gastado {r.qty_gastada} · sobra <b>{r.qty_sobra}</b>
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="text-[10px] text-slate-400">
-            OT App id {capas.ot?.id_ot} · partes BC detectados: {(capas.partes_bc_detectados || []).join(", ") || "—"}
-            {capas.n_lineas_venta_bc != null ? ` · líneas venta BC: ${capas.n_lineas_venta_bc}` : ""}
-            {" · "}API <code className="text-[9px]">GET/POST /api/ot/capas?no=…</code>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
 function PartesTrabajoOT({ lineasRaw, ficha, fichas, onClicArticulo }) {
   const [abierto, setAbierto] = useState(null); // Nº documento expandido, o null
   const UMBRAL_DISCREPANCIA = 5; // €
@@ -7216,9 +6813,7 @@ function ModalHistorialArticulo({ tipo, codigo, descripcion, fichas, vivas, otAc
       [normalizarNumeroOT(f.ot), f.numeroDocumento || "", f.codigoLinea || "", f.descripcion, f.cantidad, f.importe].join("|");
     const enMemoria = new Set(memoria.map(clave));
     const nuevas = extra.filter((f) => !enMemoria.has(clave(f)));
-    const juntas = [...nuevas, ...memoria];
-    // En venta: no mostrar PV + factura del mismo artículo/OT a la vez
-    return tipo === "venta" ? deduplicarLineasVentaPedidoFactura(juntas) : juntas;
+    return [...nuevas, ...memoria];
   }, [tipo, codigo, descripcion, fichas, vivas, otActual, optsHist, mapeoListo]);
 
   const filas = useMemo(() => {
@@ -7773,12 +7368,8 @@ class CapturaErrores extends React.Component {
 }
 
 export default function CargarDatosVentas({ usuario = null, onLogout = null }) {
-  // Ventana nueva de OTs (pestaña propia): #/ots — no disponible con solo_control_horas
-  const restringidoHoras = soloControlHoras(usuario);
-  const esVentanaOTs =
-    !restringidoHoras &&
-    typeof window !== "undefined" &&
-    window.location.hash === "#/ots";
+  // Ventana nueva de OTs (pestaña propia): #/ots
+  const esVentanaOTs = typeof window !== "undefined" && window.location.hash === "#/ots";
   return (
     <CapturaErrores>
       {esVentanaOTs ? <PantallaOTs /> : <PantallaPrincipal usuario={usuario} onLogout={onLogout} />}
@@ -7807,15 +7398,13 @@ function recortarFilas(sourceId, filas) {
 }
 
 function PantallaPrincipal({ usuario = null, onLogout = null }) {
-  const soloHoras = soloControlHoras(usuario);
   const [data, setData] = useState(() =>
     Object.fromEntries(SOURCES.map((s) => [s.id, { cached: [], totalRows: 0, rows: [] }]))
   );
   const [estadoInicial, setEstadoInicial] = useState(null);
 
-  // Restaurar el estado persistido (una vez, al montar). No aplica a solo_control_horas.
+  // Restaurar el estado persistido (una vez, al montar)
   useEffect(() => {
-    if (soloHoras) return;
     (async () => {
       try {
         const r = await fetch("/api/estado");
@@ -7835,7 +7424,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
         /* backend apagado: sin restauración */
       }
     })();
-  }, [soloHoras]);
+  }, []);
 
   const persistirBcData = (next) => {
     fetch("/api/estado", {
@@ -7906,19 +7495,12 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
     return { loaded, totalRows };
   }, [data]);
 
-  const [seccion, setSeccion] = useState(soloHoras ? "horas" : "cargar"); // cargar | memoria | explorador | recepcion | horas
-  const [vistas, setVistas] = useState(() => new Set([soloHoras ? "horas" : "cargar"]));
+  const [seccion, setSeccion] = useState("cargar"); // cargar | memoria | explorador | recepcion
+  const [vistas, setVistas] = useState(() => new Set(["cargar"]));
   const abrirSeccion = (id) => {
-    if (soloHoras && id !== "horas") return;
     setVistas((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     setSeccion(id);
   };
-
-  useEffect(() => {
-    if (!soloHoras) return;
-    setSeccion("horas");
-    setVistas(new Set(["horas"]));
-  }, [soloHoras]);
   const [actualizandoRecep, setActualizandoRecep] = useState(false);
   const [actualizandoFacVenta, setActualizandoFacVenta] = useState(false);
   const [tareaPendiente, setTareaPendiente] = useState(null); // tarea creada desde Correo
@@ -8039,43 +7621,37 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
             <SelectorEmpresa />
           </div>
           <nav className="bc-nav-menu">
-            {soloHoras ? (
-              navItem("horas", "Control de horas", Timer)
-            ) : (
-              <>
-                {navItem("cargar", "Cargar datos", Database)}
-                {navItem("memoria", "Memoria histórica", History)}
-                {navItem("explorador", "Explorador de OTs", Search)}
-                {navItem("recepcion", "Recepción de material", Package)}
-                {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
-                {navItem("precios", "Precios de artículos", Tag)}
-                {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
-                {navItem("facturasventa", "Facturas de venta", FileText)}
-                {navItem("correo", "Correo", Mail)}
-                {navItem("tareas", "Mis tareas", CheckSquare)}
-                {navItem("ia", "Asistente IA", Bot)}
-                {navItem("ratios", "Ratios financieros", BarChart3)}
-                {navItem("horas", "Control de horas", Timer)}
+            {navItem("cargar", "Cargar datos", Database)}
+            {navItem("memoria", "Memoria histórica", History)}
+            {navItem("explorador", "Explorador de OTs", Search)}
+            {navItem("recepcion", "Recepción de material", Package)}
+            {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
+            {navItem("precios", "Precios de artículos", Tag)}
+            {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
+            {navItem("facturasventa", "Facturas de venta", FileText)}
+            {navItem("correo", "Correo", Mail)}
+            {navItem("tareas", "Mis tareas", CheckSquare)}
+            {navItem("ia", "Asistente IA", Bot)}
+            {navItem("ratios", "Ratios financieros", BarChart3)}
+            {navItem("horas", "Control de horas", Timer)}
 
-                <div className="bc-nav-grupo">Hoja de ruta</div>
-                {[
-                  "Explorar datos",
-                  "Pedidos de venta",
-                  "Análisis de rentabilidad",
-                  "Precios de artículos",
-                  "Análisis por cliente",
-                  "Comparar periodos",
-                ].map((item) => (
-                  <div
-                    key={item}
-                    className="bc-nav-item desactivada"
-                    title="Pendiente de construir — hoja de ruta"
-                  >
-                    {item}
-                  </div>
-                ))}
-              </>
-            )}
+            <div className="bc-nav-grupo">Hoja de ruta</div>
+            {[
+              "Explorar datos",
+              "Pedidos de venta",
+              "Análisis de rentabilidad",
+              "Precios de artículos",
+              "Análisis por cliente",
+              "Comparar periodos",
+            ].map((item) => (
+              <div
+                key={item}
+                className="bc-nav-item desactivada"
+                title="Pendiente de construir — hoja de ruta"
+              >
+                {item}
+              </div>
+            ))}
           </nav>
         </aside>
 
@@ -8184,9 +7760,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           ))}
         </main>
       </div>
-      {!soloHoras && (
-        <AsistenteUnico seccion={seccion} fichas={estadoInicial?.fichas?.length ? new Map(estadoInicial.fichas) : null} />
-      )}
+      <AsistenteUnico seccion={seccion} fichas={estadoInicial?.fichas?.length ? new Map(estadoInicial.fichas) : null} />
     </div>
   );
 }

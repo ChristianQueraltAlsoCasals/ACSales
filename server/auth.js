@@ -17,11 +17,6 @@ const {
   validarCredencial,
   rolDesDeNivell,
 } = require("./constellation");
-const {
-  normalizarAccions,
-  accionsFallbackLocal,
-  accionsTodas,
-} = require("./permisos");
 const { resolverEmailEnvio } = require("./achuman-client");
 
 const router = express.Router();
@@ -49,12 +44,6 @@ function ponerCookie(res, token) {
 }
 
 function datosPublicos(u) {
-  const portalRol = u.portal_rol || null;
-  const portalSuper = !!u.portal_super;
-  const accions = normalizarAccions(
-    u.accions,
-    portalSuper || portalRol === "admin" ? "admin" : portalRol
-  );
   return {
     id: u.id,
     nombre: u.nom_treballador || u.nombre,
@@ -66,9 +55,8 @@ function datosPublicos(u) {
     nom_treballador: u.nom_treballador || null,
     codi_treballador: u.codi_treballador || null,
     empresa_treballador: u.empresa_treballador || null,
-    portal_rol: portalRol,
-    portal_super: portalSuper,
-    accions,
+    portal_rol: u.portal_rol || null,
+    portal_super: !!u.portal_super,
   };
 }
 
@@ -79,7 +67,6 @@ function aplicarPermisos(usuario, portal) {
       ...usuario,
       portal_rol: usuario.rol === "admin" ? "admin" : "usuari",
       portal_super: false,
-      accions: accionsTodas(),
     };
   }
   if (!portal.ok) {
@@ -87,7 +74,6 @@ function aplicarPermisos(usuario, portal) {
       ...usuario,
       portal_rol: null,
       portal_super: false,
-      accions: accionsFallbackLocal(usuario),
     };
   }
   const portalSuper = !!portal.portal_super;
@@ -98,9 +84,6 @@ function aplicarPermisos(usuario, portal) {
     ...usuario,
     portal_rol: portalRol,
     portal_super: portalSuper,
-    accions: portalSuper
-      ? accionsTodas()
-      : normalizarAccions(portal.accions, portalRol),
   };
 }
 

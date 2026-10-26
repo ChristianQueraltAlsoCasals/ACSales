@@ -19,7 +19,7 @@ COPY server/server.cjs server/db.js server/schema.sql \
      server/achuman-client.js server/acfactory-client.cjs \
      server/iaBC.cjs server/contabilidad.cjs server/macro.cjs \
      server/correoPC.cjs server/horas.cjs server/pedidosVentaSeguimiento.cjs \
-     server/mapeoArticulos.cjs server/ot-capas.cjs server/ots-app.cjs ./
+     server/mapeoArticulos.cjs ./
 COPY data/mapeo_reemplazo_items.csv ./data/mapeo_reemplazo_items.csv
 COPY --from=web /web/dist ./public
 ENV PORT=8102

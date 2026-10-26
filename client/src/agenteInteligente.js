@@ -316,70 +316,6 @@ export function adaptarLineasVentaAPI(filas, campos = API_LINEA_CAMPOS.venta) {
   });
 }
 
-/**
- * Evita contar dos veces el mismo material cuando coexisten
- * pedido de venta (Document_No PV…) y factura / otro documento
- * (P… factura ALSO, etc.) para el MISMO artículo en la MISMA OT.
- *
- * Caso típico: se cargan lineas_venta (pedido vivo) + lineas_venta_reg
- * (factura registrada) y el mismo PR aparece en ambos → uds ×2 y
- * «Material del taller» inflado.
- *
- * Regla: si hay lado PV y lado no-PV, se conserva solo el lado con
- * mayor importe neto; empate → PV. Varias líneas del mismo documento
- * (p. ej. 1 ud cobrada + 1 ud al 100 % dto) se mantienen.
- *
- * @param {Array<Object>} lineas  formato adaptado o resumen de ficha
- * @param {string|null} otFija    si todas las líneas son de una OT (ficha)
- */
-export function deduplicarLineasVentaPedidoFactura(lineas, otFija = null) {
-  const list = lineas || [];
-  if (list.length < 2) return list;
-
-  const otFijaNorm = otFija != null && otFija !== "" ? normalizarNumeroOT(otFija) : null;
-
-  const metaDe = (l) => {
-    const ot = otFijaNorm || normalizarNumeroOT(l.OT ?? l.ot ?? l.numeroOT ?? "");
-    const doc = String(l["Nº documento"] ?? l.numeroDocumento ?? "").trim().toUpperCase();
-    const codigo =
-      String(l["Nº"] ?? l.numero ?? l.codigoLinea ?? "")
-        .trim()
-        .toUpperCase() || norm(l["Descripción"] ?? l.descripcion ?? "");
-    const importe = Number(l["Importe línea"] ?? l.importe ?? 0) || 0;
-    return { ot, doc, codigo, importe, esPV: doc.startsWith("PV") };
-  };
-
-  const grupos = new Map();
-  list.forEach((l, idx) => {
-    const m = metaDe(l);
-    if (!m.ot || !m.codigo || !m.doc) return;
-    const key = `${m.ot}|${m.codigo}`;
-    if (!grupos.has(key)) grupos.set(key, []);
-    grupos.get(key).push({ idx, ...m });
-  });
-
-  const drop = new Set();
-  for (const items of grupos.values()) {
-    const tienePV = items.some((i) => i.esPV);
-    const tieneOtro = items.some((i) => !i.esPV);
-    if (!tienePV || !tieneOtro) continue;
-
-    let sumPV = 0;
-    let sumOtro = 0;
-    for (const i of items) {
-      if (i.esPV) sumPV += i.importe;
-      else sumOtro += i.importe;
-    }
-    const quedarsePV = sumPV >= sumOtro;
-    for (const i of items) {
-      if (quedarsePV ? !i.esPV : i.esPV) drop.add(i.idx);
-    }
-  }
-
-  if (drop.size === 0) return list;
-  return list.filter((_, idx) => !drop.has(idx));
-}
-
 export function adaptarLineasCompraAPI(filas, campos = API_LINEA_CAMPOS.compra) {
   return (filas || []).map((f) => {
     // DESCUENTOS: nombres CONFIRMADOS en su BC según la fuente:
@@ -940,8 +876,7 @@ export function historialVentaArticulo(codigo, descripcionFallback, fichasHistor
     }
   }
 
-  // Pedido PV + factura/otro del mismo artículo/OT → una sola vez
-  return ordenarPorReciencia(_dedupHistorial(deduplicarLineasVentaPedidoFactura(filas)));
+  return ordenarPorReciencia(_dedupHistorial(filas));
 }
 
 function _dedupHistorial(filas) {
