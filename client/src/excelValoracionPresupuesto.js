@@ -1,6 +1,8 @@
 /** Excel de la valoración de una OT con presupuesto, para el correo de
  *  revisión de material. Mismos importes que la ficha: coste de hora 21,50,
- *  venta de hora según tarifa y tipo real, compras × 1,68. */
+ *  venta de hora según tarifa ACSales (Excel) y tipo real, compras × 1,68. */
+
+import ExcelJS from "exceljs";
 
 const NAVY = "FF0F2740";
 const NAVY2 = "FF1E3A5F";
@@ -116,8 +118,6 @@ async function aBase64(data) {
 }
 
 export async function excelValoracionPresupuesto(ficha, v) {
-  const mod = await import("exceljs");
-  const ExcelJS = mod.default || mod;
   const ot = (typeof ficha === "object" && ficha && ficha._otExcel) || codigoDesdeFicha(ficha);
   const cliente = ficha?.general?.cliente || "";
   const descripcion = ficha?.general?.descripcion || "";
@@ -227,7 +227,7 @@ function hojaResumen(ws, { ot, sub, v, horas, compras, facturado, primera, ultim
   ws.mergeCells(18, 2, 18, 5);
   ws.getRow(18).height = 32;
   aplicar(ws.getCell(18, 2), {
-    valor: "La venta de compras es el coste de cada línea × 1,68. La venta de mano de obra es la tarifa general del grupo y del tipo de hora (normal, extra, festivo o guardia). El coste de la hora es 21,50 €.",
+    valor: "La venta de compras es el coste de cada línea × 1,68. La venta de mano de obra es la tarifa ACSales (Excel de Anàlisi per client: general o especial del cliente) según grupo de recurso y tipo de hora (normal, extra, festivo o guardia). El coste de la hora es 21,50 €.",
     font: { size: 9, italic: true, color: { argb: SLATE } },
     fill: PAPER,
     align: { horizontal: "left", indent: 1, wrapText: true },

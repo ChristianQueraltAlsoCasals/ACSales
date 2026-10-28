@@ -277,8 +277,13 @@ export const API_LINEA_CAMPOS = {
 
 const TIPO_LINEA_API = {
   item: "Producto",
+  artículo: "Producto", // WS en castellano (pág. 516 / SalesInvLines)
+  articulo: "Producto",
+  product: "Producto",
   resource: "Recurso",
+  recurso: "Recurso",
   account: "Cuenta",
+  cuenta: "Cuenta",
   "g/l account": "Cuenta",
   "charge (item)": "Cuenta", // cargos (portes, etc.)
 };
@@ -1078,8 +1083,11 @@ export function clasificarLineaVenta(linea, cfg = CONFIG) {
 
   if (contieneAlguna(desc, r.palabrasDesplazamiento)) return "desplazamiento";
   if (r.tiposManoObra.map(norm).includes(tipo)) return "horas";
+  // Producto / Artículo / Item: material SIEMPRE, antes de palabrasHoras.
+  // Si no, "puesto trabajo" o "parte de trabajo" en la descripción
+  // clasificaba el artículo como horas y salía en Coste no facturado.
+  if (tipo === "producto" || tipo === "artículo" || tipo === "articulo" || tipo === "item") return "material";
   if (contieneAlguna(desc, r.palabrasHoras)) return "horas";
-  if (tipo === "producto") return "material";
   return "otro";
 }
 

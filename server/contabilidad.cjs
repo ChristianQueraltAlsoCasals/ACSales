@@ -16,7 +16,7 @@
 const fs = require("fs");
 const path = require("path");
 
-module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE }) {
+module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE, db, claveEmpresa }) {
   const cache = new Map();
   const cacheNombres = new Map(); // empresa -> {ts, mapa}
   const dirGuardado = path.join(__dirname, "data", "ratios");
@@ -383,6 +383,690 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
     } catch (err) {
       console.error("Error /api/contabilidad/circulante-terceros:", err);
       res.status(500).json({ error: "No se pudieron leer las facturas abiertas.", detalle: String(err.message || err) });
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Deuda abierta por cliente (Anàlisi per client · bloc C).
+  // Facturas / abonos Open + límit de crèdit si BC el exposa.
+  // ------------------------------------------------------------------
+  const cacheDeudaCli = new Map();
+  app.get("/api/analisis-cliente/deuda", async (req, res) => {
+    const numero = String(req.query.numero || "").trim();
+    const nombre = String(req.query.nombre || "").trim();
+    if (!numero && !nombre) {
+      return res.status(400).json({ error: "Falta 'numero' o 'nombre' de client." });
+    }
+    const claveCache = `${EMPRESA_ID()}|open`;
+    try {
+      const token = await obtenerTokenBC();
+      const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+      const hoy = new Date().toISOString().slice(0, 10);
+
+      const leerOpen = async (entidad, campos) => {
+        let cached = cacheDeudaCli.get(`${claveCache}|${entidad}`);
+        if (cached && Date.now() - cached.ts < 15 * 60 * 1000 && req.query.refrescar !== "1") {
+          return cached.rows;
+        }
+        const filtro = encodeURIComponent(`status eq 'Open'`);
+        let url = `${raiz}/${entidad}?$select=${campos}&$filter=${filtro}`;
+        const out = [];
+        while (url && out.length < 10000) {
+          const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
+          if (!r.ok) throw new Error(`BC ${entidad} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+          const j = await r.json();
+          out.push(...(j.value || []));
+          url = j["@odata.nextLink"] || null;
+        }
+        cacheDeudaCli.set(`${claveCache}|${entidad}`, { ts: Date.now(), rows: out });
+        return out;
+      };
+
+      const diasEntre = (a, b) => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(a) || !/^\d{4}-\d{2}-\d{2}$/.test(b)) return null;
+        return Math.round((new Date(`${b}T00:00:00Z`) - new Date(`${a}T00:00:00Z`)) / 86400000);
+      };
+
+      const coincide = (f) => {
+        const n = String(f.customerNumber || "").trim();
+        const nom = String(f.customerName || "").trim();
+        if (numero && n && n.toLowerCase() === numero.toLowerCase()) return true;
+        if (nombre && nom && nom.toLowerCase() === nombre.toLowerCase()) return true;
+        if (numero && !n && nombre && nom && nom.toLowerCase() === nombre.toLowerCase()) return true;
+        return false;
+      };
+
+      const [ventas, abonos] = await Promise.all([
+        leerOpen("salesInvoices", "number,customerName,customerNumber,invoiceDate,dueDate,status,totalAmountIncludingTax,totalAmountExcludingTax"),
+        leerOpen("salesCreditMemos", "number,customerName,customerNumber,creditMemoDate,dueDate,status,totalAmountIncludingTax,totalAmountExcludingTax"),
+      ]);
+
+      const mapFactura = (f, tipo) => {
+        const fecha = String(f.invoiceDate || f.creditMemoDate || "").slice(0, 10);
+        const vencimiento = String(f.dueDate || "").slice(0, 10);
+        const importe = Number(f.totalAmountIncludingTax) || 0;
+        const base = Number(f.totalAmountExcludingTax) || 0;
+        const diasVencido = vencimiento ? diasEntre(vencimiento, hoy) : null;
+        let aging = "senseVenc";
+        if (diasVencido == null) aging = "senseVenc";
+        else if (diasVencido <= 0) aging = "noVenc";
+        else if (diasVencido <= 30) aging = "d1_30";
+        else if (diasVencido <= 60) aging = "d31_60";
+        else if (diasVencido <= 90) aging = "d61_90";
+        else aging = "d90";
+        return {
+          tipo,
+          numero: String(f.number || ""),
+          fecha,
+          vencimiento,
+          importe,
+          base,
+          status: String(f.status || "Open"),
+          diasVencido,
+          aging,
+          vencida: diasVencido != null && diasVencido > 0,
+        };
+      };
+
+      const facturas = ventas.filter(coincide).map((f) => mapFactura(f, "factura"));
+      const creditos = abonos.filter(coincide).map((f) => mapFactura(f, "abono"));
+
+      let creditLimit = null;
+      let balance = null;
+      let overdueAmount = null;
+      let creditLimitDisponible = false;
+      try {
+        const esc = (v) => String(v || "").replace(/'/g, "''");
+        const filtros = [];
+        if (numero) filtros.push(`number eq '${esc(numero)}'`);
+        if (nombre) filtros.push(`displayName eq '${esc(nombre)}'`);
+        for (const f of filtros) {
+          const r = await fetchConReintento(
+            `${raiz}/customers?$filter=${encodeURIComponent(f)}&$select=number,displayName,creditLimit,balance,overdueAmount&$top=1`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (!r.ok) {
+            // Alguns tenants no exposen balance/overdueAmount; reintenta només creditLimit.
+            const r2 = await fetchConReintento(
+              `${raiz}/customers?$filter=${encodeURIComponent(f)}&$select=number,displayName,creditLimit&$top=1`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            if (!r2.ok) continue;
+            const v2 = ((await r2.json()).value || [])[0];
+            if (v2) {
+              creditLimit = v2.creditLimit != null ? Number(v2.creditLimit) : null;
+              creditLimitDisponible = creditLimit != null && Number.isFinite(creditLimit);
+              break;
+            }
+            continue;
+          }
+          const v = ((await r.json()).value || [])[0];
+          if (v) {
+            creditLimit = v.creditLimit != null ? Number(v.creditLimit) : null;
+            balance = v.balance != null ? Number(v.balance) : null;
+            overdueAmount = v.overdueAmount != null ? Number(v.overdueAmount) : null;
+            creditLimitDisponible = creditLimit != null && Number.isFinite(creditLimit);
+            break;
+          }
+        }
+      } catch { /* sense fitxa client */ }
+
+      const pendiente = facturas.reduce((s, x) => s + x.importe, 0);
+      const vencido = facturas.filter((x) => x.vencida).reduce((s, x) => s + x.importe, 0);
+      const noVencido = pendiente - vencido;
+      const abonosPend = creditos.reduce((s, x) => s + x.importe, 0);
+      const exposicion = Math.max(0, pendiente - abonosPend);
+      const aging = {
+        noVenc: facturas.filter((x) => x.aging === "noVenc").reduce((s, x) => s + x.importe, 0),
+        d1_30: facturas.filter((x) => x.aging === "d1_30").reduce((s, x) => s + x.importe, 0),
+        d31_60: facturas.filter((x) => x.aging === "d31_60").reduce((s, x) => s + x.importe, 0),
+        d61_90: facturas.filter((x) => x.aging === "d61_90").reduce((s, x) => s + x.importe, 0),
+        d90: facturas.filter((x) => x.aging === "d90").reduce((s, x) => s + x.importe, 0),
+        senseVenc: facturas.filter((x) => x.aging === "senseVenc").reduce((s, x) => s + x.importe, 0),
+      };
+
+      res.json({
+        calculado: new Date().toISOString(),
+        hoy,
+        cliente: { numero: numero || null, nombre: nombre || null },
+        pendiente,
+        vencido,
+        noVencido,
+        abonosPendientes: abonosPend,
+        exposicion,
+        creditLimit,
+        creditLimitDisponible,
+        balance,
+        overdueAmount,
+        aging,
+        facturas: facturas.sort((a, b) => String(b.vencimiento || b.fecha).localeCompare(String(a.vencimiento || a.fecha))),
+        abonos: creditos.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha))),
+        // Camps del document A–G que la font actual no cobreix:
+        parcialmenteCobradas: null,
+        retencionesGarantia: null,
+        facturasReclamadas: null,
+        avisos: [
+          "Import = total amb IVA de documents amb estat Open (mateixa regla que Circulant).",
+          "No es distingeixen cobraments parcials (la API estàndard no porta Remaining Amount).",
+          "Retencions de garantia i reclamacions: no disponibles a la font actual.",
+        ],
+      });
+    } catch (err) {
+      console.error("Error /api/analisis-cliente/deuda:", err);
+      res.status(500).json({ error: "No s'ha pogut llegir la deute del client.", detalle: String(err.message || err) });
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Comportament de pagament (Anàlisi per client · bloc D).
+  // Històric: factures Paid del període (data cobrament ≈ lastModifiedDateTime).
+  // Previsió: factures Open per venciment.
+  // ------------------------------------------------------------------
+  app.get("/api/analisis-cliente/comportamiento", async (req, res) => {
+    const numero = String(req.query.numero || "").trim();
+    const nombre = String(req.query.nombre || "").trim();
+    const desde = String(req.query.desde || "").slice(0, 10);
+    const hasta = String(req.query.hasta || "").slice(0, 10);
+    if (!numero && !nombre) {
+      return res.status(400).json({ error: "Falta 'numero' o 'nombre' de client." });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(desde) || !/^\d{4}-\d{2}-\d{2}$/.test(hasta)) {
+      return res.status(400).json({ error: "Cal 'desde' i 'hasta' (YYYY-MM-DD)." });
+    }
+    try {
+      const token = await obtenerTokenBC();
+      const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+      const hoy = new Date().toISOString().slice(0, 10);
+      const esc = (v) => String(v || "").replace(/'/g, "''");
+
+      const diasEntre = (a, b) => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(a) || !/^\d{4}-\d{2}-\d{2}$/.test(b)) return null;
+        return Math.round((new Date(`${b}T00:00:00Z`) - new Date(`${a}T00:00:00Z`)) / 86400000);
+      };
+
+      const coincide = (f) => {
+        const n = String(f.customerNumber || "").trim();
+        const nom = String(f.customerName || "").trim();
+        if (numero && n && n.toLowerCase() === numero.toLowerCase()) return true;
+        if (nombre && nom && nom.toLowerCase() === nombre.toLowerCase()) return true;
+        return false;
+      };
+
+      const leerFiltrado = async (filtroExtra, campos) => {
+        const partes = [];
+        if (numero) partes.push(`customerNumber eq '${esc(numero)}'`);
+        else if (nombre) partes.push(`customerName eq '${esc(nombre)}'`);
+        if (filtroExtra) partes.push(filtroExtra);
+        const filtro = encodeURIComponent(partes.join(" and "));
+        let url = `${raiz}/salesInvoices?$select=${campos}&$filter=${filtro}`;
+        const out = [];
+        while (url && out.length < 8000) {
+          const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
+          if (!r.ok) throw new Error(`BC salesInvoices ${r.status}: ${(await r.text()).slice(0, 220)}`);
+          const j = await r.json();
+          out.push(...(j.value || []));
+          url = j["@odata.nextLink"] || null;
+        }
+        return out;
+      };
+
+      const campos =
+        "number,customerName,customerNumber,invoiceDate,dueDate,status,totalAmountIncludingTax,totalAmountExcludingTax,lastModifiedDateTime";
+
+      // Històric del període (totes les factures amb data factura al rang) + obertes (previsió)
+      const [delPeriodo, abiertas] = await Promise.all([
+        leerFiltrado(`invoiceDate ge ${desde} and invoiceDate le ${hasta}`, campos),
+        (async () => {
+          // Reutilitza la mateixa cache d'Open que el bloc C si existeix
+          const claveCache = `${EMPRESA_ID()}|open|salesInvoices`;
+          let cached = cacheDeudaCli.get(claveCache);
+          if (cached && Date.now() - cached.ts < 15 * 60 * 1000 && req.query.refrescar !== "1") {
+            return (cached.rows || []).filter(coincide);
+          }
+          return leerFiltrado(`status eq 'Open'`, campos);
+        })(),
+      ]);
+
+      const facturasPeriodo = (numero || nombre ? delPeriodo.filter(coincide) : delPeriodo).map((f) => {
+        const fecha = String(f.invoiceDate || "").slice(0, 10);
+        const vencimiento = String(f.dueDate || "").slice(0, 10);
+        const status = String(f.status || "").trim();
+        const importe = Number(f.totalAmountIncludingTax) || 0;
+        const base = Number(f.totalAmountExcludingTax) || 0;
+        const cobroAprox = status.toLowerCase() === "paid" ? String(f.lastModifiedDateTime || "").slice(0, 10) : "";
+        const plazoPactado = diasEntre(fecha, vencimiento);
+        const plazoReal = cobroAprox ? diasEntre(fecha, cobroAprox) : null;
+        const retraso = cobroAprox && vencimiento ? diasEntre(vencimiento, cobroAprox) : null;
+        return {
+          numero: String(f.number || ""),
+          fecha,
+          vencimiento,
+          status,
+          importe,
+          base,
+          cobroAprox: cobroAprox || null,
+          plazoPactado,
+          plazoReal,
+          retraso,
+          puntual: retraso != null ? retraso <= 0 : null,
+        };
+      });
+
+      const cobradas = facturasPeriodo.filter((f) => String(f.status).toLowerCase() === "paid" && f.cobroAprox);
+      const openList = abiertas.filter(coincide).map((f) => {
+        const fecha = String(f.invoiceDate || "").slice(0, 10);
+        const vencimiento = String(f.dueDate || "").slice(0, 10);
+        const importe = Number(f.totalAmountIncludingTax) || 0;
+        const diasVencido = vencimiento ? diasEntre(vencimiento, hoy) : null;
+        return {
+          numero: String(f.number || ""),
+          fecha,
+          vencimiento,
+          importe,
+          diasVencido,
+          vencida: diasVencido != null && diasVencido > 0,
+        };
+      });
+
+      const avg = (arr) => (arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : null);
+
+      const plazosReales = cobradas.map((f) => f.plazoReal).filter((n) => n != null);
+      const retrasos = cobradas.map((f) => f.retraso).filter((n) => n != null);
+      const retrasosPos = retrasos.filter((n) => n > 0);
+      const plazosPactados = facturasPeriodo.map((f) => f.plazoPactado).filter((n) => n != null && n >= 0);
+      const nPuntual = cobradas.filter((f) => f.puntual === true).length;
+      const pctPuntual = cobradas.length ? nPuntual / cobradas.length : null;
+      const importeMedio =
+        facturasPeriodo.length > 0
+          ? facturasPeriodo.reduce((s, f) => s + f.importe, 0) / facturasPeriodo.length
+          : null;
+      const mayorRetrasoHist = retrasos.length ? Math.max(...retrasos) : null;
+      const mayorRetrasoOpen = openList.reduce((m, f) => Math.max(m, f.diasVencido != null && f.diasVencido > 0 ? f.diasVencido : 0), 0);
+      const mayorRetraso =
+        mayorRetrasoHist != null || mayorRetrasoOpen > 0
+          ? Math.max(mayorRetrasoHist != null ? mayorRetrasoHist : 0, mayorRetrasoOpen)
+          : null;
+      const incidencias = retrasosPos.length + openList.filter((f) => f.vencida).length;
+
+      // Evolució mensual (per data de cobrament aproximada)
+      const porMes = new Map();
+      for (const f of cobradas) {
+        const mes = (f.cobroAprox || "").slice(0, 7);
+        if (!mes) continue;
+        const g = porMes.get(mes) || { mes, n: 0, retrasoSum: 0, puntual: 0, importe: 0 };
+        g.n += 1;
+        g.retrasoSum += f.retraso || 0;
+        if (f.puntual) g.puntual += 1;
+        g.importe += f.importe;
+        porMes.set(mes, g);
+      }
+      const evolucion = [...porMes.values()]
+        .sort((a, b) => a.mes.localeCompare(b.mes))
+        .map((g) => ({
+          mes: g.mes,
+          n: g.n,
+          retrasoMedio: g.n ? g.retrasoSum / g.n : null,
+          pctPuntual: g.n ? g.puntual / g.n : null,
+          importe: g.importe,
+        }));
+
+      // Previsió per setmana / mes (venciments Open futurs o ja vençuts)
+      const isoSemana = (iso) => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return null;
+        const d = new Date(`${iso}T00:00:00Z`);
+        const day = d.getUTCDay() || 7;
+        d.setUTCDate(d.getUTCDate() + 4 - day);
+        const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+        const week = Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+        return `${d.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+      };
+      const porSemana = new Map();
+      const porMesPrev = new Map();
+      for (const f of openList) {
+        const v = f.vencimiento || f.fecha;
+        if (!v) continue;
+        const sem = isoSemana(v);
+        const mes = v.slice(0, 7);
+        if (sem) {
+          const g = porSemana.get(sem) || { clave: sem, importe: 0, n: 0, vencidas: 0 };
+          g.importe += f.importe;
+          g.n += 1;
+          if (f.vencida) g.vencidas += 1;
+          porSemana.set(sem, g);
+        }
+        if (mes) {
+          const g = porMesPrev.get(mes) || { clave: mes, importe: 0, n: 0, vencidas: 0 };
+          g.importe += f.importe;
+          g.n += 1;
+          if (f.vencida) g.vencidas += 1;
+          porMesPrev.set(mes, g);
+        }
+      }
+      const previsionSemana = [...porSemana.values()].sort((a, b) => a.clave.localeCompare(b.clave));
+      const previsionMes = [...porMesPrev.values()].sort((a, b) => a.clave.localeCompare(b.clave));
+
+      res.json({
+        calculado: new Date().toISOString(),
+        hoy,
+        desde,
+        hasta,
+        cliente: { numero: numero || null, nombre: nombre || null },
+        nFacturasPeriodo: facturasPeriodo.length,
+        nCobradasConFecha: cobradas.length,
+        nOpen: openList.length,
+        plazoMedioReal: avg(plazosReales),
+        plazoMedioPactado: avg(plazosPactados),
+        retrasoMedio: avg(retrasos),
+        retrasoMedioPositivo: avg(retrasosPos),
+        pctPuntual,
+        importeMedio,
+        mayorRetraso,
+        mayorRetrasoHist,
+        mayorRetrasoOpen: mayorRetrasoOpen || null,
+        incidencias,
+        incidenciasHist: retrasosPos.length,
+        incidenciasOpen: openList.filter((f) => f.vencida).length,
+        evolucion,
+        previsionSemana,
+        previsionMes,
+        cobradas: cobradas
+          .slice()
+          .sort((a, b) => String(b.cobroAprox).localeCompare(String(a.cobroAprox)))
+          .slice(0, 80),
+        open: openList.sort((a, b) => String(a.vencimiento || "").localeCompare(String(b.vencimiento || ""))),
+        metodoCobro: "lastModifiedDateTime",
+        avisos: [
+          "La data de cobrament és aproximada: lastModifiedDateTime de la factura quan l'estat és Paid (la API estàndard no exposa el moviment de liquidació).",
+          "Puntual = cobrament aproximat ≤ venciment.",
+          "Incidències = factures cobrades amb retard + factures Open ja vençudes.",
+          "Previsió = import de factures Open agrupades per data de venciment.",
+        ],
+      });
+    } catch (err) {
+      console.error("Error /api/analisis-cliente/comportamiento:", err);
+      res.status(500).json({ error: "No s'ha pogut calcular el comportament de pagament.", detalle: String(err.message || err) });
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Fitxa BC del client (bloc G) + notes administratives locals.
+  // ------------------------------------------------------------------
+  app.get("/api/analisis-cliente/ficha", async (req, res) => {
+    const numero = String(req.query.numero || "").trim();
+    const nombre = String(req.query.nombre || "").trim();
+    if (!numero && !nombre) return res.status(400).json({ error: "Falta 'numero' o 'nombre'." });
+    try {
+      const token = await obtenerTokenBC();
+      const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+      const esc = (v) => String(v || "").replace(/'/g, "''");
+      const filtros = [];
+      if (numero) filtros.push(`number eq '${esc(numero)}'`);
+      if (nombre) filtros.push(`displayName eq '${esc(nombre)}'`);
+
+      let cli = null;
+      const camposBase =
+        "number,displayName,email,phoneNumber,taxRegistrationNumber,addressLine1,addressLine2,city,postalCode,country,creditLimit,blocked";
+      const camposExtra = `${camposBase},balance,paymentTermsId,paymentMethodId`;
+      for (const f of filtros) {
+        let r = await fetchConReintento(`${raiz}/customers?$filter=${encodeURIComponent(f)}&$select=${camposExtra}&$top=1`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!r.ok) {
+          r = await fetchConReintento(`${raiz}/customers?$filter=${encodeURIComponent(f)}&$select=${camposBase}&$top=1`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        }
+        if (!r.ok) continue;
+        cli = ((await r.json()).value || [])[0] || null;
+        if (cli) break;
+      }
+      if (!cli) return res.status(404).json({ error: "Client no trobat a la fitxa del sistema." });
+
+      const resolverCatalogo = async (entidad, id) => {
+        if (!id) return null;
+        try {
+          const r = await fetchConReintento(`${raiz}/${entidad}(${id})?$select=code,displayName`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (!r.ok) return null;
+          const j = await r.json();
+          return { code: j.code || "", displayName: j.displayName || "" };
+        } catch {
+          return null;
+        }
+      };
+
+      const [terms, method] = await Promise.all([
+        resolverCatalogo("paymentTerms", cli.paymentTermsId),
+        resolverCatalogo("paymentMethods", cli.paymentMethodId),
+      ]);
+
+      res.json({
+        numero: cli.number || "",
+        nombre: cli.displayName || "",
+        email: cli.email || "",
+        telefono: cli.phoneNumber || "",
+        cif: cli.taxRegistrationNumber || "",
+        direccion: [cli.addressLine1, cli.addressLine2].filter(Boolean).join(", "),
+        ciudad: cli.city || "",
+        cp: cli.postalCode || "",
+        pais: cli.country || "",
+        creditLimit: cli.creditLimit != null ? Number(cli.creditLimit) : null,
+        balance: cli.balance != null ? Number(cli.balance) : null,
+        blocked: cli.blocked || "",
+        paymentTerms: terms,
+        paymentMethod: method,
+        avisos: [
+          "Dades de la fitxa de client del sistema de gestió (API customers).",
+          "Termes / forma de pagament: si el tenant no exposa paymentTermsId, es mostren buits.",
+          "PO client, albarà valorat, FACE, periodicitat i retencions: notes internes ACSales (no són camps BC).",
+        ],
+      });
+    } catch (err) {
+      console.error("Error /api/analisis-cliente/ficha:", err);
+      res.status(500).json({ error: "No s'ha pogut llegir la fitxa del client.", detalle: String(err.message || err) });
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Tarifas MO (Excel): general (todos) + override opcional por client.
+  // ------------------------------------------------------------------
+  function leerTarifaDefectoDisco() {
+    try {
+      const candidatos = [
+        path.join(__dirname, "data", "tarifas_mo_defecto.json"),
+        path.join(__dirname, "..", "data", "tarifas_mo_defecto.json"),
+      ];
+      const p = candidatos.find((x) => fs.existsSync(x));
+      if (!p) return null;
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (!j || !Array.isArray(j.filas)) return null;
+      return {
+        origen: j.origen || "tarifas_mo_defecto.json",
+        actualizado: j.actualizado || null,
+        filas: j.filas,
+        ambito: "general",
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function normalizarFilasTarifa(filas) {
+    return (filas || [])
+      .map((r) => ({
+        tipoProducto: String(r.tipoProducto || r["Tipo de producto"] || "").trim(),
+        producto: String(r.producto || r["N.º de producto"] || r["No. de producto"] || r.No || "").trim(),
+        descripcion: String(r.descripcion || r["Descripción"] || r.Description || "").trim(),
+        tipoTrabajo: String(r.tipoTrabajo || r["Cód. tipo trabajo"] || r["Cod. tipo trabajo"] || "").trim(),
+        unidad: String(r.unidad || r["Cód. unidad medida"] || "HORA").trim(),
+        cantidadMin: Number(r.cantidadMin ?? r["Cantidad mínima"] ?? 0) || 0,
+        precio: Number(r.precio ?? r["Precio venta"] ?? r.Unit_Price ?? 0) || 0,
+      }))
+      .filter((r) => r.producto || r.descripcion);
+  }
+
+  app.get("/api/analisis-cliente/tarifas", async (req, res) => {
+    if (!db || !claveEmpresa) return res.status(500).json({ error: "Persistència no disponible." });
+    const cliente = String(req.query.cliente || "").trim();
+    try {
+      const doc = await db.getDoc(claveEmpresa("analisis_cliente_tarifas"), {});
+      let general = doc.general || null;
+      if (!general || !Array.isArray(general.filas) || !general.filas.length) {
+        general = leerTarifaDefectoDisco();
+      }
+      const especial = cliente && doc.clientes && doc.clientes[cliente] ? doc.clientes[cliente] : null;
+      const activa = especial && especial.filas?.length ? especial : general;
+      res.json({
+        general,
+        especial: especial || null,
+        activa,
+        usaEspecial: !!(especial && especial.filas?.length),
+      });
+    } catch (err) {
+      console.error("Error GET tarifas:", err);
+      res.status(500).json({ error: "No s'han pogut llegir les tarifes." });
+    }
+  });
+
+  app.post("/api/analisis-cliente/tarifas", async (req, res) => {
+    if (!db || !claveEmpresa) return res.status(500).json({ error: "Persistència no disponible." });
+    const body = req.body || {};
+    const ambito = body.ambito === "cliente" ? "cliente" : "general";
+    const cliente = String(body.cliente || "").trim();
+    const filas = normalizarFilasTarifa(body.filas);
+    if (!filas.length) return res.status(400).json({ error: "No hi ha línies de tarifa vàlides." });
+    if (ambito === "cliente" && !cliente) return res.status(400).json({ error: "Falta 'cliente' per a tarifa especial." });
+    try {
+      const doc = await db.getDoc(claveEmpresa("analisis_cliente_tarifas"), {});
+      const bloque = {
+        origen: String(body.origen || body.nombreArchivo || "excel").trim() || "excel",
+        actualizado: new Date().toISOString(),
+        filas,
+        ambito,
+      };
+      if (ambito === "general") {
+        doc.general = bloque;
+      } else {
+        if (!doc.clientes || typeof doc.clientes !== "object") doc.clientes = {};
+        doc.clientes[cliente] = { ...bloque, cliente };
+      }
+      await db.setDoc(claveEmpresa("analisis_cliente_tarifas"), doc);
+      res.json({ guardado: true, bloque });
+    } catch (err) {
+      console.error("Error POST tarifas:", err);
+      res.status(500).json({ error: "No s'han pogut desar les tarifes." });
+    }
+  });
+
+  app.delete("/api/analisis-cliente/tarifas", async (req, res) => {
+    if (!db || !claveEmpresa) return res.status(500).json({ error: "Persistència no disponible." });
+    const cliente = String(req.query.cliente || "").trim();
+    if (!cliente) return res.status(400).json({ error: "Falta 'cliente'." });
+    try {
+      const doc = await db.getDoc(claveEmpresa("analisis_cliente_tarifas"), {});
+      if (doc.clientes && doc.clientes[cliente]) {
+        delete doc.clientes[cliente];
+        await db.setDoc(claveEmpresa("analisis_cliente_tarifas"), doc);
+      }
+      res.json({ borrado: true });
+    } catch (err) {
+      console.error("Error DELETE tarifas:", err);
+      res.status(500).json({ error: "No s'ha pogut treure la tarifa especial." });
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Esborrany tarifes 2027 (simulador). NO pisa la tarifa 2026.
+  // ------------------------------------------------------------------
+  app.get("/api/analisis-cliente/tarifas-2027", async (req, res) => {
+    if (!db || !claveEmpresa) return res.status(500).json({ error: "Persistència no disponible." });
+    const cliente = String(req.query.cliente || "").trim();
+    if (!cliente) return res.status(400).json({ error: "Falta 'cliente'." });
+    try {
+      const doc = await db.getDoc(claveEmpresa("analisis_cliente_tarifas_2027"), {});
+      res.json(doc[cliente] || null);
+    } catch (err) {
+      console.error("Error GET tarifas-2027:", err);
+      res.status(500).json({ error: "No s'ha pogut llegir l'esborrany 2027." });
+    }
+  });
+
+  app.post("/api/analisis-cliente/tarifas-2027", async (req, res) => {
+    if (!db || !claveEmpresa) return res.status(500).json({ error: "Persistència no disponible." });
+    const body = req.body || {};
+    const cliente = String(body.cliente || "").trim();
+    if (!cliente) return res.status(400).json({ error: "Falta 'cliente'." });
+    try {
+      const doc = await db.getDoc(claveEmpresa("analisis_cliente_tarifas_2027"), {});
+      const filasAprobadas = Array.isArray(body.filasAprobadas)
+        ? body.filasAprobadas
+            .map((r) => ({
+              producto: String(r.producto || "").trim(),
+              tipoTrabajo: String(r.tipoTrabajo || "").trim(),
+              descripcion: String(r.descripcion || "").trim(),
+              precio: Number(r.precio) || 0,
+            }))
+            .filter((r) => r.producto || r.tipoTrabajo)
+        : [];
+      const bloque = {
+        costePrevisto: Number(body.costePrevisto) || 0,
+        margenObjetivo: Number(body.margenObjetivo) || 0,
+        pctEstructura: Number(body.pctEstructura) >= 0 ? Number(body.pctEstructura) : 0.22,
+        filasAprobadas,
+        actualizado: new Date().toISOString(),
+      };
+      doc[cliente] = bloque;
+      await db.setDoc(claveEmpresa("analisis_cliente_tarifas_2027"), doc);
+      res.json({ guardado: true, borrador: bloque });
+    } catch (err) {
+      console.error("Error POST tarifas-2027:", err);
+      res.status(500).json({ error: "No s'ha pogut desar l'esborrany 2027." });
+    }
+  });
+
+  app.get("/api/analisis-cliente/condiciones", async (req, res) => {
+    if (!db || !claveEmpresa) return res.status(500).json({ error: "Persistència no disponible." });
+    const cliente = String(req.query.cliente || "").trim();
+    if (!cliente) return res.status(400).json({ error: "Falta 'cliente'." });
+    try {
+      const mapa = await db.getDoc(claveEmpresa("analisis_cliente_condiciones"), {});
+      res.json(mapa[cliente] || {});
+    } catch (err) {
+      console.error("Error GET condiciones:", err);
+      res.status(500).json({ error: "No s'han pogut llegir les condicions." });
+    }
+  });
+
+  app.post("/api/analisis-cliente/condiciones", async (req, res) => {
+    if (!db || !claveEmpresa) return res.status(500).json({ error: "Persistència no disponible." });
+    const body = req.body || {};
+    const cliente = String(body.cliente || "").trim();
+    if (!cliente) return res.status(400).json({ error: "Falta 'cliente'." });
+    try {
+      const mapa = await db.getDoc(claveEmpresa("analisis_cliente_condiciones"), {});
+      const prev = mapa[cliente] || {};
+      const next = {
+        ...prev,
+        necesitaPO: body.necesitaPO === true || body.necesitaPO === "si" || body.necesitaPO === "Sí",
+        albaranValorado: body.albaranValorado === true || body.albaranValorado === "si" || body.albaranValorado === "Sí",
+        periodicidad: String(body.periodicidad || "").trim(),
+        facePortal: String(body.facePortal || "").trim(),
+        retenciones: String(body.retenciones || "").trim(),
+        incidenciasAdmin: String(body.incidenciasAdmin || "").trim(),
+        contactosExtra: String(body.contactosExtra || "").trim(),
+        notas: String(body.notas || "").trim(),
+        actualizado: new Date().toISOString(),
+      };
+      // Normalitza booleans si venen com a string buit
+      if (body.necesitaPO === false || body.necesitaPO === "no" || body.necesitaPO === "No") next.necesitaPO = false;
+      if (body.albaranValorado === false || body.albaranValorado === "no" || body.albaranValorado === "No") next.albaranValorado = false;
+      mapa[cliente] = next;
+      await db.setDoc(claveEmpresa("analisis_cliente_condiciones"), mapa);
+      res.json({ guardado: true, condiciones: next });
+    } catch (err) {
+      console.error("Error POST condiciones:", err);
+      res.status(500).json({ error: "No s'han pogut guardar les condicions." });
     }
   });
 

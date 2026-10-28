@@ -2,5 +2,5 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Tema visual Dynamics 365 Business Central: styles.css + tailwind.config.js.
-   Login / shell / tokens Fluent: styles.css. Las pantallas siguen en utilidades Tailwind. */
+/* Tema visual espacial (XR): styles.css + tailwind.config.js.
+   Solo aspecto. Login / shell / tokens: styles.css. Pantallas: utilidades Tailwind. */

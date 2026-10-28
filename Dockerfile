@@ -19,8 +19,11 @@ COPY server/server.cjs server/db.js server/schema.sql \
      server/achuman-client.js server/acfactory-client.cjs \
      server/iaBC.cjs server/contabilidad.cjs server/macro.cjs \
      server/correoPC.cjs server/horas.cjs server/pedidosVentaSeguimiento.cjs \
-     server/mapeoArticulos.cjs ./
+     server/informePedidosPendientes.cjs \
+     server/informeHoras.cjs \
+     server/teamsChatbot.cjs server/mapeoArticulos.cjs ./
 COPY data/mapeo_reemplazo_items.csv ./data/mapeo_reemplazo_items.csv
+COPY data/tarifas_mo_defecto.json ./data/tarifas_mo_defecto.json
 COPY --from=web /web/dist ./public
 ENV PORT=8102
 EXPOSE 8102

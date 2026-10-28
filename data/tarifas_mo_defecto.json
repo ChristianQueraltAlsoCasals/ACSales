@@ -1,0 +1,762 @@
+{
+  "origen": "Líneas (29).xlsx",
+  "actualizado": "2026-10-27T17:42:32.071Z",
+  "filas": [
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS01",
+      "descripcion": "Mano de obra Oficial de 1ra Instalaciones",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 31
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS01",
+      "descripcion": "Mano de obra Oficial de 1ra Instalaciones",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 31
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS01",
+      "descripcion": "Mano de obra Oficial de 1ra Instalaciones",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS01",
+      "descripcion": "Mano de obra Oficial de 1ra Instalaciones",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS01",
+      "descripcion": "Mano de obra Oficial de 1ra Instalaciones",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS01",
+      "descripcion": "Mano de obra Oficial de 1ra Instalaciones",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS01",
+      "descripcion": "Mano de obra Oficial de 1ra Instalaciones",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS02",
+      "descripcion": "Mano de obra Oficial de 2na Instalaciones",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS02",
+      "descripcion": "Mano de obra Oficial de 2na Instalaciones",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS02",
+      "descripcion": "Mano de obra Oficial de 2na Instalaciones",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 34
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS02",
+      "descripcion": "Mano de obra Oficial de 2na Instalaciones",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 39
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS02",
+      "descripcion": "Mano de obra Oficial de 2na Instalaciones",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS02",
+      "descripcion": "Mano de obra Oficial de 2na Instalaciones",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOINS02",
+      "descripcion": "Mano de obra Oficial de 2na Instalaciones",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimiento",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 31
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimiento",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 31
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimiento",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimiento",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimiento",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimiento",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimiento",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimiento",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimiento",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimiento",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 34
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimiento",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 39
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimiento",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimiento",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMA02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimiento",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO01",
+      "descripcion": "Mano de obra Oficial de 1ra Construcción",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO01",
+      "descripcion": "Mano de obra Oficial de 1ra Construcción",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO01",
+      "descripcion": "Mano de obra Oficial de 1ra Construcción",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 34
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO01",
+      "descripcion": "Mano de obra Oficial de 1ra Construcción",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 39
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO01",
+      "descripcion": "Mano de obra Oficial de 1ra Construcción",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO01",
+      "descripcion": "Mano de obra Oficial de 1ra Construcción",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO01",
+      "descripcion": "Mano de obra Oficial de 1ra Construcción",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO02",
+      "descripcion": "Mano de obra Oficial de 2na Construcción",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 27
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO02",
+      "descripcion": "Mano de obra Oficial de 2na Construcción",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 27
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO02",
+      "descripcion": "Mano de obra Oficial de 2na Construcción",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 32
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO02",
+      "descripcion": "Mano de obra Oficial de 2na Construcción",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 37
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO02",
+      "descripcion": "Mano de obra Oficial de 2na Construcción",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO02",
+      "descripcion": "Mano de obra Oficial de 2na Construcción",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOCO02",
+      "descripcion": "Mano de obra Oficial de 2na Construcción",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU01",
+      "descripcion": "Mano de obra Oficial de 1ra Automatización",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 43
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU01",
+      "descripcion": "Mano de obra Oficial de 1ra Automatización",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 43
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU01",
+      "descripcion": "Mano de obra Oficial de 1ra Automatización",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU01",
+      "descripcion": "Mano de obra Oficial de 1ra Automatización",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 53
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU01",
+      "descripcion": "Mano de obra Oficial de 1ra Automatización",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU01",
+      "descripcion": "Mano de obra Oficial de 1ra Automatización",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU01",
+      "descripcion": "Mano de obra Oficial de 1ra Automatización",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 53
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU02",
+      "descripcion": "Mano de obra Oficial de 2na Automatización",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 35
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU02",
+      "descripcion": "Mano de obra Oficial de 2na Automatización",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 35
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU02",
+      "descripcion": "Mano de obra Oficial de 2na Automatización",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 40
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU02",
+      "descripcion": "Mano de obra Oficial de 2na Automatización",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 45
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU02",
+      "descripcion": "Mano de obra Oficial de 2na Automatización",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU02",
+      "descripcion": "Mano de obra Oficial de 2na Automatización",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOAU02",
+      "descripcion": "Mano de obra Oficial de 2na Automatización",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 53
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI01",
+      "descripcion": "Mano de obra Oficial de 1ra Servicio de Ingenieria",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 43
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI01",
+      "descripcion": "Mano de obra Oficial de 1ra Servicio de Ingenieria",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 43
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI01",
+      "descripcion": "Mano de obra Oficial de 1ra Servicio de Ingenieria",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI01",
+      "descripcion": "Mano de obra Oficial de 1ra Servicio de Ingenieria",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 53
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI01",
+      "descripcion": "Mano de obra Oficial de 1ra Servicio de Ingenieria",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI01",
+      "descripcion": "Mano de obra Oficial de 1ra Servicio de Ingenieria",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI01",
+      "descripcion": "Mano de obra Oficial de 1ra Servicio de Ingenieria",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 53
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI02",
+      "descripcion": "Mano de obra Oficial de 2na Servicio de Ingenieria",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 35
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI02",
+      "descripcion": "Mano de obra Oficial de 2na Servicio de Ingenieria",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 35
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI02",
+      "descripcion": "Mano de obra Oficial de 2na Servicio de Ingenieria",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 40
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI02",
+      "descripcion": "Mano de obra Oficial de 2na Servicio de Ingenieria",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 45
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI02",
+      "descripcion": "Mano de obra Oficial de 2na Servicio de Ingenieria",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI02",
+      "descripcion": "Mano de obra Oficial de 2na Servicio de Ingenieria",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 48
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOSI02",
+      "descripcion": "Mano de obra Oficial de 2na Servicio de Ingenieria",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 53
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimientos Recurre",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 31
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimientos Recurre",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 31
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimientos Recurre",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimientos Recurre",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimientos Recurre",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimientos Recurre",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR01",
+      "descripcion": "Mano de obra Oficial de 1ra Mantenimientos Recurre",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimientos Recurre",
+      "tipoTrabajo": "H_NORMAL",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimientos Recurre",
+      "tipoTrabajo": "H_EXTRA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 29
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimientos Recurre",
+      "tipoTrabajo": "H_FESTIVO1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 34
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimientos Recurre",
+      "tipoTrabajo": "H_FESTIVO2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 39
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimientos Recurre",
+      "tipoTrabajo": "H_GUARDIA",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimientos Recurre",
+      "tipoTrabajo": "H_GUARDIA1",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 36
+    },
+    {
+      "tipoProducto": "Familia recurso",
+      "producto": "MOMR02",
+      "descripcion": "Mano de obra Oficial de 2na Mantenimientos Recurre",
+      "tipoTrabajo": "H_GUARDIA2",
+      "unidad": "HORA",
+      "cantidadMin": 1,
+      "precio": 41
+    }
+  ]
+}

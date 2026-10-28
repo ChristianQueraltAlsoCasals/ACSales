@@ -6553,12 +6553,15 @@ app.post("/api/facturas-compra/bandeja/procesada", async (req, res) => {
 // Módulos Proves (IA, ratios, macro, horas, correos PC → notas recepción)
 // ---------------------------------------------------------------------
 require("./iaBC.cjs")({ app, obtenerTokenBC, fetchConReintento, db });
-require("./contabilidad.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE });
+require("./contabilidad.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE, db, claveEmpresa });
 require("./macro.cjs")({ app, fetchConReintento, db });
 const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@alsocasals.com";
 require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep, escribirRecep, BUZON_PERSONAL });
 require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL });
+require("./teamsChatbot.cjs")({ app, db, obtenerTokenGraph, fetchConReintento });
 require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa });
+const informePedidosPendientes = require("./informePedidosPendientes.cjs");
+const informeHoras = require("./informeHoras.cjs");
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)
 app.get(/^\/(?!api).*/, (req, res) => {
@@ -6584,6 +6587,8 @@ async function arrancar() {
 
   app.listen(PORT, () => {
     console.log(`Agente de Ventas — backend escuchando en http://localhost:${PORT}`);
+    informePedidosPendientes.programar({ db });
+    informeHoras.programar({ db });
     console.log(`[recepcion] Subir Documento: emparejamiento manual + coincidencia por raíz de palabra — ${PDFDocument ? "activo (pdf-lib OK)" : "INACTIVO — falta 'npm install pdf-lib'"}`);
     console.log("[facturas-compra] Entrar en BC 2026-09-04: SOLO cabecera (sin líneas) + fecha leída del PDF + adjunto con 2 intentos (A/B)");
     console.log("[facturas-compra] Duplicados 2026-09-04 (v2): carga completa + varios candidatos de servicio + auto-descubrimiento en catálogo BC");

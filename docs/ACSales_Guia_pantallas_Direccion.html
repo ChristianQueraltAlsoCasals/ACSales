@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>ACSales — Guía detallada de cada pantalla</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 18mm 16mm 18mm 16mm;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", "Calibri", "Helvetica Neue", Arial, sans-serif;
+      font-size: 10.5pt;
+      line-height: 1.45;
+      color: #1e293b;
+      max-width: 180mm;
+      margin: 0 auto;
+      padding: 0;
+    }
+    h1 {
+      font-size: 18pt;
+      font-weight: 700;
+      color: #0f172a;
+      margin: 0 0 6pt 0;
+      line-height: 1.25;
+      border-bottom: 2.5pt solid #1d4ed8;
+      padding-bottom: 8pt;
+    }
+    .subtitle {
+      font-size: 10pt;
+      color: #475569;
+      margin: 8pt 0 16pt 0;
+      font-style: italic;
+    }
+    .intro {
+      background: #f1f5f9;
+      border-left: 3.5pt solid #1d4ed8;
+      padding: 10pt 12pt;
+      margin: 0 0 18pt 0;
+      border-radius: 0 4pt 4pt 0;
+    }
+    .intro p { margin: 0 0 8pt 0; }
+    .intro p:last-child { margin-bottom: 0; }
+    h2 {
+      font-size: 13pt;
+      font-weight: 700;
+      color: #1e3a8a;
+      margin: 22pt 0 8pt 0;
+      padding: 6pt 0 6pt 10pt;
+      border-left: 4pt solid #2563eb;
+      background: #eff6ff;
+      page-break-after: avoid;
+      break-after: avoid;
+    }
+    h3 {
+      font-size: 11pt;
+      font-weight: 700;
+      color: #0f172a;
+      margin: 12pt 0 4pt 0;
+      page-break-after: avoid;
+      break-after: avoid;
+    }
+    p { margin: 0 0 7pt 0; }
+    ul, ol {
+      margin: 4pt 0 10pt 0;
+      padding-left: 18pt;
+    }
+    li { margin-bottom: 3pt; }
+    strong { font-weight: 650; color: #0f172a; }
+    em { font-style: italic; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 8pt 0 12pt 0;
+      font-size: 9.5pt;
+      page-break-inside: avoid;
+    }
+    th {
+      background: #1e3a8a;
+      color: #fff;
+      text-align: left;
+      padding: 6pt 8pt;
+      font-weight: 600;
+    }
+    td {
+      border: 0.75pt solid #cbd5e1;
+      padding: 5pt 8pt;
+      vertical-align: top;
+    }
+    tr:nth-child(even) td { background: #f8fafc; }
+    .screen {
+      page-break-inside: avoid;
+      break-inside: avoid;
+      margin-bottom: 4pt;
+    }
+    /* En pantallas largas permitimos partir, pero el título se queda con el inicio */
+    .screen-long { page-break-inside: auto; }
+    .label {
+      display: inline-block;
+      font-size: 8.5pt;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: #1d4ed8;
+      margin-right: 4pt;
+    }
+    .block {
+      margin: 0 0 8pt 0;
+    }
+    .footer-note {
+      margin-top: 24pt;
+      padding-top: 10pt;
+      border-top: 1pt solid #cbd5e1;
+      font-size: 9.5pt;
+      color: #64748b;
+    }
+    .cover-meta {
+      font-size: 9.5pt;
+      color: #64748b;
+      margin-top: 4pt;
+    }
+    hr {
+      border: none;
+      border-top: 1pt solid #e2e8f0;
+      margin: 14pt 0;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>ACSales — Guía detallada de cada pantalla</h1>
+  <p class="subtitle">(Para Dirección y mandos · también sirve para formar a quien entra nuevo · octubre 2026)</p>
+
+  <div class="intro">
+    <p>Arriba del menú eliges <strong>EMPRESA</strong> (Also Casals, FerrosCA o Quimlab). Al cambiar, la aplicación se reinicia a propósito: así no se mezclan datos entre sociedades.</p>
+    <p>En la barra superior está la campana <strong>Teams</strong>: cola de encargos detectados en Teams para dar <strong>OK</strong> o <strong>No</strong> (no es un chat; no ejecuta sola cambios en el sistema de gestión).</p>
+    <p>Debajo del menú activo hay un bloque gris <strong>Hoja de ruta</strong> (Explorar datos, Análisis de rentabilidad, Análisis por cliente, Comparar periodos…). Aún no funcionan.</p>
+  </div>
+
+  <!-- 1 -->
+  <div class="screen-long">
+    <h2>1. Cargar datos</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Es el “almacén” de la aplicación. Trae tablas del sistema de gestión (por rango de fechas) y las deja disponibles para el resto de pantallas. Sin esta carga, muchas pantallas se quedan vacías o avisan de que falta información.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Sobre todo Administración / quien arranca el día o la semana de trabajo de datos.</p>
+
+    <h3>Qué ves</h3>
+    <p>Título <em>Cargar datos</em>, contadores de cuántas fuentes están cargadas y cuántas filas hay en total, y <strong>13 tarjetas</strong>, una por tipo de información. En cada una: fechas Desde/Hasta, cargar, ver datos, borrar caché.</p>
+
+    <h3>Las 13 fuentes (en lenguaje llano)</h3>
+    <ol>
+      <li>Pedidos de venta (cabeceras)</li>
+      <li>Líneas de venta (qué se vendió en pedidos vivos)</li>
+      <li>Líneas de compra</li>
+      <li>Líneas de venta registradas (facturas de venta línea a línea, con OT)</li>
+      <li>Facturas de venta emitidas (cabeceras)</li>
+      <li>Notas de abono de venta</li>
+      <li>Líneas de compra registradas (histórico con OT)</li>
+      <li>Pedidos de compra (cabecera: proveedor, fechas…)</li>
+      <li>Líneas de pedido de venta (enviado / facturado / pendiente)</li>
+      <li>Movimientos de contabilidad</li>
+      <li>Movimientos de OT (proyecto)</li>
+      <li>Tarifas de venta</li>
+      <li>Recursos (personas / grupos → unidades de negocio)</li>
+    </ol>
+
+    <h3>Cómo se trabaja</h3>
+    <p>Elige empresa → abre la tarjeta que necesitas → pon fechas → carga. Cuando tengas ventas/compras/OTs, pasa a <strong>Memoria histórica</strong>.</p>
+
+    <h3>Importante</h3>
+    <p>Aquí <strong>no se modifica</strong> el sistema de gestión: solo se lee y se guarda una copia de trabajo en la aplicación.</p>
+  </div>
+
+  <!-- 2 -->
+  <div class="screen-long">
+    <h2>2. Memoria histórica</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Convierte datos sueltos (facturas, líneas, listado de OTs) en <strong>fichas por OT</strong>: una “memoria” de qué se hizo, qué costó y qué se cobró. Esa memoria alimenta el Explorador y los pendientes de facturar.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Administración / facturación / quien prepara el análisis de obras.</p>
+
+    <h3>Qué ves</h3>
+    <p>Tres bloques de entrada:</p>
+    <ul>
+      <li>Facturas de venta en <strong>PDF</strong> (opcional)</li>
+      <li>Líneas de factura ya cargadas desde <em>Cargar datos</em></li>
+      <li><strong>Listado de OTs</strong> (Excel/CSV o “desde el sistema de gestión”)</li>
+    </ul>
+    <p>Botón principal: <strong>Construir memoria histórica</strong>. Después puedes consultar una OT nueva, explorar, ver el mapa de conocimiento o abrir el explorador en ventana aparte.</p>
+
+    <h3>Cómo se trabaja</h3>
+    <ol>
+      <li>Tener líneas de venta/compra (y, si puedes, pedidos de compra) en <em>Cargar datos</em>.</li>
+      <li>Tener listado de OTs.</li>
+      <li>Pulsar construir.</li>
+      <li>Revisar el resumen (cuántas fichas, avisos, sin descripción…).</li>
+    </ol>
+
+    <h3>Importante</h3>
+    <p>Guarda el resultado en la base de la aplicación. <strong>No crea</strong> facturas ni pedidos en el sistema de gestión.</p>
+
+    <h3>Si falta algo</h3>
+    <p>Te avisa: hace falta al menos información de facturación/líneas y el listado de OTs.</p>
+  </div>
+
+  <!-- 3 -->
+  <div class="screen-long">
+    <h2>3. Explorador de OTs</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Es la lupa sobre las obras: filtrar, ver estado, gasto, material comprado vs añadido a la venta, y abrir el detalle económico de cada OT.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Administración, jefes de departamento, dirección operativa cuando hay un caso concreto.</p>
+
+    <h3>Qué ves al listar</h3>
+    <ul>
+      <li>Contador <em>X de Y OTs</em></li>
+      <li>Gráficos por estado y por material (comprado y no añadido / comprado y añadido)</li>
+      <li>Filtros: cliente, texto, departamento, estado app, tipo de trabajo, fechas (año de la OT)</li>
+      <li>Tabla con OT, presupuesto, estado, cliente, descripción, departamento, gasto asociado, correo, <strong>Ver datos</strong></li>
+      <li>Selección múltiple → <strong>Crear factura</strong> (abre documento vacío en el sistema de gestión, <strong>sin líneas y sin registrar</strong>)</li>
+    </ul>
+
+    <h3>Qué ves dentro de una OT (detalle)</h3>
+    <p>Pestañas típicas: <strong>Material propuesto</strong>, <strong>Factura</strong>, <strong>Partes</strong>.<br />
+    Métricas de cabecera: venta actual, materiales, coste no facturado, material de taller, mano de obra, margen…<br />
+    Avisos de coherencia: falta cobrar, sin coste (¿almacén?), cantidades distintas, mismo artículo con código distinto, OK.</p>
+
+    <h3>Cómo se trabaja</h3>
+    <p>Filtrar → abrir OT → revisar material/factura → si procede, correo al departamento o crear borrador de factura (Administración registra después en el sistema de gestión).</p>
+
+    <h3>Importante</h3>
+    <p>Sin memoria construida: mensaje de que aún no hay fichas.<br />
+    Los correos van al equipo del departamento (Mantenimiento, Instalaciones, Construcción, Automatización…) con copia a Administración; <strong>Dirección no va en copia automática</strong>.</p>
+  </div>
+
+  <!-- 4 -->
+  <div class="screen-long">
+    <h2>4. Recepción de material</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Controlar pedidos de compra con material <strong>pendiente de recibir</strong>: retrasos, reclamaciones y, si hay albarán en PDF, cruzarlo con el pedido y registrar la recepción.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Compras / almacén / Administración de compras.</p>
+
+    <h3>Qué ves</h3>
+    <ul>
+      <li>Botones: actualizar desde el sistema de gestión, buscar correos relacionados, subir documento</li>
+      <li>KPIs: pendientes, importe pendiente, excluidos “esperar”, tramos de antigüedad (&gt;60 / 30–60 / 15–29 días)</li>
+      <li>Filtros (proveedor, OT, prioridad, nº pedido, fechas, reclamación…)</li>
+      <li>Al subir PDF: comparación cantidades del pedido vs albarán, líneas nuevas propuestas, confirmación</li>
+    </ul>
+
+    <h3>Prioridades (colores)</h3>
+    <p>Urgente · Reclamar · Revisar · Normal (según retraso / reglas de la pantalla).</p>
+
+    <h3>Cómo se trabaja</h3>
+    <p>Actualizar datos → filtrar lo crítico → reclamar por correo si hace falta → o subir albarán, revisar el cruce y <strong>confirmar</strong> (aquí sí se puede <strong>escribir</strong> recepción en el sistema de gestión).</p>
+
+    <h3>Si falta algo</h3>
+    <p>Sin cabeceras o sin líneas de compra: avisa claramente.</p>
+  </div>
+
+  <!-- 5 -->
+  <div class="screen-long">
+    <h2>5. Validación de facturas</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Cotejar facturas de <strong>proveedor</strong> (PDF/foto o bandeja de correo de facturación) con el pedido: ¿coincide? ¿está recibido? ¿el precio cuadra? ¿está duplicada?</p>
+
+    <h3>Quién la usa</h3>
+    <p>Administración / compras.</p>
+
+    <h3>Qué ves</h3>
+    <ul>
+      <li>Subir factura; bandeja con vistas Pendientes / Entradas / Todas</li>
+      <li>Contadores: para entrar · de gasto · a revisar</li>
+      <li>Semáforo: verde (lista para entrar) / rojo (revisar)</li>
+      <li>Avisos: pendiente de recibir, precio distinto, sin match, duplicado…</li>
+    </ul>
+
+    <h3>Cómo se trabaja</h3>
+    <p>Abrir de bandeja o subir PDF → revisar coincidencias → <strong>Enviar aviso</strong> al departamento si hay incidencia → o <strong>Entrar</strong> (crea <strong>borrador</strong> de factura de compra en el sistema de gestión; <strong>no la contabiliza</strong>). En casos forzados, se puede entrar “de todas formas” tras revisión humana. Si no hay pedido, puede proponerse crear uno “como la última” (con confirmación).</p>
+
+    <h3>Importante</h3>
+    <p>Hasta que alguien pulse entrar/crear, el sistema de gestión no se modifica (salvo lo ya dicho). El registro contable sigue siendo manual.</p>
+  </div>
+
+  <!-- 6 -->
+  <div class="screen-long">
+    <h2>6. Precios de artículos</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Responde: ¿estamos comprando caro respecto a nuestro histórico? ¿quién compra bien?</p>
+
+    <h3>Quién la usa</h3>
+    <p>Compras / jefatura de compras.</p>
+
+    <h3>Dos modos</h3>
+    <ol>
+      <li><strong>Por artículo</strong> — buscas código/descripción; ves histórico, mínimo reciente, alerta si el precio está claramente por encima.</li>
+      <li><strong>¿Quién compra bien?</strong> — vista por comprador (necesita también cabeceras de pedidos de compra).</li>
+    </ol>
+
+    <h3>Regla de aviso</h3>
+    <p>Desviación respecto al mínimo histórico con tolerancia del <strong>3 %</strong> (rojo si se pasa).</p>
+
+    <h3>Importante</h3>
+    <p>Es <strong>solo análisis</strong>. Puede ayudar a avisar por correo; <strong>no cambia</strong> precios en el sistema de gestión.</p>
+  </div>
+
+  <!-- 7 -->
+  <div class="screen-long">
+    <h2>7. Pedidos de venta</h2>
+    <p><em>(Nombre del menú: Pedidos de venta. Título en pantalla: «Pedidos de venta pendientes de facturar».)</em></p>
+
+    <h3>Para qué sirve</h3>
+    <p>Lista de <strong>OTs con gasto</strong> (material + mano de obra de referencia) que aún no están en estados de “ya facturado / archivada / garantía”, para priorizar cobro y hacer seguimiento.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Administración / facturación / dirección comercial operativa.</p>
+
+    <h3>Qué ves</h3>
+    <p>Filtros por cliente, departamento, estado, si ya hay correo…<br />
+    Columnas: OT, estado, cliente, descripción, departamento, <strong>gasto asociado</strong>, <strong>ingresos</strong>, <strong>margen</strong> (con estructura del 22 % en el cálculo de la pantalla), notas, correo.<br />
+    Botón <strong>Buscar correos</strong> (revisa el buzón buscando menciones de esas OTs).</p>
+
+    <h3>Cómo se trabaja</h3>
+    <p>Filtrar lo gordo → abrir la OT / pedidos ligados → nota o correo de seguimiento.<br />
+    La <strong>creación de factura</strong> se hace en el Explorador (borrador); aquí el foco es la cola de pendientes y el seguimiento.</p>
+
+    <h3>Si falta algo</h3>
+    <p>Sin memoria histórica construida, no hay base.</p>
+  </div>
+
+  <!-- 8 -->
+  <div class="screen-long">
+    <h2>8. Facturas de venta</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Histórico de facturas de venta <strong>ya emitidas</strong> (contabilizadas): consultar, ver líneas y, si hace falta, reclamar el cobro por correo.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Administración / cobros.</p>
+
+    <h3>Qué ves</h3>
+    <p>Filtros por número, cliente, OT, pedido, fechas de factura y vencimiento.<br />
+    Tabla con detalle de líneas expandible y acción de correo de reclamación.</p>
+
+    <h3>Cómo se trabaja</h3>
+    <p>Actualizar el periodo → filtrar → abrir detalle → (opcional) enviar reclamación.</p>
+
+    <h3>Importante</h3>
+    <p>Lee del sistema de gestión; el correo sí se envía; <strong>no contabiliza</strong> nada nuevo.</p>
+  </div>
+
+  <!-- 9 -->
+  <div class="screen-long">
+    <h2>9. Correo</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Bandeja del <strong>usuario que ha iniciado sesión</strong> (no un buzón genérico fijo): leer, redactar con ayuda, enviar y convertir un correo en tarea.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Cualquiera con cuenta corporativa en la app.</p>
+
+    <h3>Qué ves</h3>
+    <p>Entrada / enviados, búsqueda, lectura del mensaje, composición, confirmación de envío, <strong>crear tarea</strong> a partir del correo.</p>
+
+    <h3>Importante</h3>
+    <p>Envía correo real (con doble confirmación). Crear tarea salta a <strong>Mis tareas</strong>. Desde aquí no se “escribe” el sistema de gestión salvo flujos concretos de acción documentada que la propia pantalla deje muy explícitos.</p>
+  </div>
+
+  <!-- 10 -->
+  <div class="screen-long">
+    <h2>10. Mis tareas</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Lista personal de pendientes (prioridad, fecha límite, notas). También se alimenta desde Correo.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Uso individual.</p>
+
+    <h3>Qué ves</h3>
+    <p>Contadores: pendientes, vencidas, prioridad alta. Alta de tareas. Ver hechas. Detalle con historial.</p>
+
+    <h3>Importante</h3>
+    <p>Se guarda en el <strong>navegador</strong> de esa persona. No es un gestor de proyectos de toda la empresa ni del ERP.</p>
+  </div>
+
+  <!-- 11 -->
+  <div class="screen-long">
+    <h2>11. Asistente IA</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Preguntar en lenguaje natural sobre datos del sistema de gestión de la empresa activa, y <strong>proponer</strong> cambios. Nada se aplica solo.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Quien tenga criterio para revisar propuestas (Administración / perfiles autorizados).</p>
+
+    <h3>Qué ves</h3>
+    <p>Chat, chats guardados, reglas aprendidas, historial de cambios aplicados, nueva conversación. Cuando hay un cambio propuesto, aparece una tarjeta clara: <strong>Aplicar</strong> o descartar.</p>
+
+    <h3>Regla de oro</h3>
+    <p>Solo se escribe en el sistema de gestión si alguien pulsa <strong>Aplicar</strong>.</p>
+
+    <h3>Burbuja flotante «IA»</h3>
+    <p>En casi todas las pantallas (excepto cuando ya estás en Asistente IA) hay un botón <strong>IA</strong> abajo a la derecha. Es el mismo tipo de ayuda, contextual a la pantalla en la que estás, con opción de enviar a la IA lo que se ve. Misma regla: aplicar a mano.</p>
+  </div>
+
+  <!-- 12 -->
+  <div class="screen-long">
+    <h2>12. Ratios financieros</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>El bloque de <strong>dirección financiera</strong>: salud de la empresa, análisis profundo, caja operativa, mano de obra económica y escenarios externos.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Dirección y finanzas. (Otras pestañas también interesan a operaciones.)</p>
+
+    <h3>Antes de nada</h3>
+    <p>Elige periodo a analizar y de comparación → <strong>Actualizar</strong> (lee contabilidad; puede tardar).</p>
+
+    <h3>Pestaña Ratios → tres vistas</h3>
+
+    <p><strong>Dirección</strong><br />
+    Cuadro de mando: rentabilidades, liquidez, tesorería, endeudamiento, periodo medio financiero, cobertura del punto muerto, diagnóstico, semáforo, “qué ha mejorado / a vigilar”, evolución mensual. Cada cifra se puede pulsar para ver el origen.</p>
+
+    <p><strong>Análisis financiero</strong><br />
+    Tablas completas: cuenta de resultados, Dupont, corto/largo plazo, rotaciones, periodos medios, apalancamiento y puntos muertos, masas patrimoniales. Las existencias se pueden ajustar a mano si hace falta recalcular.</p>
+
+    <p><strong>Circulante y tesorería</strong><br />
+    Tensión de caja, ciclo, dinero atrapado en el ciclo, simulaciones “si cobráramos antes” / “si cambiara el plazo de pago”, ranking de facturas abiertas de clientes y proveedores.</p>
+
+    <h3>Pizarra</h3>
+    <p>Cálculos libres sobre cuentas (tipo hoja de análisis) y notas/dibujo. Solo en el navegador; no es el cuadro oficial.</p>
+
+    <h3>Control y análisis de mano de obra</h3>
+    <p>Horas de uso por unidad de negocio / OT / cliente, con coste de referencia (<strong>21,50 €/h</strong> en la app) y coste de oportunidad. Conviene tener cargada la tabla <strong>Recursos</strong>.</p>
+
+    <h3>Indicadores económicos y escenarios</h3>
+    <p>Sensibilidad a IPC, energía, metales, tipos de interés, demanda, impagos, etc. Sirve para conversar riesgos; <strong>no escribe</strong> en el sistema de gestión y no sustituye un presupuesto oficial.</p>
+  </div>
+
+  <!-- 13 -->
+  <div class="screen-long">
+    <h2>13. Control de horas</h2>
+
+    <h3>Para qué sirve</h3>
+    <p>Ver si la gente imputa las horas, detectar faltas, excesos, extras y ausencias, y preparar la parte de tarifas/pago. Es disciplina operativa; el análisis económico agregado está en Ratios → mano de obra.</p>
+
+    <h3>Quién la usa</h3>
+    <p>Dirección de operaciones, RR.HH., jefes de departamento.</p>
+
+    <h3>Antes</h3>
+    <p>Periodo → <strong>Cargar</strong> movimientos de proyecto. Para filtrar por departamento: tabla <strong>Recursos</strong> en <em>Cargar datos</em>.</p>
+
+    <h3>Pestañas</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Pestaña</th>
+          <th>Qué hace</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Cuadro de horas</strong></td>
+          <td>Matriz persona × día/semana. Colores: sin imputar, bajo jornada, completa, exceso, ausencia</td>
+        </tr>
+        <tr>
+          <td><strong>Extras y ausencias</strong></td>
+          <td>Resumen de extras vs exceso; partes de amianto si aplica</td>
+        </tr>
+        <tr>
+          <td><strong>Detalle</strong></td>
+          <td>Movimientos línea a línea</td>
+        </tr>
+        <tr>
+          <td><strong>Tipos de trabajo y jornada</strong></td>
+          <td>Clasificar: normal, extra, vacaciones, baja, festivo, permiso…</td>
+        </tr>
+        <tr>
+          <td><strong>Configuración</strong></td>
+          <td>Jornada, festivos, poblaciones, incidencias</td>
+        </tr>
+        <tr>
+          <td><strong>Tarifas y pago</strong></td>
+          <td>Tablas de tarifas y relación con columnas / precios</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Importante</h3>
+    <p>Lee las imputaciones del sistema de gestión. Los ajustes de configuración y tarifas se guardan en la <strong>aplicación</strong>. Desde aquí <strong>no se imputan</strong> horas nuevas al sistema de gestión.</p>
+  </div>
+
+  <hr />
+
+  <div class="screen">
+    <h2>Orden práctico de uso (si empiezas de cero)</h2>
+    <ol>
+      <li>Elegir <strong>EMPRESA</strong></li>
+      <li><strong>Cargar datos</strong> (lo que vayas a usar)</li>
+      <li><strong>Memoria histórica</strong> → construir</li>
+      <li>Trabajar <strong>Explorador</strong> / <strong>Pedidos de venta</strong> / compras (<strong>Recepción</strong>, <strong>Validación</strong>, <strong>Precios</strong>)</li>
+      <li>En paralelo: <strong>Ratios</strong> (Actualizar) y <strong>Control de horas</strong> (Cargar)</li>
+      <li>Día a día: <strong>Correo</strong>, <strong>Mis tareas</strong>, campana <strong>Teams</strong>, <strong>IA</strong> cuando haga falta</li>
+    </ol>
+  </div>
+
+  <p class="footer-note">Also Casals Group · Documento interno · ACSales · Guía de pantallas</p>
+
+</body>
+</html>

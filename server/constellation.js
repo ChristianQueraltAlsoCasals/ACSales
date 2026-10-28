@@ -208,6 +208,27 @@ async function validarCredencial({ username, password, empresa }) {
   }
 }
 
+/** Unidades de negocio y usuarios (dónde está asignada cada persona). */
+async function llistarUnitats() {
+  if (!configurat()) return { ok: false, omitit: true, unitats: [], usuaris: [] };
+  try {
+    const { ok, status, cos } = await crida("/api/intern/unitats");
+    if (!ok) {
+      return {
+        ok: false,
+        status,
+        error: cos.error || `El portal ha respondido ${status}`,
+        unitats: [],
+        usuaris: [],
+      };
+    }
+    return { ok: true, unitats: cos.unitats || [], usuaris: cos.usuaris || [] };
+  } catch (e) {
+    console.error("Error consultando unidades de ACconstelation:", e.message);
+    return { ok: false, status: 503, error: e.message, unitats: [], usuaris: [] };
+  }
+}
+
 module.exports = {
   APP_CLAU,
   configurat,
@@ -216,4 +237,5 @@ module.exports = {
   validarCredencial,
   rolDesDeNivell,
   candidatsUsername,
+  llistarUnitats,
 };

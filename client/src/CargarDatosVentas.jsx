@@ -31,7 +31,11 @@ import {
   Timer,
   Paperclip,
   Send,
+  Users,
+  SlidersHorizontal,
 } from "lucide-react";
+import TeamsPendentsCampana from "./teamsPendents.jsx";
+import SimuladorTarifas2027 from "./simuladorTarifas2027.jsx";
 import {
   construirFichasOT,
   enriquecerFichasConAtributos,
@@ -68,6 +72,7 @@ import { excelValoracionPresupuesto as generarExcelValoracion } from "./excelVal
 import Recepcion from "./recepcion.jsx";
 import FacturasCompra from "./facturasCompra.jsx";
 import FacturasVenta from "./facturasVenta.jsx";
+import AnalisisCliente from "./analisisCliente.jsx";
 import Precios from "./precios.jsx";
 import { EMAILS_DEPARTAMENTO, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
 import Correo from "./correo.jsx";
@@ -1969,41 +1974,10 @@ function difMaterialDeFicha(ficha) {
   return compararMaterialOT(ventaMaterial, compraReal);
 }
 
-/** Text de la revisió (el que abans anava al porta-retalls) per enganxar-lo
- *  DINS del missatge del correu, on es veu i s'edita. */
-function textoRevisionMaterial(dif) {
-  const items = dif?.items || [];
-  const grupos = [
-    ["falta_cobrar", `Material/Coste No facturado — comprat sense facturar (${eur(dif?.costeNoFacturado)}):`, "Confirmar si s'ha de facturar al client."],
-    ["sin_coste", `Material del Taller — venut sense compra associada (${eur(dif?.ventaSinCoste)}):`, "Confirmar si s'ha agafat del taller o magatzem."],
-    ["cantidad_distinta", "CANTITATS DIFERENTS:", "Revisar les quantitats."],
-    ["codigo_distinto", "MATEIX ARTICLE, CODI DIFERENT?:", "Revisar les referències."],
-  ];
-  const bloques = [];
-  for (const [estado, titulo, accion] of grupos) {
-    const lineas = items.filter((it) => it.estado === estado);
-    if (!lineas.length) continue;
-    bloques.push(
-      titulo + "\n" +
-      lineas.map((it) =>
-        `  · ${it.codigo || "—"} · ${it.descripcion} · compra ${it.udsCompradas || 0} ud (${eur(it.costeCompra)}) · venda ${it.udsVendidas || 0} ud (${eur(it.importeVenta)}) → ${accion}`
-      ).join("\n")
-    );
-  }
-  if (!bloques.length) return "";
-  return "Revisió de material (comprat ↔ venut):\n\n" + bloques.join("\n\n");
-}
-
-function borradorConRevision(ficha, dif) {
-  const base = borradorCorreoFacturacion(ficha);
-  const extra = textoRevisionMaterial(dif);
-  if (!extra) return base;
-  const marca = "Quedem a l'espera";
-  const i = base.cuerpoTexto.indexOf(marca);
-  const cuerpoTexto = i === -1
-    ? `${base.cuerpoTexto}\n\n${extra}`
-    : `${base.cuerpoTexto.slice(0, i)}${extra}\n\n${base.cuerpoTexto.slice(i)}`;
-  return { ...base, cuerpoTexto };
+function borradorConRevision(ficha) {
+  // La revisió de material (comprat ↔ venut) va NOMÉS en la taula HTML
+  // sota el missatge. No s'enganxa com a text pla al cos del correu.
+  return borradorCorreoFacturacion(ficha);
 }
 
 /** Correu de REVISIÓ DE MATERIAL d'una OT (Diferències comprat ↔ venut):
@@ -2465,7 +2439,15 @@ function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = 
       trabajos.push(
         excelValoracionPresupuesto(ficha, excelValoracion)
           .then((a) => ({ xls: a }))
-          .catch((e) => ({ errorXls: e.message || String(e) }))
+          .catch((e) => {
+            const msg = e?.message || String(e);
+            const cache = /Failed to fetch dynamically imported module|Loading chunk|Importing a module script failed/i.test(msg);
+            return {
+              errorXls: cache
+                ? "No se ha podido generar el Excel. Recarga la página con Ctrl+F5 y vuelve a abrirlo."
+                : msg,
+            };
+          })
       );
     }
     Promise.all(trabajos).then((partes) => {
@@ -2480,7 +2462,7 @@ function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = 
     });
   };
 
-  const borradorBase = borradorConRevision(ficha, diferencias);
+  const borradorBase = borradorConRevision(ficha);
   const textoVal = textoValoracion(valoracion);
   const cuerpoBase = textoVal
     ? (() => {
@@ -4209,9 +4191,22 @@ function DetalleOT({ ficha, fichas, onVolver }) {
   const [creandoFactura, setCreandoFactura] = useState(false);
   const [confirmarFactura, setConfirmarFactura] = useState(false);
   const [avisoFactura, setAvisoFactura] = useState(null);
+  const [margenPctTexto, setMargenPctTexto] = useState("12");
+  const [margenAplicado, setMargenAplicado] = useState(MARGEN_OBJETIVO_VENTA);
   const noBC = codigoOTParaBC(ficha);
 
-  useEffect(() => { setClavesCosteNF(leerCosteNF(noBC)); }, [noBC]);
+  useEffect(() => {
+    setClavesCosteNF(leerCosteNF(noBC));
+    setMargenPctTexto("12");
+    setMargenAplicado(MARGEN_OBJETIVO_VENTA);
+  }, [noBC]);
+
+  const cambiarMargenObjetivo = (texto) => {
+    const limpio = String(texto).replace("%", "").trim();
+    setMargenPctTexto(limpio);
+    const n = parseFloat(limpio.replace(",", "."));
+    if (Number.isFinite(n) && n >= 0 && n < 100) setMargenAplicado(n / 100);
+  };
 
   const cambiarCosteNF = (claves, anadir) => {
     setClavesCosteNF((prev) => {
@@ -4275,6 +4270,9 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     ? Number(movsUso.horas) || 0
     : null;
 
+  const clienteFactura = ficha.general?.cliente || "";
+  const clienteNumeroFactura = (lineasBC?.ventaRaw || []).map((r) => r["Sell_to_Customer_No"]).find(Boolean) || "";
+
   const [tarifaMO, setTarifaMO] = useState(null);
   useEffect(() => {
     if (!esPresupuesto) {
@@ -4282,21 +4280,34 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       return;
     }
     let cancelado = false;
-    setTarifaMO({ cargando: true, error: null, grupos: {}, nombres: {}, precios: {} });
-    fetch("/api/ot/tarifa-mano-obra")
+    setTarifaMO({ cargando: true, error: null, grupos: {}, nombres: {}, precios: {}, origen: null, usaEspecial: false });
+    const qs = new URLSearchParams();
+    if (clienteNumeroFactura) qs.set("cliente", clienteNumeroFactura);
+    if (clienteFactura) qs.set("nombre", clienteFactura);
+    const url = qs.toString() ? `/api/ot/tarifa-mano-obra?${qs}` : "/api/ot/tarifa-mano-obra";
+    fetch(url)
       .then(async (r) => {
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
-        if (!cancelado) setTarifaMO({ cargando: false, error: null, grupos: j.grupos || {}, nombres: j.nombres || {}, precios: j.precios || {} });
+        if (!cancelado) {
+          setTarifaMO({
+            cargando: false,
+            error: null,
+            grupos: j.grupos || {},
+            nombres: j.nombres || {},
+            precios: j.precios || {},
+            origen: j.origen || null,
+            usaEspecial: !!j.usaEspecial,
+            ambito: j.ambito || "general",
+            lineas: j.lineas || 0,
+          });
+        }
       })
       .catch((err) => {
-        if (!cancelado) setTarifaMO({ cargando: false, error: err.message || String(err), grupos: {}, nombres: {}, precios: {} });
+        if (!cancelado) setTarifaMO({ cargando: false, error: err.message || String(err), grupos: {}, nombres: {}, precios: {}, origen: null, usaEspecial: false });
       });
     return () => { cancelado = true; };
-  }, [esPresupuesto]);
-
-  const clienteFactura = ficha.general?.cliente || "";
-  const clienteNumeroFactura = (lineasBC?.ventaRaw || []).map((r) => r["Sell_to_Customer_No"]).find(Boolean) || "";
+  }, [esPresupuesto, clienteFactura, clienteNumeroFactura]);
   const crearFacturaDeEstaOT = async () => {
     setCreandoFactura(true);
     setAvisoFactura(null);
@@ -4926,7 +4937,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller);
         const costeDirectoBarra = costeMaterial + manoObra;
         const coefBarra = coefVentaPosible(ficha.general?.cliente);
-        const voBarra = calcularVentaObjetivo(costeDirectoBarra, ratioPropia, pctGeneral, MARGEN_OBJETIVO_VENTA, coefBarra);
+        const voBarra = calcularVentaObjetivo(costeDirectoBarra, ratioPropia, pctGeneral, margenAplicado, coefBarra);
         const ventaObjetivoBarra = voBarra.ventaObjetivo;
         const estructura = ventaObjetivoBarra != null ? ventaObjetivoBarra * pctEstructura : 0;
         const col = (v) => (v < 0 ? "text-red-600" : "text-emerald-600");
@@ -5269,19 +5280,20 @@ function DetalleOT({ ficha, fichas, onVolver }) {
             {(() => {
               const costeDirecto = costeMaterial + manoObra;
               const coefVenta = coefVentaPosible(ficha.general?.cliente);
-              const vo = calcularVentaObjetivo(costeDirecto, ratioPropia, pctGeneral, MARGEN_OBJETIVO_VENTA, coefVenta);
+              const vo = calcularVentaObjetivo(costeDirecto, ratioPropia, pctGeneral, margenAplicado, coefVenta);
               const gap = vo.ventaObjetivo != null ? ingresos - vo.ventaObjetivo : null;
               const baseVo = vo.ventaObjetivo;
               const eurEstrPropia = baseVo != null ? baseVo * ratioPropia : null;
               const eurEstrGeneral = baseVo != null ? baseVo * pctGeneral : null;
-              const eurMargeObj = baseVo != null ? baseVo * 0.12 : null;
+              const eurMargeObj = baseVo != null ? baseVo * margenAplicado : null;
+              const margenTxt = `${(margenAplicado * 100).toLocaleString("es-ES", { maximumFractionDigits: 1 })} %`;
               const mostrarCifras = tasasEstEstado === "ok" || tasasEstEstado === "error";
               return (
                 <div className="mt-2 bg-white border border-slate-200 rounded-lg px-4 py-3">
                   <div className="flex items-baseline justify-between gap-2 flex-wrap mb-2">
                     <div className="text-xs font-bold text-slate-800">Venta Objetivo</div>
                     <div className="text-[10px] text-slate-400">
-                      Coste directe ÷ (1 − est. pròpia UN − est. general − 12 %) · Venta Posible × {coefVenta}
+                      Coste directe ÷ (1 − est. pròpia UN − est. general − {margenTxt}) · Venta Posible × {coefVenta}
                       {un ? ` · UN ${un}` : ""}
                       {taxesProvisionales ? " · taxes provisionals (22 %)" : (tasasEst?.year ? ` · taxes ${tasasEst.year}` : "")}
                     </div>
@@ -5322,20 +5334,11 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                         tabIndex={0}
                         title="Com es calcula la Venta Objetivo"
                         onClick={() => setDesglose({
-                          titulo: vo.fiable && vo.ventaObjetivo != null ? `Venta Objetivo · ${eur(vo.ventaObjetivo)}` : "Venta Objetivo · no fiable",
-                          subtitulo: "Coste directe ÷ (1 − pròpia − general − 12 %)",
+                          margenEditable: true,
+                          costeDirecto,
+                          ratioPropia,
+                          pctGeneral,
                           filas: [],
-                          formula: [
-                            { label: "Coste directe", valor: eur(costeDirecto) },
-                            { label: "÷ Divisor", valor: vo.divisor != null ? vo.divisor.toLocaleString("es-ES", { maximumFractionDigits: 4 }) : "—" },
-                            { label: "  (1 − pròpia − general − 12 %)", valor: `1 − ${pctTxt(ratioPropia)} − ${pctTxt(pctGeneral)} − 12 %` },
-                            { label: "= Venta Objetivo", valor: vo.ventaObjetivo != null ? eur(vo.ventaObjetivo) : "No fiable", destacado: true },
-                            { label: "Estructura pròpia s/ objectiu", valor: vo.ventaObjetivo != null ? eur(vo.ventaObjetivo * ratioPropia) : "—" },
-                            { label: "Estructura general s/ objectiu", valor: vo.ventaObjetivo != null ? eur(vo.ventaObjetivo * pctGeneral) : "—" },
-                            { label: "Marge 12 % s/ objectiu", valor: vo.ventaObjetivo != null ? eur(vo.ventaObjetivo * 0.12) : "—" },
-                          ],
-                          total: vo.ventaObjetivo,
-                          totalLabel: "Com l'exemple: cost + estructures + marge = venda",
                         })}
                         onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.currentTarget.click(); } }}
                       >
@@ -5343,7 +5346,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                         {vo.fiable && vo.ventaObjetivo != null ? (
                           <>
                             <div className="text-sm font-bold text-indigo-700 tabular-nums">{eur(vo.ventaObjetivo)}</div>
-                            <div className="text-[9px] text-slate-400 mt-0.5">marge objectiu 12 %{clicHint}</div>
+                            <div className="text-[9px] text-slate-400 mt-0.5">marge objectiu {margenTxt}{clicHint}</div>
                           </>
                         ) : (
                           <>
@@ -5391,16 +5394,16 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                       <Metrica
                         label="Marge objectiu"
                         valor={eurMargeObj != null ? eur(eurMargeObj) : "—"}
-                        sub={`12 % s/ objectiu${clicHint}`}
+                        sub={`${margenTxt} s/ objectiu${clicHint}`}
                         colorClase="text-emerald-700"
-                        title="Marge = Venta Objetivo × 12 %"
+                        title={`Marge = Venta Objetivo × ${margenTxt}`}
                         onClick={() => setDesglose({
                           titulo: `Marge objectiu · ${eurMargeObj != null ? eur(eurMargeObj) : "—"}`,
-                          subtitulo: "12 % × Venta Objetivo",
+                          subtitulo: `${margenTxt} × Venta Objetivo`,
                           filas: [],
                           formula: [
                             { label: "Venta Objetivo", valor: baseVo != null ? eur(baseVo) : "—" },
-                            { label: "× 12 %", valor: "12 %" },
+                            { label: `× ${margenTxt}`, valor: margenTxt },
                             { label: "= Marge objectiu", valor: eurMargeObj != null ? eur(eurMargeObj) : "—", destacado: true },
                             { label: "Comprovació", valor: baseVo != null ? `${eur(costeDirecto)} + ${eur(eurEstrPropia || 0)} + ${eur(eurEstrGeneral || 0)} + ${eur(eurMargeObj || 0)} = ${eur(baseVo)}` : "—" },
                           ],
@@ -5773,8 +5776,15 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         <div className="bg-white border border-indigo-200 rounded-lg p-4 mt-3">
           <div className="flex items-baseline justify-between gap-2 flex-wrap mb-2">
             <div className="text-xs font-bold text-slate-800">Valoració del pressupost {ficha.general.presupuesto}</div>
-            <div className="text-[10px] text-slate-400">Mà d'obra: cost 21,50 €/h · venda segons tarifa general i tipus d'hora · Material: cost de les compres × 1,68</div>
+            <div className="text-[10px] text-slate-400">Mà d&apos;obra: cost 21,50 €/h · venda segons tarifa ACSales (Excel) i tipus d&apos;hora · Material: cost de les compres × 1,68</div>
           </div>
+          {tarifaMO && !tarifaMO.cargando && !tarifaMO.error && (
+            <div className={`text-[11px] rounded px-2 py-1 mb-2 border ${tarifaMO.usaEspecial ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-sky-50 border-sky-200 text-sky-900"}`}>
+              {tarifaMO.usaEspecial
+                ? `Tarifa especial del client (${tarifaMO.origen || "excel"} · ${tarifaMO.lineas || 0} preus).`
+                : `Tarifa general ACSales (${tarifaMO.origen || "defecte"} · ${tarifaMO.lineas || 0} preus).`}
+            </div>
+          )}
           {(movsUso?.cargando || tarifaMO?.cargando) && <div className="text-[11px] text-slate-500">Llegint hores i tarifa…</div>}
           {(movsUso?.error || tarifaMO?.error) && (
             <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 mb-2">
@@ -5801,7 +5811,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
               </div>
               {valoracionPresupuesto.sinTarifa > 0 && (
                 <div className="text-[11px] text-amber-800 mb-2">
-                  {valoracionPresupuesto.sinTarifa} línia(es) d'hores sense tarifa (falta el grup del recurs o el tipus d'hora). La venda de mà d'obra no es tanca.
+                  {valoracionPresupuesto.sinTarifa} línia(es) d&apos;hores sense tarifa (falta el grup del recurs o el tipus d&apos;hora). La venda de mà d&apos;obra no es tanca.
                 </div>
               )}
               <div className="text-[11px] font-semibold text-slate-600 mb-1">Hores ({valoracionPresupuesto.horas.length})</div>
@@ -5876,9 +5886,14 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         />
       )}
 
-      {desglose && (
+      {desglose && (() => {
+        const vivo = desglose.margenEditable
+          ? desgloseVentaObjetivoVivo(desglose, margenAplicado, margenPctTexto, cambiarMargenObjetivo)
+          : null;
+        return (
         <ModalDesgloseCelda
           {...desglose}
+          {...(vivo || {})}
           filas={desglose.esTaller
             ? materialTaller.map((l) => ({
                 codigo: String(l.numero || "").trim(),
@@ -5889,12 +5904,12 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                 editable: true,
               }))
             : desglose.esCosteNF ? costeNFVista.filas : desglose.filas}
-          total={desglose.esTaller ? costeTaller : desglose.esCosteNF ? costeAplicado : desglose.total}
+          total={desglose.esTaller ? costeTaller : desglose.esCosteNF ? costeAplicado : (vivo ? vivo.total : desglose.total)}
           titulo={desglose.esTaller
             ? `Material taller · + ${eur(costeTaller)}`
             : desglose.esCosteNF
             ? `Coste No Facturado · ${costeAplicado > 0 ? "− " + eur(costeAplicado) : eur(0)}`
-            : desglose.titulo}
+            : (vivo ? vivo.titulo : desglose.titulo)}
           onEditarImporte={desglose.esTaller
             ? (f, importe) => guardarPrecioTaller(f.codigo, f.descripcion, importe, f.cantidad)
             : null}
@@ -5910,7 +5925,8 @@ function DetalleOT({ ficha, fichas, onVolver }) {
             setHistorial({ tipo, codigo, descripcion });
           } : null}
         />
-      )}
+        );
+      })()}
     </div>
   );
 }
@@ -5950,6 +5966,30 @@ function PrecioLineaTaller({ importe, onGuardar }) {
   );
 }
 
+function desgloseVentaObjetivoVivo(base, margenAplicado, margenPctTexto, onCambiarMargen) {
+  const vo = calcularVentaObjetivo(base.costeDirecto, base.ratioPropia, base.pctGeneral, margenAplicado);
+  const mTxt = (margenAplicado * 100).toLocaleString("es-ES", { maximumFractionDigits: 1 });
+  const pTxt = (x) => `${((Number(x) || 0) * 100).toLocaleString("es-ES", { maximumFractionDigits: 1 })} %`;
+  const venta = vo.ventaObjetivo;
+  return {
+    titulo: vo.fiable && venta != null ? `Venta Objetivo · ${eur(venta)}` : "Venta Objetivo · no fiable",
+    subtitulo: `Coste directe ÷ (1 − pròpia − general − ${mTxt} %)`,
+    formula: [
+      { label: "Coste directe", valor: eur(base.costeDirecto) },
+      { label: "÷ Divisor", valor: vo.divisor != null ? vo.divisor.toLocaleString("es-ES", { maximumFractionDigits: 4 }) : "—" },
+      { label: "(1 − pròpia − general − marge)", prefijo: `1 − ${pTxt(base.ratioPropia)} − ${pTxt(base.pctGeneral)} −`, esMargen: true },
+      { label: "= Venta Objetivo", valor: venta != null ? eur(venta) : "No fiable", destacado: true },
+      { label: "Estructura pròpia s/ objectiu", valor: venta != null ? eur(venta * (Number(base.ratioPropia) || 0)) : "—" },
+      { label: "Estructura general s/ objectiu", valor: venta != null ? eur(venta * (Number(base.pctGeneral) || 0)) : "—" },
+      { label: `Marge ${mTxt} % s/ objectiu`, valor: venta != null ? eur(venta * margenAplicado) : "—" },
+    ],
+    total: venta,
+    totalLabel: "Com l'exemple: cost + estructures + marge = venda",
+    margenPct: margenPctTexto,
+    onCambiarMargen,
+  };
+}
+
 /** Popup genèric: desglose d'una cel·la (línies i/o fórmula). UI en catalán. */
 function ModalDesgloseCelda({
   titulo,
@@ -5966,6 +6006,8 @@ function ModalDesgloseCelda({
   onAnadirTodas,
   onQuitarTodas,
   onEditarImporte = null,
+  margenPct = null,
+  onCambiarMargen = null,
 }) {
   const tieneDoc = (filas || []).some((f) => f.documento);
   const tieneProv = (filas || []).some((f) => f.proveedor);
@@ -5996,7 +6038,22 @@ function ModalDesgloseCelda({
                   className={`flex items-center justify-between gap-3 text-[12px] ${r.destacado ? "font-bold text-slate-900 pt-1 border-t border-slate-200 mt-1" : "text-slate-700"}`}
                 >
                   <span>{r.label}</span>
-                  <span className="tabular-nums shrink-0">{r.valor}</span>
+                  {r.esMargen && onCambiarMargen ? (
+                    <span className="inline-flex items-center gap-1 tabular-nums shrink-0">
+                      <span>{r.prefijo}</span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        aria-label="Marge objectiu"
+                        value={margenPct ?? ""}
+                        onChange={(e) => onCambiarMargen(e.target.value)}
+                        className="w-14 border border-indigo-300 bg-white rounded px-1 py-0.5 text-right text-[12px] font-semibold text-slate-800"
+                      />
+                      <span>%</span>
+                    </span>
+                  ) : (
+                    <span className="tabular-nums shrink-0">{r.valor}</span>
+                  )}
                 </div>
               ))}
             </div>
@@ -7503,6 +7560,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
   };
   const [actualizandoRecep, setActualizandoRecep] = useState(false);
   const [actualizandoFacVenta, setActualizandoFacVenta] = useState(false);
+  const [actualizandoAnalisisCli, setActualizandoAnalisisCli] = useState(false);
   const [tareaPendiente, setTareaPendiente] = useState(null); // tarea creada desde Correo
 
   // El Correo llama a esto para crear una tarea; cambia a la pantalla Tareas.
@@ -7536,6 +7594,23 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
     }
   };
 
+  // Añade filas de una fuente BC a la caché local (por id o número).
+  const fusionarFuenteBC = (prev, fuente, desde, hasta, filas) => {
+    const previas = prev[fuente]?.rows || [];
+    const porClave = new Map();
+    for (const r of previas) porClave.set(String(r.id || r.number || ""), r);
+    for (const r of filas || []) porClave.set(String(r.id || r.number || ""), r);
+    const rows = [...porClave.values()].filter((r) => r.id || r.number);
+    return {
+      ...prev,
+      [fuente]: {
+        cached: [{ from: desde, to: hasta }],
+        totalRows: rows.length,
+        rows,
+      },
+    };
+  };
+
   // Añade las facturas de venta del rango a las ya cargadas (por id o número).
   const actualizarFacturasVenta = async (desde, hasta) => {
     setActualizandoFacVenta(true);
@@ -7543,19 +7618,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
       const res = await fetchFromBC("facturas_venta", desde, hasta);
       if (!res.error && res.data) {
         setData((prev) => {
-          const previas = prev.facturas_venta?.rows || [];
-          const porClave = new Map();
-          for (const r of previas) porClave.set(String(r.id || r.number || ""), r);
-          for (const r of res.data) porClave.set(String(r.id || r.number || ""), r);
-          const rows = [...porClave.values()].filter((r) => r.id || r.number);
-          const next = {
-            ...prev,
-            facturas_venta: {
-              cached: [{ from: desde, to: hasta }],
-              totalRows: rows.length,
-              rows,
-            },
-          };
+          const next = fusionarFuenteBC(prev, "facturas_venta", desde, hasta, res.data);
           persistirBcData(next);
           return next;
         });
@@ -7563,6 +7626,27 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
       return res;
     } finally {
       setActualizandoFacVenta(false);
+    }
+  };
+
+  // Facturas + abonos de venta para Anàlisi per client (MVP A).
+  const actualizarAnalisisCliente = async (desde, hasta) => {
+    setActualizandoAnalisisCli(true);
+    try {
+      const [fac, abo] = await Promise.all([
+        fetchFromBC("facturas_venta", desde, hasta),
+        fetchFromBC("abonos_venta", desde, hasta),
+      ]);
+      setData((prev) => {
+        let next = prev;
+        if (!fac.error && fac.data) next = fusionarFuenteBC(next, "facturas_venta", desde, hasta, fac.data);
+        if (!abo.error && abo.data) next = fusionarFuenteBC(next, "abonos_venta", desde, hasta, abo.data);
+        if (next !== prev) persistirBcData(next);
+        return next;
+      });
+      return { fac, abo };
+    } finally {
+      setActualizandoAnalisisCli(false);
     }
   };
 
@@ -7595,6 +7679,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           </span>
         </div>
         <div className="bc-topbar-spacer" />
+        <TeamsPendentsCampana />
         {(usuario || onLogout) && (
           <div className="bc-topbar-user">
             {usuario && (
@@ -7629,6 +7714,8 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
             {navItem("precios", "Precios de artículos", Tag)}
             {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
             {navItem("facturasventa", "Facturas de venta", FileText)}
+            {navItem("analisiscliente", "Anàlisi per client", Users)}
+            {navItem("simuladortarifas", "Simulador tarifas 2027", SlidersHorizontal)}
             {navItem("correo", "Correo", Mail)}
             {navItem("tareas", "Mis tareas", CheckSquare)}
             {navItem("ia", "Asistente IA", Bot)}
@@ -7641,7 +7728,6 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
               "Pedidos de venta",
               "Análisis de rentabilidad",
               "Precios de artículos",
-              "Análisis por cliente",
               "Comparar periodos",
             ].map((item) => (
               <div
@@ -7687,6 +7773,36 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
               lineas={data["lineas_venta_reg"]?.rows || []}
               onActualizar={actualizarFacturasVenta}
               actualizando={actualizandoFacVenta}
+            />
+          ))}
+          {panel("analisiscliente", (
+            <AnalisisCliente
+              facturas={data["facturas_venta"]?.rows || []}
+              abonos={data["abonos_venta"]?.rows || []}
+              lineas={data["lineas_venta_reg"]?.rows || []}
+              lineasCompra={[
+                ...(data["lineas_compra_reg"]?.rows || []),
+                ...(data["lineas_compra"]?.rows || []),
+              ]}
+              movsProyecto={data["movs_contabilidad_excel"]?.rows || []}
+              fichas={(estadoInicial?.fichas || []).map((x) => (Array.isArray(x) ? x[1] : x))}
+              onActualizar={actualizarAnalisisCliente}
+              actualizando={actualizandoAnalisisCli}
+            />
+          ))}
+          {panel("simuladortarifas", (
+            <SimuladorTarifas2027
+              facturas={data["facturas_venta"]?.rows || []}
+              abonos={data["abonos_venta"]?.rows || []}
+              lineas={data["lineas_venta_reg"]?.rows || []}
+              lineasCompra={[
+                ...(data["lineas_compra_reg"]?.rows || []),
+                ...(data["lineas_compra"]?.rows || []),
+              ]}
+              movsProyecto={data["movs_contabilidad_excel"]?.rows || []}
+              fichas={(estadoInicial?.fichas || []).map((x) => (Array.isArray(x) ? x[1] : x))}
+              onActualizar={actualizarAnalisisCliente}
+              actualizando={actualizandoAnalisisCli}
             />
           ))}
           {panel("correo", <Correo onCrearTarea={crearTareaDesdeCorreo} usuario={usuario} />)}

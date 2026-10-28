@@ -14,10 +14,82 @@
  * .env, o se busca en el catálogo (nombres tipo «Movs_proyecto»…).
  */
 module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa }) {
+  const fs = require("fs");
+  const path = require("path");
   const raiz = () => `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${encodeURIComponent(EMPRESA_NOMBRE() || "")}')`;
   const leerJSON = async (base, def) => db.getDoc(claveEmpresa(base), def);
   const escribirJSON = async (base, d) => db.setDoc(claveEmpresa(base), d);
   const { erpConfigurado, getPool, sql, esErrorConectividadErp } = require("./erp-db");
+
+  /** Tarifa MO de Anàlisi per client (Excel): semilla disco + Postgres. */
+  function leerTarifaDefectoDisco() {
+    try {
+      const candidatos = [
+        path.join(__dirname, "data", "tarifas_mo_defecto.json"),
+        path.join(__dirname, "..", "data", "tarifas_mo_defecto.json"),
+      ];
+      const p = candidatos.find((x) => fs.existsSync(x));
+      if (!p) return null;
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (!j || !Array.isArray(j.filas) || !j.filas.length) return null;
+      return {
+        origen: j.origen || "tarifas_mo_defecto.json",
+        actualizado: j.actualizado || null,
+        filas: j.filas,
+        ambito: "general",
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function preciosDesdeFilas(filas) {
+    const precios = {};
+    for (const r of filas || []) {
+      const prod = String(r.producto || r["N.º de producto"] || r.Product_No || "").trim();
+      const tipo = String(r.tipoTrabajo || r["Cód. tipo trabajo"] || r.Work_Type_Code || "").trim();
+      const precio = Number(r.precio ?? r["Precio venta"] ?? r.Unit_Price);
+      if (!prod || !tipo || !(precio > 0)) continue;
+      precios[`${prod}|${tipo}`] = precio;
+    }
+    return precios;
+  }
+
+  function buscarTarifaEspecial(doc, candidatos) {
+    const mapa = doc && doc.clientes && typeof doc.clientes === "object" ? doc.clientes : {};
+    const keys = Object.keys(mapa);
+    for (const c of candidatos) {
+      if (!c) continue;
+      if (mapa[c] && Array.isArray(mapa[c].filas) && mapa[c].filas.length) return mapa[c];
+      const low = c.toLowerCase();
+      const hit = keys.find((k) => k.toLowerCase() === low);
+      if (hit && mapa[hit]?.filas?.length) return mapa[hit];
+    }
+    return null;
+  }
+
+  async function resolverTarifaAcsales(candidatosCliente) {
+    let doc = {};
+    if (db && claveEmpresa) {
+      try {
+        doc = await db.getDoc(claveEmpresa("analisis_cliente_tarifas"), {});
+      } catch {
+        doc = {};
+      }
+    }
+    let general = doc.general && Array.isArray(doc.general.filas) && doc.general.filas.length
+      ? doc.general
+      : null;
+    if (!general) general = leerTarifaDefectoDisco();
+    const especial = buscarTarifaEspecial(doc, candidatosCliente);
+    const activa = especial && especial.filas?.length ? especial : general;
+    return {
+      general,
+      especial: especial || null,
+      activa,
+      usaEspecial: !!(especial && especial.filas?.length),
+    };
+  }
 
   let catEstado = "";
   async function catalogo(token) {
@@ -470,11 +542,25 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
     }
   });
 
-  // Tarifa general de mano de obra (lista GENERAL, familia de recurso)
-  // y el grupo de cada recurso (MOINS01, MOMA02…). La ficha de una OT con
-  // presupuesto cruza las horas reales con este precio según el tipo de hora.
+  // Tarifa de mano de obra para valoración OT con presupuesto:
+  // precios desde Excel ACSales (Anàlisi G: general o especial del cliente);
+  // grupos de recurso desde BC (Ficha_recurso).
   app.get("/api/ot/tarifa-mano-obra", async (req, res) => {
     try {
+      const candidatos = [
+        String(req.query.cliente || "").trim(),
+        String(req.query.nombre || "").trim(),
+        String(req.query.numero || "").trim(),
+      ].filter(Boolean);
+
+      const tarifaAc = await resolverTarifaAcsales(candidatos);
+      if (!tarifaAc.activa?.filas?.length) {
+        return res.status(404).json({
+          error: "No hi ha tarifa de mà d'obra a ACSales. Puja l'Excel a Anàlisi per client (G).",
+        });
+      }
+      const precios = preciosDesdeFilas(tarifaAc.activa.filas);
+
       const token = await obtenerTokenBC();
       const recursos = await leerTodo(
         `${raiz()}/Ficha_recurso_Excel?$select=No,Name,Resource_Group_No`,
@@ -489,21 +575,18 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
         grupos[no] = String(r.Resource_Group_No || "").trim();
         nombres[no] = String(r.Name || "").trim();
       }
-      const filtro = encodeURIComponent("Price_List_Code eq 'GENERAL' and Asset_Type eq 'Resource Group'");
-      const lineas = await leerTodo(
-        `${raiz()}/Price_List_Lines_Excel?$filter=${filtro}&$select=Product_No,Work_Type_Code,Unit_Price`,
-        token,
-        5000
-      );
-      const precios = {};
-      for (const l of lineas) {
-        const prod = String(l.Product_No || "").trim();
-        const tipo = String(l.Work_Type_Code || "").trim();
-        const precio = Number(l.Unit_Price);
-        if (!prod || !tipo || !(precio > 0)) continue;
-        precios[`${prod}|${tipo}`] = precio;
-      }
-      res.json({ grupos, nombres, precios, lineas: Object.keys(precios).length, recursos: Object.keys(grupos).length });
+
+      res.json({
+        grupos,
+        nombres,
+        precios,
+        lineas: Object.keys(precios).length,
+        recursos: Object.keys(grupos).length,
+        origen: tarifaAc.activa.origen || (tarifaAc.usaEspecial ? "especial" : "general"),
+        usaEspecial: tarifaAc.usaEspecial,
+        ambito: tarifaAc.usaEspecial ? "cliente" : "general",
+        actualizado: tarifaAc.activa.actualizado || null,
+      });
     } catch (e) {
       console.error("Error /api/ot/tarifa-mano-obra:", e);
       res.status(500).json({ error: "No se ha podido leer la tarifa de mano de obra.", detalle: String(e.message || e) });
