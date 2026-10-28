@@ -60,10 +60,20 @@ const PORT = process.env.PORT || 3000;
 
 // Auth ERP + ACconstelation (mismo patrón que achuman / aclogistics)
 const { router: authRouter, requiereSesion } = require("./auth");
+const { soloControlHoras } = require("./permisos");
 app.use("/api/auth", authRouter);
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
   return requiereSesion(req, res, next);
+});
+/** Usuarios con solo_control_horas: únicamente endpoints de Control de horas. */
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) return next();
+  if (!req.usuario || !soloControlHoras(req.usuario)) return next();
+  if (req.path.startsWith("/horas")) return next();
+  return res.status(403).json({
+    error: "Solo tienes permiso para Control de horas en ACsales.",
+  });
 });
 
 // ---------------------------------------------------------------------

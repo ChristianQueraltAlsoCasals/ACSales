@@ -20,6 +20,13 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
   const leerJSON = async (base, def) => db.getDoc(claveEmpresa(base), def);
   const escribirJSON = async (base, d) => db.setDoc(claveEmpresa(base), d);
   const { erpConfigurado, getPool, sql, esErrorConectividadErp } = require("./erp-db");
+  const { puedeTarifasPago } = require("./permisos");
+
+  function exigirTarifasPago(req, res) {
+    if (puedeTarifasPago(req.usuario)) return true;
+    res.status(403).json({ error: "No tienes permiso para Tarifas y pago." });
+    return false;
+  }
 
   /** Tarifa MO de Anàlisi per client (Excel): semilla disco + Postgres. */
   function leerTarifaDefectoDisco() {
@@ -163,8 +170,12 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
   });
 
   // Tabla de tarifas (Excel de Maria con los precios de las extras por trabajador)
-  app.get("/api/horas/tarifas", async (req, res) => res.json({ tarifas: await leerJSON("horas_tarifas", null) }));
+  app.get("/api/horas/tarifas", async (req, res) => {
+    if (!exigirTarifasPago(req, res)) return;
+    res.json({ tarifas: await leerJSON("horas_tarifas", null) });
+  });
   app.post("/api/horas/tarifas", async (req, res) => {
+    if (!exigirTarifasPago(req, res)) return;
     try {
       const t = req.body || {};
       const columnas = Array.isArray(t.columnas) ? t.columnas.map((c) => String(c).slice(0, 120)) : [];
