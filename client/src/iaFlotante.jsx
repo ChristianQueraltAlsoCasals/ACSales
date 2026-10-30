@@ -7,6 +7,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Bot, Send, X, Paperclip, Plus, Minimize2 } from "lucide-react";
 import { TarjetaCambio, cargarImagen, MensajeConTablas } from "./chatIA.jsx";
 import { empresaGuardada } from "./empresa.jsx";
+import { aplicarAccionesApp, snapshotAppParaIA } from "./accionesAppIA.js";
 
 const NOMBRES = {
   cargar: "Cargar datos",
@@ -21,8 +22,10 @@ const NOMBRES = {
   simuladortarifas: "Simulador de tarifas 2027",
   correo: "Correo",
   tareas: "Mis tareas",
+  calendario: "Calendario",
   ratios: "Ratios financieros",
   horas: "Control de horas",
+  ia: "Asistente IA",
 };
 
 const SUGERENCIAS = {
@@ -42,6 +45,7 @@ const SUGERENCIAS = {
   ],
   correo: ["Resume los correos importantes", "¿Qué correos necesitan respuesta?"],
   tareas: ["¿Qué tareas son más urgentes?", "Organízame las tareas de hoy"],
+  calendario: ["¿Qué tengo esta semana?", "Crea un evento para mañana"],
   ratios: ["Explícame los ratios en fácil", "¿Qué ratio debería preocuparme más?"],
   horas: ["¿Quién tiene más días sin imputar?", "¿Quién acumula más horas extra?"],
 };
@@ -52,7 +56,7 @@ function textoPantalla() {
   return (main.innerText || "").replace(/\n{3,}/g, "\n\n").slice(0, 9000);
 }
 
-export default function IAFlotante({ seccion, incrustado = false }) {
+export default function IAFlotante({ seccion, incrustado = false, onAbrirSeccion }) {
   const [abierto, setAbierto] = useState(false);
   const [conv, setConv] = useState({});
   const [entrada, setEntrada] = useState("");
@@ -62,6 +66,8 @@ export default function IAFlotante({ seccion, incrustado = false }) {
   const finRef = useRef(null);
   const inputImgRef = useRef(null);
   const chatIds = useRef({});
+  const abrirSeccionRef = useRef(onAbrirSeccion);
+  useEffect(() => { abrirSeccionRef.current = onAbrirSeccion; }, [onAbrirSeccion]);
 
   const empresa = empresaGuardada();
   const empresaId = empresa?.id || "Also";
@@ -104,15 +110,22 @@ export default function IAFlotante({ seccion, incrustado = false }) {
           historial: previo.historial,
           empresa: empresaId,
           imagenes: imgs.map((i) => ({ media_type: i.media_type, data: i.data })),
-          contexto: usarPantalla ? { pantalla, texto: textoPantalla() } : { pantalla, texto: "(Maria ha desactivado enviar el contenido de la pantalla)" },
+          contexto: {
+            pantalla,
+            texto: usarPantalla ? textoPantalla() : "(Maria ha desactivado enviar el contenido de la pantalla)",
+            app: snapshotAppParaIA(),
+          },
         }),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — ") || `Error ${r.status}`);
+      const { mensajes: msgsApp } = aplicarAccionesApp(j.accionesApp || [], { abrirSeccion: abrirSeccionRef.current });
+      const msgs = [...mensajesYo, { rol: "ia", texto: j.texto || (j.cambios?.length ? "Te he preparado el cambio: revísalo y pulsa «Aplicar en BC»." : (msgsApp.length ? msgsApp.join(" · ") : "(sin respuesta)")), pasos: j.pasos || [], cambios: j.cambios || [], accionesApp: msgsApp }];
+      if (msgsApp.length) msgs.push({ rol: "sistema", texto: `✓ ${msgsApp.join(" · ")}` });
       const nuevo = {
         ...previo,
         historial: j.historial || [],
-        mensajes: [...mensajesYo, { rol: "ia", texto: j.texto || (j.cambios?.length ? "Te he preparado el cambio: revísalo y pulsa «Aplicar en BC»." : "(sin respuesta)"), pasos: j.pasos || [], cambios: j.cambios || [] }],
+        mensajes: msgs,
       };
       setConv((c) => ({ ...c, [sec]: nuevo }));
       guardar(sec, nuevo);

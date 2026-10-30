@@ -8,11 +8,14 @@
  *    exceso sobre la jornada teórica).
  *  · Detalle de movimientos y clasificación de los tipos de trabajo
  *    (qué código es extra, vacaciones, baja…), jornada y festivos.
+ *  · Aviso por correo al responsable del departamento (días incompletos,
+ *    laborables sin imputar e incidencias de Configuración).
  */
-import React, { useEffect, useMemo, useState } from "react";
-import { ConfiguracionHoras, TarifasHoras, FestivosLinea, listaFestivos, agruparAmiantoPorDia, normNum } from "./horasExtra.jsx";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { ConfiguracionHoras, TarifasHoras, FestivosLinea, listaFestivos, agruparAmiantoPorDia, normNum, TIPOS_INCIDENCIA } from "./horasExtra.jsx";
 import { indiceRecursos } from "./manoObra.jsx";
 import { puedeTarifasPago } from "./permisos.js";
+import { codigoDepartamentoDesdeUnidad, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
 
 const CATS = {
   normal: { txt: "Normal", color: "" },
@@ -55,6 +58,300 @@ const fmtF = (s) => (s ? s.split("-").reverse().join("/") : "");
 const DIAS = ["D", "L", "M", "X", "J", "V", "S"];
 const SIN_DEPTO = "Sin departamento";
 
+function emailsDeCampo(texto) {
+  return String(texto || "").split(/[;,\s]+/).map((s) => s.trim()).filter((s) => s.includes("@"));
+}
+
+/** Días laborables con faltas de horas o sin imputar, más incidencias de Configuración. */
+function revisarAnomalias(r, dias, hastaReal, jornadaDiaFn, incidenciasRec) {
+  const sinImputar = [];
+  const incompletos = [];
+  for (const dia of dias) {
+    if (dia > hastaReal) continue;
+    const j = jornadaDiaFn(dia, r.recurso);
+    if (!(j > 0)) continue;
+    const d = r.dias[dia];
+    const trab = d ? d.trabajo : 0;
+    const aus = d ? Object.values(d.aus).reduce((a, b) => a + b, 0) : 0;
+    const total = trab + aus;
+    if (!d || total === 0) sinImputar.push(dia);
+    else if (total < j - 0.01) incompletos.push({ dia, horas: total, jornada: j });
+  }
+  const desde = dias[0];
+  const hasta = dias[dias.length - 1];
+  const incidencias = (incidenciasRec || []).filter((i) => {
+    const iHasta = i.hasta || i.desde;
+    return i.desde && iHasta && i.desde <= hasta && iHasta >= desde;
+  });
+  return { sinImputar, incompletos, incidencias };
+}
+
+function escHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function textoAHtml(t) {
+  return escHtml(t).split(/\r?\n/).join("<br/>");
+}
+
+function badgeSituacion(tipo) {
+  const estilos = {
+    incompleto: "background:#f59e0b;color:#fff",
+    sinImputar: "background:#fecaca;color:#7f1d1d",
+    incidencia: "background:#e2e8f0;color:#334155",
+  };
+  const textos = {
+    incompleto: "Faltan horas",
+    sinImputar: "Sin imputar",
+    incidencia: "Incidencia",
+  };
+  return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;${estilos[tipo] || estilos.incidencia}">${textos[tipo] || tipo}</span>`;
+}
+
+/** Tabla HTML del detalle (Outlook-friendly) + intro/cierre editables. */
+function construirAvisoHoras({ deptoNombre, desde, hasta, filas }) {
+  const th = 'style="text-align:left;padding:6px 10px;border-bottom:2px solid #cbd5e1;background:#f1f5f9;font-size:12px;white-space:nowrap"';
+  const td = 'style="padding:6px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top"';
+  const tdR = 'style="padding:6px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;vertical-align:top;font-variant-numeric:tabular-nums"';
+
+  const filasDetalle = [];
+  for (const f of filas) {
+    const quien = `${f.nombre}`;
+    const cod = f.recurso;
+    for (const x of f.incompletos) {
+      const falta = Math.round((x.jornada - x.horas) * 100) / 100;
+      filasDetalle.push({
+        nombre: quien, recurso: cod, tipo: "incompleto",
+        fecha: fmtF(x.dia), imputado: `${h(x.horas)} h`, jornada: `${h(x.jornada)} h`,
+        obs: `Faltan ${h(falta)} h para completar la jornada`,
+      });
+    }
+    for (const dia of f.sinImputar) {
+      filasDetalle.push({
+        nombre: quien, recurso: cod, tipo: "sinImputar",
+        fecha: fmtF(dia), imputado: "0 h", jornada: "—",
+        obs: "Día laborable sin ninguna hora imputada",
+      });
+    }
+    for (const i of f.incidencias) {
+      const tipoTxt = TIPOS_INCIDENCIA[i.tipo]?.txt || i.tipo;
+      const periodo = i.hasta && i.hasta !== i.desde ? `${fmtF(i.desde)} – ${fmtF(i.hasta)}` : fmtF(i.desde);
+      const extras = [
+        i.tipo === "reduccion" && i.horas ? `${i.horas} h/día` : "",
+        i.motivo || "",
+      ].filter(Boolean).join(" · ");
+      filasDetalle.push({
+        nombre: quien, recurso: cod, tipo: "incidencia",
+        fecha: periodo, imputado: "—", jornada: "—",
+        obs: extras ? `${tipoTxt} · ${extras}` : tipoTxt,
+      });
+    }
+  }
+
+  const nInc = filas.reduce((t, f) => t + f.incompletos.length, 0);
+  const nSin = filas.reduce((t, f) => t + f.sinImputar.length, 0);
+  const nCfg = filas.reduce((t, f) => t + f.incidencias.length, 0);
+
+  const resumenFilas = filas.map((f) => {
+    const partes = [];
+    if (f.incompletos.length) partes.push(`${f.incompletos.length} día(s) incompleto(s)`);
+    if (f.sinImputar.length) partes.push(`${f.sinImputar.length} sin imputar`);
+    if (f.incidencias.length) partes.push(`${f.incidencias.length} incidencia(s)`);
+    return `<tr>
+      <td ${td}><b>${escHtml(f.nombre)}</b><div style="color:#64748b;font-size:11px">${escHtml(f.recurso)}</div></td>
+      <td ${td}>${escHtml(partes.join(" · "))}</td>
+      <td ${tdR}>${f.incompletos.length || "—"}</td>
+      <td ${tdR}>${f.sinImputar.length || "—"}</td>
+      <td ${tdR}>${f.incidencias.length || "—"}</td>
+    </tr>`;
+  }).join("");
+
+  const detalleFilas = filasDetalle.map((r) => `<tr>
+    <td ${td}><b>${escHtml(r.nombre)}</b><div style="color:#64748b;font-size:11px">${escHtml(r.recurso)}</div></td>
+    <td ${td}>${badgeSituacion(r.tipo)}</td>
+    <td ${td} style="white-space:nowrap">${escHtml(r.fecha)}</td>
+    <td ${tdR}>${escHtml(r.imputado)}</td>
+    <td ${tdR}>${escHtml(r.jornada)}</td>
+    <td ${td}>${escHtml(r.obs)}</td>
+  </tr>`).join("");
+
+  const htmlDetalle = `
+<div style="margin:16px 0 8px;font-size:13px;color:#334155">
+  <b>Resumen</b> · ${filas.length} trabajador${filas.length === 1 ? "" : "es"} ·
+  ${nInc} día(s) con horas incompletas · ${nSin} día(s) sin imputar · ${nCfg} incidencia(s)
+</div>
+<table style="border-collapse:collapse;width:100%;max-width:720px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:18px">
+  <thead><tr>
+    <th ${th}>Trabajador</th>
+    <th ${th}>Qué revisar</th>
+    <th ${th} style="text-align:right">Incompletos</th>
+    <th ${th} style="text-align:right">Sin imputar</th>
+    <th ${th} style="text-align:right">Incidencias</th>
+  </tr></thead>
+  <tbody>${resumenFilas}</tbody>
+</table>
+<div style="margin:8px 0;font-size:13px;color:#334155"><b>Detalle día a día</b></div>
+<table style="border-collapse:collapse;width:100%;max-width:900px;font-family:Segoe UI,Arial,sans-serif">
+  <thead><tr>
+    <th ${th}>Trabajador</th>
+    <th ${th}>Situación</th>
+    <th ${th}>Fecha</th>
+    <th ${th} style="text-align:right">Imputado</th>
+    <th ${th} style="text-align:right">Jornada</th>
+    <th ${th}>Observación</th>
+  </tr></thead>
+  <tbody>${detalleFilas}</tbody>
+</table>
+<p style="margin:14px 0 0;font-size:12px;color:#64748b">
+  Leyenda: <span style="color:#b45309">■ Faltan horas</span> (amarillo en el cuadro) ·
+  <span style="color:#b91c1c">■ Sin imputar</span> (rojo / laborable vacío) ·
+  Incidencia = apunte de Configuración (día libre, reducción…).
+</p>`.trim();
+
+  const intro = [
+    "Buenos días,",
+    "",
+    `Os pedimos que reviséis las horas del departamento ${deptoNombre || "—"} en el periodo ${fmtF(desde)} – ${fmtF(hasta)}.`,
+    "",
+    "Abajo tenéis un resumen por trabajador y el detalle de cada día a revisar (jornada incompleta, laborable sin horas o incidencia).",
+  ].join("\n");
+
+  const cierre = [
+    "Por favor, revisadlo en Business Central (Movs. proyecto) o en Control de horas de ACSales y completad o corregid lo que corresponda.",
+    "",
+    "Gracias.",
+    "Un saludo,",
+  ].join("\n");
+
+  return { intro, cierre, htmlDetalle, nFilasDetalle: filasDetalle.length };
+}
+
+function ModalCorreoAvisoHoras({ borrador, onCerrar, onEnviado }) {
+  const [para, setPara] = useState((borrador.para || []).join("; "));
+  const [cc, setCc] = useState((borrador.cc || []).join("; "));
+  const tocadoRef = useRef(false);
+  const [asunto, setAsunto] = useState(borrador.asunto || "");
+  const [intro, setIntro] = useState(borrador.intro || "");
+  const [cierre, setCierre] = useState(borrador.cierre || "");
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState(null);
+  const [de, setDe] = useState("");
+
+  useEffect(() => {
+    let vivo = true;
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!vivo || !d.email) return;
+        setDe(d.email);
+        if (tocadoRef.current) return;
+        const aj = aplicarRemitente(borrador.para || [], borrador.cc || [], d.email);
+        setPara(aj.para.join("; "));
+        setCc(aj.cc.join("; "));
+      })
+      .catch(() => {});
+    return () => { vivo = false; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const enviar = async () => {
+    const destinatarios = emailsDeCampo(para);
+    const copias = emailsDeCampo(cc).filter((e) => !destinatarios.some((p) => p.toLowerCase() === e.toLowerCase()));
+    if (!destinatarios.length) { setError("Indica al menos un destinatario."); return; }
+    if (!asunto.trim()) { setError("Falta el asunto."); return; }
+    setEnviando(true);
+    setError(null);
+    try {
+      const cuerpoHtml = `<div style="font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;line-height:1.45">
+<p style="margin:0 0 12px">${textoAHtml(intro)}</p>
+${borrador.htmlDetalle || ""}
+<p style="margin:16px 0 0">${textoAHtml(cierre)}</p>
+</div>`;
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: destinatarios,
+          cc: copias,
+          asunto: asunto.trim(),
+          cuerpoHtml,
+          incluirFirma: true,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      onEnviado?.({ de: json.de, para: destinatarios, cc: copias, asunto: asunto.trim() });
+    } catch (err) {
+      setError(err.message || String(err));
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onCerrar}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 sticky top-0 bg-white z-10">
+          <div>
+            <div className="text-sm font-semibold text-slate-800">Avisar al responsable · Control de horas</div>
+            <div className="text-[11px] text-slate-500">
+              {borrador.deptoNombre ? `dpto. ${borrador.deptoNombre}` : "sin departamento"}
+              {borrador.nTrabajadores ? ` · ${borrador.nTrabajadores} trabajador${borrador.nTrabajadores === 1 ? "" : "es"}` : ""}
+              {borrador.nFilasDetalle ? ` · ${borrador.nFilasDetalle} líneas de detalle` : ""}
+              {de ? ` · desde ${de}` : ""}
+            </div>
+          </div>
+          <button type="button" onClick={onCerrar} className="text-slate-400 hover:text-slate-700 text-lg px-2" aria-label="Cerrar">✕</button>
+        </div>
+        <div className="px-4 py-3 space-y-3 text-sm">
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Para</span>
+            <input value={para} onChange={(e) => { tocadoRef.current = true; setPara(e.target.value); }}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px]" placeholder="email1@…; email2@…" />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Copia</span>
+            <input value={cc} onChange={(e) => { tocadoRef.current = true; setCc(e.target.value); }}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px]" placeholder="administración — se quita quien envía" />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Asunto</span>
+            <input value={asunto} onChange={(e) => setAsunto(e.target.value)}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px]" />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Introducción</span>
+            <textarea value={intro} onChange={(e) => setIntro(e.target.value)} rows={5}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] font-sans" />
+          </label>
+          <div>
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Tablas del correo (vista previa)</span>
+            <div
+              className="mt-1 max-h-72 overflow-auto border border-slate-200 rounded-md p-3 bg-slate-50 text-[12px]"
+              dangerouslySetInnerHTML={{ __html: borrador.htmlDetalle || "" }}
+            />
+          </div>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Cierre</span>
+            <textarea value={cierre} onChange={(e) => setCierre(e.target.value)} rows={4}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] font-sans" />
+          </label>
+          {error && <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
+        </div>
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-slate-200 bg-slate-50 sticky bottom-0">
+          <button type="button" onClick={onCerrar} disabled={enviando} className="text-sm px-3 py-1.5 rounded-md border border-slate-300 text-slate-700 hover:bg-white">Cancelar</button>
+          <button type="button" onClick={enviar} disabled={enviando}
+            className="text-sm font-semibold px-4 py-1.5 rounded-md text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50">
+            {enviando ? "Enviando…" : "Enviar correo"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function ControlHoras({ recursos = [], usuario = null }) {
   const veTarifas = puedeTarifasPago(usuario);
   const [datos, setDatos] = useState(null);
@@ -74,11 +371,19 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
   const [diaDetalle, setDiaDetalle] = useState(null); // { r, dias: [..], titulo }
   const [amianto, setAmianto] = useState(null); // { partes, precioDefecto, error? }
   const [verAmianto, setVerAmianto] = useState(false); // popup con lo que ha traído la API
+  const [avisoHoras, setAvisoHoras] = useState(null); // borrador del correo al responsable
+  const [elegirDeptoAviso, setElegirDeptoAviso] = useState(null); // { opciones: [{nombre, n}] } si hay varios dptos
+  // Paso 2: elegir trabajadores → { deptoNombre, filas, seleccionados: { [recurso]: true } }
+  const [elegirTrabajadoresAviso, setElegirTrabajadoresAviso] = useState(null);
+  const [avisoEnviado, setAvisoEnviado] = useState("");
   useEffect(() => {
     const esc = (e) => {
       if (e.key !== "Escape") return;
       setDiaDetalle(null);
       setVerAmianto(false);
+      setAvisoHoras(null);
+      setElegirDeptoAviso(null);
+      setElegirTrabajadoresAviso(null);
     };
     window.addEventListener("keydown", esc);
     return () => window.removeEventListener("keydown", esc);
@@ -247,6 +552,93 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
   const porSemanas = calc && calc.dias.length > 31;
   const columnas = calc ? (porSemanas ? [...new Set(calc.dias.map(lunesDe))] : calc.dias) : [];
 
+  /** Trabajadores visibles con faltas / sin imputar / incidencias de Configuración. */
+  const filasAviso = useMemo(() => {
+    if (!calc) return [];
+    return visibles.map((r) => {
+      const a = revisarAnomalias(r, calc.dias, calc.hastaReal, jornadaDia, incPorRec[r.recurso]);
+      if (!a.sinImputar.length && !a.incompletos.length && !a.incidencias.length) return null;
+      return { recurso: r.recurso, nombre: r.nombre, depto: deptoDe(r.recurso) || SIN_DEPTO, ...a };
+    }).filter(Boolean);
+  }, [calc, visibles, incPorRec, deptoListo, departamento]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function resumenCortoTrabajador(f) {
+    const partes = [];
+    if (f.incompletos.length) partes.push(`${f.incompletos.length} incompleto${f.incompletos.length === 1 ? "" : "s"}`);
+    if (f.sinImputar.length) partes.push(`${f.sinImputar.length} sin imputar`);
+    if (f.incidencias.length) partes.push(`${f.incidencias.length} incidencia${f.incidencias.length === 1 ? "" : "s"}`);
+    return partes.join(" · ") || "—";
+  }
+
+  function borradorAvisoParaDepto(deptoNombre, recursosSel = null) {
+    let filas = filasAviso.filter((f) => f.depto === deptoNombre);
+    if (recursosSel) {
+      const ok = new Set(recursosSel);
+      filas = filas.filter((f) => ok.has(f.recurso));
+    }
+    if (!filas.length || !datos) return null;
+    const codigo = codigoDepartamentoDesdeUnidad(deptoNombre === SIN_DEPTO ? "" : deptoNombre);
+    const { para, cc } = listasCorreoDepartamento(codigo);
+    const { intro, cierre, htmlDetalle, nFilasDetalle } = construirAvisoHoras({
+      deptoNombre, desde: datos.desde, hasta: datos.hasta, filas,
+    });
+    return {
+      para,
+      cc,
+      deptoNombre,
+      nTrabajadores: filas.length,
+      nFilasDetalle,
+      asunto: `Revisión horas · ${deptoNombre} · ${fmtF(datos.desde)}–${fmtF(datos.hasta)}`,
+      intro,
+      cierre,
+      htmlDetalle,
+    };
+  }
+
+  function abrirSeleccionTrabajadores(deptoNombre) {
+    const filas = filasAviso
+      .filter((f) => f.depto === deptoNombre)
+      .slice()
+      .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+    if (!filas.length) return;
+    const seleccionados = Object.fromEntries(filas.map((f) => [f.recurso, true]));
+    setElegirDeptoAviso(null);
+    setElegirTrabajadoresAviso({ deptoNombre, filas, seleccionados });
+  }
+
+  function abrirAvisoResponsable() {
+    setAvisoEnviado("");
+    setElegirTrabajadoresAviso(null);
+    setAvisoHoras(null);
+    if (!filasAviso.length) return;
+    if (deptoActivo) {
+      abrirSeleccionTrabajadores(deptoActivo);
+      return;
+    }
+    const porDep = new Map();
+    for (const f of filasAviso) porDep.set(f.depto, (porDep.get(f.depto) || 0) + 1);
+    const opciones = [...porDep.entries()]
+      .map(([nombre, n]) => ({ nombre, n }))
+      .sort((a, b) => (a.nombre === SIN_DEPTO ? 1 : b.nombre === SIN_DEPTO ? -1 : a.nombre.localeCompare(b.nombre, "es")));
+    if (opciones.length === 1) {
+      abrirSeleccionTrabajadores(opciones[0].nombre);
+      return;
+    }
+    setElegirDeptoAviso({ opciones });
+  }
+
+  function confirmarTrabajadoresAviso() {
+    if (!elegirTrabajadoresAviso) return;
+    const recursos = Object.entries(elegirTrabajadoresAviso.seleccionados)
+      .filter(([, v]) => v)
+      .map(([r]) => r);
+    if (!recursos.length) return;
+    const b = borradorAvisoParaDepto(elegirTrabajadoresAviso.deptoNombre, recursos);
+    if (!b) return;
+    setElegirTrabajadoresAviso(null);
+    setAvisoHoras(b);
+  }
+
   // Celda del día en la fila del TRABAJADOR (total del día, en color)
   function celda(r, col) {
     const diasCol = porSemanas ? calc.dias.filter((d) => lunesDe(d) === col) : [col];
@@ -357,6 +749,20 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
                 <label className="flex items-center gap-1 text-slate-600"><input type="checkbox" checked={soloPersonas} onChange={(e) => setSoloPersonas(e.target.checked)} /> Solo personas (sin máquinas)</label>
               )}
               <span className="text-xs text-slate-400">{visibles.length} trabajadores · jornada {ajustes.jornada} h{ajustes.jornadaViernes ? ` (viernes ${ajustes.jornadaViernes} h)` : ""}</span>
+              <button
+                type="button"
+                onClick={abrirAvisoResponsable}
+                disabled={!filasAviso.length}
+                title={filasAviso.length
+                  ? (deptoActivo
+                    ? `Enviar al responsable de ${deptoActivo} el listado de días incompletos, sin imputar e incidencias`
+                    : "Enviar al responsable del departamento el listado de días incompletos, sin imputar e incidencias")
+                  : "No hay días incompletos, sin imputar ni incidencias en la vista actual"}
+                className="px-3 py-1.5 rounded bg-amber-600 text-white text-sm disabled:opacity-40 hover:bg-amber-700"
+              >
+                ✉ Avisar responsable{filasAviso.length ? ` (${filasAviso.length})` : ""}
+              </button>
+              {avisoEnviado && <span className="text-xs text-emerald-700">{avisoEnviado}</span>}
               {pestana === "cuadro" && (
                 <span className="flex gap-2 text-xs">
                   <button onClick={() => setPlegados({})} className="underline text-slate-500">Desplegar todos</button>
@@ -599,6 +1005,133 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
             </div>
           )}
         </>
+      )}
+
+      {elegirDeptoAviso && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setElegirDeptoAviso(null)}>
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-slate-100">
+              <div className="text-sm font-semibold text-slate-800">¿A qué departamento avisar?</div>
+              <p className="text-[11px] text-slate-500 mt-1">Hay incidencias en varios departamentos. Elige uno para preparar el correo a sus responsables.</p>
+            </div>
+            <ul className="px-3 py-3 space-y-2 max-h-80 overflow-y-auto">
+              {elegirDeptoAviso.opciones.map((o) => (
+                <li key={o.nombre}>
+                  <button
+                    type="button"
+                    className="w-full text-left px-4 py-3 text-sm rounded-xl border border-slate-200 bg-white hover:bg-amber-50 hover:border-amber-200 flex justify-between gap-3 items-center"
+                    onClick={() => abrirSeleccionTrabajadores(o.nombre)}
+                  >
+                    <span className="font-medium text-slate-800">{o.nombre}</span>
+                    <span className="text-xs text-slate-500 shrink-0">{o.n} trabajador{o.n === 1 ? "" : "es"}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="px-5 py-3 border-t border-slate-100 flex justify-end">
+              <button type="button" onClick={() => setElegirDeptoAviso(null)} className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {elegirTrabajadoresAviso && (() => {
+        const { deptoNombre, filas, seleccionados } = elegirTrabajadoresAviso;
+        const nSel = Object.values(seleccionados).filter(Boolean).length;
+        const todos = nSel === filas.length && filas.length > 0;
+        const volverADepto = () => {
+          setElegirTrabajadoresAviso(null);
+          if (deptoActivo) return;
+          const porDep = new Map();
+          for (const f of filasAviso) porDep.set(f.depto, (porDep.get(f.depto) || 0) + 1);
+          const opciones = [...porDep.entries()]
+            .map(([nombre, n]) => ({ nombre, n }))
+            .sort((a, b) => (a.nombre === SIN_DEPTO ? 1 : b.nombre === SIN_DEPTO ? -1 : a.nombre.localeCompare(b.nombre, "es")));
+          if (opciones.length > 1) setElegirDeptoAviso({ opciones });
+        };
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setElegirTrabajadoresAviso(null)}>
+            <div className="bg-white rounded-xl shadow-xl w-full max-w-lg" onClick={(e) => e.stopPropagation()}>
+              <div className="px-5 py-4 border-b border-slate-100">
+                <div className="text-sm font-semibold text-slate-800">¿Qué trabajadores incluir en el correo?</div>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Departamento <b>{deptoNombre}</b>. Marca solo los que deben aparecer en el aviso al responsable.
+                </p>
+              </div>
+              <div className="px-5 pt-3 flex items-center justify-between gap-2 text-xs text-slate-500">
+                <span>{nSel} de {filas.length} seleccionados</span>
+                <button
+                  type="button"
+                  className="underline text-slate-600 hover:text-slate-900"
+                  onClick={() => setElegirTrabajadoresAviso((s) => ({
+                    ...s,
+                    seleccionados: Object.fromEntries(s.filas.map((f) => [f.recurso, !todos])),
+                  }))}
+                >
+                  {todos ? "Quitar todos" : "Seleccionar todos"}
+                </button>
+              </div>
+              <ul className="px-3 py-3 space-y-2 max-h-80 overflow-y-auto">
+                {filas.map((f) => {
+                  const checked = !!seleccionados[f.recurso];
+                  return (
+                    <li key={f.recurso}>
+                      <label
+                        className={`flex items-start gap-3 px-4 py-3 text-sm rounded-xl border cursor-pointer ${
+                          checked ? "border-amber-300 bg-amber-50" : "border-slate-200 bg-white hover:bg-slate-50"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          className="mt-1"
+                          checked={checked}
+                          onChange={(e) => setElegirTrabajadoresAviso((s) => ({
+                            ...s,
+                            seleccionados: { ...s.seleccionados, [f.recurso]: e.target.checked },
+                          }))}
+                        />
+                        <span className="flex-1 min-w-0">
+                          <span className="font-medium text-slate-800 block truncate">{f.nombre}</span>
+                          <span className="text-[11px] text-slate-500">{f.recurso} · {resumenCortoTrabajador(f)}</span>
+                        </span>
+                      </label>
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="px-5 py-3 border-t border-slate-100 flex justify-between gap-2">
+                <button type="button" onClick={volverADepto} className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50">
+                  {deptoActivo ? "Cancelar" : "Atrás"}
+                </button>
+                <div className="flex gap-2">
+                  {!deptoActivo && (
+                    <button type="button" onClick={() => setElegirTrabajadoresAviso(null)} className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50">Cancelar</button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={!nSel}
+                    onClick={confirmarTrabajadoresAviso}
+                    className="text-sm font-semibold px-4 py-1.5 rounded-lg text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-40"
+                  >
+                    Siguiente
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {avisoHoras && (
+        <ModalCorreoAvisoHoras
+          borrador={avisoHoras}
+          onCerrar={() => setAvisoHoras(null)}
+          onEnviado={({ para }) => {
+            setAvisoHoras(null);
+            setAvisoEnviado(`Correo enviado a ${para.join(", ")}`);
+            setTimeout(() => setAvisoEnviado(""), 5000);
+          }}
+        />
       )}
 
       {verAmianto && (

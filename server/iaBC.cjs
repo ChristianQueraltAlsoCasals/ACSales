@@ -261,7 +261,64 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
         required: ["displayName", "cat1", "cat2", "cat3", "descripcion"],
       },
     },
+    {
+      name: "crear_tarea",
+      description:
+        "Crea una tarea en «Mis tareas» / Calendario de ACSales (navegador de Maria). Úsala SIEMPRE que pida añadir, crear o apuntar una tarea, recordatorio o pendiente (también si viene de un correo o captura). Se aplica sola al instante: NO digas que no tienes acceso. Si es recurrente (mensual, semanal…), pon periodicidad y la próxima fecha límite.",
+      input_schema: {
+        type: "object",
+        properties: {
+          titulo: { type: "string", description: "Título corto y claro de la tarea" },
+          prioridad: { type: "string", enum: ["alta", "media", "baja"] },
+          fecha: { type: "string", description: "Fecha límite YYYY-MM-DD (próxima ocurrencia si es periódica)" },
+          notas: { type: "string", description: "Detalle, OT, importes, cliente…" },
+          periodicidad: { type: "string", description: "Ej. mensual, semanal, anual; vacío si es puntual" },
+        },
+        required: ["titulo"],
+      },
+    },
+    {
+      name: "crear_evento",
+      description:
+        "Crea un evento en el Calendario de ACSales (cita, reunión, recordatorio con hora). Se aplica sola. Distinto de crear_tarea (checklist).",
+      input_schema: {
+        type: "object",
+        properties: {
+          titulo: { type: "string" },
+          fecha: { type: "string", description: "YYYY-MM-DD" },
+          hora: { type: "string", description: "HH:MM opcional" },
+          notas: { type: "string" },
+        },
+        required: ["titulo", "fecha"],
+      },
+    },
+    {
+      name: "abrir_pantalla",
+      description:
+        "Abre una pantalla de ACSales para Maria. Ids: cargar, memoria, explorador, recepcion, facturascompra, precios, pedidosventa, facturasventa, analisiscliente, simuladortarifas, correo, tareas, calendario, ia, ratios, horas.",
+      input_schema: {
+        type: "object",
+        properties: {
+          pantalla: { type: "string", description: "Id de la pantalla (ej. tareas, calendario, correo)" },
+        },
+        required: ["pantalla"],
+      },
+    },
+    {
+      name: "marcar_tarea",
+      description: "Marca una tarea existente como hecha o pendiente. Usa el id que aparece en el contexto de tareas del navegador.",
+      input_schema: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Id de la tarea" },
+          hecha: { type: "boolean", description: "true = hecha, false = pendiente" },
+        },
+        required: ["id"],
+      },
+    },
   ];
+
+  const HERRAMIENTAS_APP = new Set(["crear_tarea", "crear_evento", "abrir_pantalla", "marcar_tarea"]);
 
   function esRecursoProducto(recurso) {
     const r = String(recurso || "").toLowerCase();
@@ -329,7 +386,7 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
   // botón seleccionado). Cualquier otra empresa que pida la IA se rechaza.
   async function ejecutarHerramienta(nombre, entradaOriginal, empresaFija, ctx = {}) {
     const entrada = { ...(entradaOriginal || {}) };
-    if (empresaFija && nombre !== "buscar_gocatalog" && nombre !== "proponer_producto") {
+    if (empresaFija && nombre !== "buscar_gocatalog" && nombre !== "proponer_producto" && !HERRAMIENTAS_APP.has(nombre)) {
       if (entrada.empresa) {
         const pedida = await resolverEmpresa(entrada.empresa).catch(() => null);
         if (!pedida || pedida.id !== empresaFija.id) {
@@ -339,6 +396,56 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
       entrada.empresa = empresaFija.id;
     }
     switch (nombre) {
+      case "crear_tarea": {
+        const titulo = String(entradaOriginal?.titulo || "").trim();
+        if (!titulo) throw new Error("Falta el título de la tarea.");
+        const prioridad = ["alta", "media", "baja"].includes(entradaOriginal?.prioridad) ? entradaOriginal.prioridad : "media";
+        const fecha = String(entradaOriginal?.fecha || "").trim().slice(0, 10);
+        const notas = String(entradaOriginal?.notas || "").trim();
+        const periodicidad = String(entradaOriginal?.periodicidad || "").trim();
+        return {
+          accionApp: true,
+          tipo: "crear_tarea",
+          titulo,
+          prioridad,
+          fecha,
+          notas,
+          periodicidad,
+          mensaje: "Tarea preparada: el navegador de Maria la guardará ahora en Mis tareas. Confirma en una frase que ya está creada (no digas que no tienes acceso).",
+        };
+      }
+      case "crear_evento": {
+        const titulo = String(entradaOriginal?.titulo || "").trim();
+        if (!titulo) throw new Error("Falta el título del evento.");
+        const fecha = String(entradaOriginal?.fecha || "").trim().slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) throw new Error("La fecha del evento debe ser YYYY-MM-DD.");
+        return {
+          accionApp: true,
+          tipo: "crear_evento",
+          titulo,
+          fecha,
+          hora: String(entradaOriginal?.hora || "").trim().slice(0, 5),
+          notas: String(entradaOriginal?.notas || "").trim(),
+          mensaje: "Evento preparado: el calendario del navegador lo guardará ahora.",
+        };
+      }
+      case "abrir_pantalla": {
+        const pantalla = String(entradaOriginal?.pantalla || "").trim();
+        const ids = ["cargar", "memoria", "explorador", "recepcion", "facturascompra", "precios", "pedidosventa", "facturasventa", "analisiscliente", "simuladortarifas", "correo", "tareas", "calendario", "ia", "ratios", "horas"];
+        if (!ids.includes(pantalla)) throw new Error(`Pantalla desconocida «${pantalla}». Usa una de: ${ids.join(", ")}`);
+        return { accionApp: true, tipo: "abrir_pantalla", pantalla, mensaje: `Se abrirá la pantalla «${pantalla}».` };
+      }
+      case "marcar_tarea": {
+        const id = String(entradaOriginal?.id ?? "").trim();
+        if (!id) throw new Error("Falta el id de la tarea.");
+        return {
+          accionApp: true,
+          tipo: "marcar_tarea",
+          id,
+          hecha: entradaOriginal?.hecha !== false,
+          mensaje: "Se actualizará la tarea en el navegador.",
+        };
+      }
       case "guardar_regla": {
         const texto = String(entradaOriginal?.texto || "").trim();
         if (!texto) throw new Error("La regla está vacía.");
@@ -575,7 +682,9 @@ Qué puedes hacer:
 - EMPRESA DE ESTA CONVERSACIÓN: ${empresaFija.nombre}. SOLO puedes consultar y modificar esta empresa (excepto altas de producto, que van a Also+Ferros+App vía ACFactory). Si te piden algo de otra empresa (ALSO CASALS, FERROSCA o QUIMLAB), di que cambie de empresa con los botones de abajo de la pantalla.` : " Si no te dicen empresa, usa ALSO CASALS."}
 - Proponer cambios (modificar campos o crear registros/líneas) con proponer_cambio. NUNCA se aplican solos: Maria verá una tarjeta y pulsará «Aplicar». Por eso, tras proponer, di "te he preparado el cambio, revísalo y pulsa Aplicar" — nunca digas que ya está hecho.
 - CREAR PRODUCTOS/ARTÍCULOS: SOLO con proponer_producto (ACFactory → Also + Ferros + App). NUNCA uses proponer_cambio ni crees en 'items'. NO edites ni borres productos desde aquí (eso es ACFactory).
-- NO puedes borrar registros, ni registrar/postear documentos, ni lanzar acciones de BC. Si te lo piden, explica que eso se hace en BC directamente.
+- APP ACSALES (pantallas del Agente de Ventas): SÍ tienes acceso. Herramientas crear_tarea, crear_evento, abrir_pantalla, marcar_tarea se ejecutan en el navegador de Maria al instante. NUNCA digas que no tienes acceso a las tareas, al calendario o a las pantallas. Si pide «añade una tarea», «apúntame esto», «recuérdame», «crea un evento» o «abre Correo/Calendario/…», LLAMA YA a la herramienta correspondiente (no te limites a sugerir el texto para que ella lo copie). Si la tarea es mensual/periódica, usa periodicidad y la próxima fecha límite. Tras crear, confirma en una frase qué has creado.
+- El contexto del mensaje puede incluir el texto de la pantalla actual y un resumen de tareas/eventos del navegador: úsalo.
+- NO puedes borrar registros de BC, ni registrar/postear documentos, ni lanzar acciones de BC. Si te lo piden, explica que eso se hace en BC directamente.
 
 ${bloqueReglas}${bloqueDatosEmpresasGrupo()}Aprender: cuando Maria te enseñe una forma de hacer algo que se repite («a partir de ahora…», «siempre…», «recuerda…», o te corrija algo que seguramente querrá igual la próxima vez), guárdalo con guardar_regla y díselo en una frase («📌 Apuntado: …»). Si solo es para este caso, no lo guardes.
 
@@ -622,9 +731,10 @@ Cómo trabajar:
     );
     // Contexto de la pantalla desde la que se pregunta (botón flotante 🤖) — 24/09/2026
     const ctx = req.body?.contexto;
+    const bloqueApp = ctx?.app ? `\nEstado de la app en el navegador de Maria:\n${String(ctx.app).slice(0, 6000)}\n` : "";
     const textoCtx = ctx && ctx.pantalla
-      ? `[Contexto automático: Maria te escribe desde la pantalla «${String(ctx.pantalla).slice(0, 80)}» del Agente de Ventas. Esto es lo que tiene en pantalla ahora mismo (texto, puede estar recortado):\n"""\n${String(ctx.texto || "").slice(0, 9000)}\n"""\nÚsalo para entender a qué se refiere ("este pedido", "esta OT", "estos datos"…). Si necesitas más datos, consulta BC.]\n\n`
-      : "";
+      ? `[Contexto automático: Maria te escribe desde la pantalla «${String(ctx.pantalla).slice(0, 80)}» del Agente de Ventas.${bloqueApp}Esto es lo que tiene en pantalla ahora mismo (texto, puede estar recortado):\n"""\n${String(ctx.texto || "").slice(0, 9000)}\n"""\nÚsalo para entender a qué se refiere ("este pedido", "esta OT", "estos datos"…). Si pide crear tareas/eventos o abrir pantallas, USA las herramientas de la app. Si necesitas más datos de BC, consulta BC.]\n\n`
+      : (bloqueApp ? `[Contexto app ACSales]\n${bloqueApp}\n` : "");
     const contenidoUsuario = imagenes.length
       ? [
           ...imagenes.map((im) => ({ type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } })),
@@ -633,6 +743,7 @@ Cómo trabajar:
       : textoCtx + mensaje;
     const msgs = [...previo, { role: "user", content: contenidoUsuario }];
     const propuestos = [];
+    const accionesApp = [];
     const pasos = [];
     try {
       for (let vuelta = 0; vuelta < 10; vuelta++) {
@@ -667,6 +778,9 @@ Cómo trabajar:
                 propuestos.push(publico);
               }
             }
+            if (salida?.accionApp) {
+              accionesApp.push({ ...salida });
+            }
             contenido = recortar(salida);
             pasos.push({ herramienta: u.name, entrada: u.input, ok: true });
           } catch (e) {
@@ -680,7 +794,7 @@ Cómo trabajar:
       }
       const ultimo = msgs[msgs.length - 1];
       const texto = ultimo.role === "assistant" ? (ultimo.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim() : "";
-      res.json({ texto, cambios: propuestos, pasos, historial: msgs.map(sinImagenes) });
+      res.json({ texto, cambios: propuestos, accionesApp, pasos, historial: msgs.map(sinImagenes) });
     } catch (err) {
       console.error("Error /api/ia-bc/chat:", err);
       res.status(500).json({ error: "Error hablando con la IA.", detalle: String(err.message || err) });

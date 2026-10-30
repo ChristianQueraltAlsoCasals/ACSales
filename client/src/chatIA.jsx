@@ -13,6 +13,7 @@
  */
 import React, { useState, useEffect, useRef } from "react";
 import { Send, CheckCircle2, X, RefreshCw, Trash2, History, Bot, Paperclip, Eye, ExternalLink, Pin, Pencil, MessageSquare, Plus, ClipboardCopy } from "lucide-react";
+import { aplicarAccionesApp, snapshotAppParaIA } from "./accionesAppIA.js";
 
 function esSeparadorTabla(linea) {
   return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(linea);
@@ -613,16 +614,27 @@ export default function ChatIA() {
       const r = await fetch("/api/ia-bc/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mensaje: texto, historial, empresa: empresa.id, imagenes: imgs.map((i) => ({ media_type: i.media_type, data: i.data })) }),
+        body: JSON.stringify({
+          mensaje: texto,
+          historial,
+          empresa: empresa.id,
+          imagenes: imgs.map((i) => ({ media_type: i.media_type, data: i.data })),
+          contexto: { pantalla: "Asistente IA", texto: "", app: snapshotAppParaIA() },
+        }),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — ") || `Error ${r.status}`);
       setHistorial(j.historial || []);
       if ((j.pasos || []).some((p) => /regla/.test(p.herramienta) && p.ok)) cargarReglas();
-      setMensajes((m) => [
-        ...m,
-        { rol: "ia", texto: j.texto || (j.cambios?.length ? "Te he preparado el cambio: revísalo y pulsa «Aplicar en BC»." : "(sin respuesta)"), pasos: j.pasos || [], cambios: j.cambios || [] },
-      ]);
+      const { mensajes: msgsApp } = aplicarAccionesApp(j.accionesApp || [], {});
+      setMensajes((m) => {
+        const next = [
+          ...m,
+          { rol: "ia", texto: j.texto || (j.cambios?.length ? "Te he preparado el cambio: revísalo y pulsa «Aplicar en BC»." : (msgsApp.length ? msgsApp.join(" · ") : "(sin respuesta)")), pasos: j.pasos || [], cambios: j.cambios || [] },
+        ];
+        if (msgsApp.length) next.push({ rol: "sistema", texto: `✓ ${msgsApp.join(" · ")}` });
+        return next;
+      });
     } catch (e) {
       setMensajes((m) => [...m, { rol: "ia", texto: `✗ ${e.message || e}`, error: true }]);
     }

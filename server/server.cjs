@@ -6570,6 +6570,15 @@ require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep
 require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL });
 require("./teamsChatbot.cjs")({ app, db, obtenerTokenGraph, fetchConReintento });
 require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa });
+require("./albaranVentaCorreo.cjs").registrarRutas({
+  app,
+  obtenerTokenBC,
+  obtenerTokenGraph,
+  fetchConReintento,
+  EMPRESA_ID,
+  EMPRESA_NOMBRE,
+  buzonDelUsuario,
+});
 const informePedidosPendientes = require("./informePedidosPendientes.cjs");
 const informeHoras = require("./informeHoras.cjs");
 

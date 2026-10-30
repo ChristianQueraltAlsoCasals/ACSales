@@ -3,8 +3,38 @@
  *
  * Bandeja del usuario logueado (email_empresa de AChuman), no un buzón fijo.
  */
-import React, { useState, useEffect, useCallback } from "react";
-import { RefreshCw, Search, Mail, Paperclip, ArrowLeft, ChevronLeft, ChevronRight, Sparkles, CheckSquare } from "lucide-react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { RefreshCw, Search, Mail, Paperclip, ArrowLeft, ChevronLeft, ChevronRight, Sparkles, CheckSquare, X } from "lucide-react";
+
+const EXTENSIONES_ADJUNTO = new Set(["pdf", "png", "jpg", "jpeg", "doc", "docx", "xls", "xlsx"]);
+const TOPE_FICHERO = 3 * 1024 * 1024;
+const TOPE_TOTAL = 10 * 1024 * 1024;
+const MAX_ADJUNTOS = 10;
+
+function extensionFichero(nombre) {
+  const s = String(nombre || "");
+  const i = s.lastIndexOf(".");
+  return i >= 0 ? s.slice(i + 1).toLowerCase() : "";
+}
+
+function leerFicheroAdjunto(file) {
+  return new Promise((resolve, reject) => {
+    const lector = new FileReader();
+    lector.onload = () => {
+      const raw = String(lector.result || "");
+      const coma = raw.indexOf(",");
+      resolve({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        nombre: file.name,
+        mime: file.type || "",
+        base64: coma >= 0 ? raw.slice(coma + 1) : "",
+        bytes: file.size,
+      });
+    };
+    lector.onerror = () => reject(new Error(`No s'ha pogut llegir ${file.name}`));
+    lector.readAsDataURL(file);
+  });
+}
 
 const FIRMA_SALUDO = "Salutacions / Saludos / Best Regards.";
 const FIRMA_LEGAL = "D'acord amb el que estableix la Llei Orgànica 15/1999, de 13 de desembre, de Protecció de Dades de Caràcter Personal, els informem que les dades que figuren en aquesta comunicació estan incloses en un fitxer propietat de ALSOCASALS INSTAL·LACIONS, S.L..\n\nPer poder exercir els drets d'accés, rectificació, cancel·lació o oposició podran dirigir-se, en qualsevol moment a l'empresa, a la següent adreça: C/ BARCELONA, 74 43500, TORTOSA o mitjançant correu electrònic a xavi.also@alsocasals.com. Aquest missatge, i en el seu cas els fitxers adjunts, són confidencials, especialment en el que respecta a les dades personals, i es dirigeixen exclusivament al destinatari referenciat. Si vostè no és el destinatari i l'ha rebut per error o té coneixement del mateix per qualsevol motiu, li preguem que ens ho comuniqui per aquest mitjà i procedeixi a esborrar-lo, i que en tot cas, s'abstingui d'utilitzar, reproduir, alterar, arxivar o comunicar a tercers el present missatge i fitxers adjunts, podent incórrer en responsabilitats legals.";
@@ -122,6 +152,9 @@ export default function Correo({ onCrearTarea, usuario = null }) {
   const [recDescartada, setRecDescartada] = useState(false);
   const [enviando, setEnviando] = useState(false);
   const [confirmarEnvio, setConfirmarEnvio] = useState(false);
+  const [adjuntos, setAdjuntos] = useState([]);
+  const inputAdjuntoRef = useRef(null);
+  const [albaran, setAlbaran] = useState(null); // null | { fase, propuesta, resultado, error }
   const [aviso, setAviso] = useState(null);
   const [accionBc, setAccionBc] = useState("");
   const [errorAccion, setErrorAccion] = useState(null);
@@ -137,7 +170,7 @@ export default function Correo({ onCrearTarea, usuario = null }) {
       .catch(() => {});
   }, []);
 
-  const abrirCompositor = (modo, msg, textoInicial = "") => {
+  const abrirCompositor = (modo, msg, textoInicial = "", adjuntosIniciales = []) => {
     setCompo({
       modo,
       original: msg ? `De: ${msg.deNombre || msg.de}\nAssumpte: ${msg.asunto}\n\n${(msg.tipoCuerpo === "html" ? msg.cuerpo.replace(/<[^>]+>/g, " ") : msg.cuerpo) || msg.preview || ""}` : "",
@@ -147,7 +180,54 @@ export default function Correo({ onCrearTarea, usuario = null }) {
     });
     setInstrucciones(""); setBorrador(textoInicial || ""); setErrCompo(null);
     setTono("cercano"); setIdioma("auto");
-    setConfirmarEnvio(false); setEnviando(false);
+    setConfirmarEnvio(false); setEnviando(false); setAdjuntos(adjuntosIniciales || []);
+  };
+
+  const anadirAdjuntos = async (lista) => {
+    const files = Array.from(lista || []);
+    if (!files.length) return;
+    const rechazados = [];
+    const aceptados = [];
+    let suma = adjuntos.reduce((n, a) => n + (a.bytes || 0), 0);
+    let cuenta = adjuntos.length;
+    const avisoTope = "Els adjunts junts no poden passar de 10 MB.";
+    for (const f of files) {
+      if (cuenta >= MAX_ADJUNTOS) {
+        rechazados.push("Màxim 10 adjunts per correu.");
+        break;
+      }
+      if (!EXTENSIONES_ADJUNTO.has(extensionFichero(f.name))) {
+        rechazados.push(`«${f.name}» no és PDF, foto, Excel ni Word.`);
+        continue;
+      }
+      if (!f.size) {
+        rechazados.push(`«${f.name}» està buit.`);
+        continue;
+      }
+      if (f.size > TOPE_FICHERO) {
+        rechazados.push(`«${f.name}» pesa més de 3 MB.`);
+        continue;
+      }
+      if (suma + f.size > TOPE_TOTAL) {
+        if (!rechazados.includes(avisoTope)) rechazados.push(avisoTope);
+        continue;
+      }
+      suma += f.size;
+      cuenta += 1;
+      aceptados.push(f);
+    }
+    try {
+      const leidos = [];
+      for (const f of aceptados) leidos.push(await leerFicheroAdjunto(f));
+      if (leidos.length) {
+        setAdjuntos((prev) => [...prev, ...leidos]);
+        setConfirmarEnvio(false);
+      }
+      setErrCompo(rechazados.length ? rechazados.join(" ") : null);
+    } catch (err) {
+      setErrCompo(err.message || String(err));
+    }
+    if (inputAdjuntoRef.current) inputAdjuntoRef.current.value = "";
   };
 
   const enviarCorreu = async () => {
@@ -167,6 +247,9 @@ export default function Correo({ onCrearTarea, usuario = null }) {
           cuerpoHtml: htmlPerEnviar(borrador),
           incluirFirma: true,
           respuestaA: compo.modo === "responder" ? (compo.respuestaA || "") : "",
+          ...(adjuntos.length
+            ? { adjuntos: adjuntos.map(({ nombre, base64, mime }) => ({ nombre, base64, mime })) }
+            : {}),
         }),
       });
       const d = await r.json().catch(() => ({}));
@@ -183,6 +266,64 @@ export default function Correo({ onCrearTarea, usuario = null }) {
     } finally {
       setEnviando(false);
     }
+  };
+
+  const proponerAlbaranVenta = async () => {
+    if (!abierto?.id) return;
+    setAlbaran({ fase: "leyendo", propuesta: null, resultado: null, error: null });
+    try {
+      const r = await fetch("/api/correo/albaran-venta/proponer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messageId: abierto.id,
+          asunto: abierto.asunto || "",
+          cuerpo: abierto.cuerpo || "",
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || "No s'ha pogut llegir la OC.");
+      setAlbaran({ fase: "propuesta", propuesta: d.propuesta, resultado: null, error: null });
+    } catch (err) {
+      setAlbaran({ fase: "error", propuesta: null, resultado: null, error: err.message || String(err) });
+    }
+  };
+
+  const crearAlbaranVenta = async () => {
+    if (!albaran?.propuesta) return;
+    setAlbaran((prev) => ({ ...prev, fase: "creando", error: null }));
+    try {
+      const r = await fetch("/api/correo/albaran-venta/crear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ propuesta: albaran.propuesta }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || "No s'ha pogut crear el pedido / albarà.");
+      setAlbaran({ fase: "hecho", propuesta: albaran.propuesta, resultado: d, error: null });
+    } catch (err) {
+      setAlbaran((prev) => ({ ...prev, fase: "propuesta", error: err.message || String(err) }));
+    }
+  };
+
+  const responderAmbAlbaran = () => {
+    const res = albaran?.resultado;
+    if (!res?.pdf?.base64 || !abierto) return;
+    const oc = res.ocCliente || albaran.propuesta?.ocCliente || "";
+    const texto =
+      `Bon dia,\n\n` +
+      `Us adjuntem l'albarà corresponent a la vostra ordre de compra ${oc}` +
+      (albaran.propuesta?.oferta ? ` (oferta ${albaran.propuesta.oferta})` : "") +
+      `.\n\nQualsevol dubte, no dubteu en contactar-nos.`;
+    abrirCompositor("responder", abierto, texto, [{
+      id: `alb-${Date.now()}`,
+      nombre: res.pdf.nombre || `Albaran_${res.pedido}.pdf`,
+      mime: res.pdf.mime || "application/pdf",
+      base64: res.pdf.base64,
+      bytes: res.pdf.bytes || 0,
+    }]);
+    setAlbaran(null);
+    setAviso(`Albarà ${res.pedido} preparat. Revisa el correu i envia'l.`);
   };
 
   const prepararDocumentBc = async (accion, clave, pista) => {
@@ -306,6 +447,133 @@ export default function Correo({ onCrearTarea, usuario = null }) {
     }
   };
 
+  const modalAlbaran = albaran && (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={() => { if (albaran.fase !== "creando" && albaran.fase !== "leyendo") setAlbaran(null); }}>
+      <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[92vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between p-4 border-b border-slate-200">
+          <div className="text-sm font-bold text-slate-800">Albarà de venda des del correu</div>
+          <button type="button" disabled={albaran.fase === "creando" || albaran.fase === "leyendo"} onClick={() => setAlbaran(null)} className="text-slate-400 hover:text-slate-600 p-1 disabled:opacity-40">✕</button>
+        </div>
+        <div className="p-4 space-y-3 text-[13px]">
+          {(albaran.fase === "leyendo" || albaran.fase === "creando") && (
+            <p className="text-slate-500">
+              {albaran.fase === "leyendo" ? "Llegint els PDFs adjunts i preparant el pedido de venta…" : "Creant el PV a BC, registrant l'enviament i baixant el PDF de l'albarà…"}
+            </p>
+          )}
+          {albaran.error && <div className="text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-md p-2">{albaran.error}</div>}
+          {albaran.propuesta && (albaran.fase === "propuesta" || albaran.fase === "creando") && (
+            <>
+              <div className="grid grid-cols-[120px_1fr] gap-x-2 gap-y-1">
+                <span className="text-slate-500">OC client</span>
+                <input
+                  value={albaran.propuesta.ocCliente || ""}
+                  disabled={albaran.fase === "creando"}
+                  onChange={(e) => setAlbaran((p) => ({ ...p, propuesta: { ...p.propuesta, ocCliente: e.target.value, comentarioOc: `Orden de comp. ${e.target.value}` } }))}
+                  className="border border-slate-300 rounded px-2 py-1"
+                />
+                <span className="text-slate-500">Oferta</span>
+                <input
+                  value={albaran.propuesta.oferta || ""}
+                  disabled={albaran.fase === "creando"}
+                  onChange={(e) => setAlbaran((p) => ({ ...p, propuesta: { ...p.propuesta, oferta: e.target.value } }))}
+                  className="border border-slate-300 rounded px-2 py-1"
+                />
+                <span className="text-slate-500">Client BC</span>
+                <span className="font-medium text-slate-800">
+                  {albaran.propuesta.clienteBc
+                    ? `${albaran.propuesta.clienteBc.number} · ${albaran.propuesta.clienteBc.name}`
+                    : `${albaran.propuesta.clienteNombre || "—"} (${albaran.propuesta.clienteCif || "sense CIF"})`}
+                </span>
+                <span className="text-slate-500">Compte / venedor</span>
+                <span>70000000 · MRC</span>
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold text-slate-500 mb-1">Comentaris</div>
+                <input
+                  value={albaran.propuesta.comentarioOc || ""}
+                  disabled={albaran.fase === "creando"}
+                  onChange={(e) => setAlbaran((p) => ({ ...p, propuesta: { ...p.propuesta, comentarioOc: e.target.value } }))}
+                  className="w-full border border-slate-300 rounded px-2 py-1 mb-1"
+                />
+                <input
+                  value={albaran.propuesta.comentarioTrabajo || ""}
+                  disabled={albaran.fase === "creando"}
+                  onChange={(e) => setAlbaran((p) => ({ ...p, propuesta: { ...p.propuesta, comentarioTrabajo: e.target.value } }))}
+                  className="w-full border border-slate-300 rounded px-2 py-1"
+                />
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold text-slate-500 mb-1">Línies (compte 70000000 · cant. 1)</div>
+                <ul className="border border-slate-200 rounded-md divide-y divide-slate-100">
+                  {(albaran.propuesta.lineas || []).map((l, i) => (
+                    <li key={i} className="flex gap-2 items-center px-2 py-1.5">
+                      <input
+                        value={l.descripcion}
+                        disabled={albaran.fase === "creando"}
+                        onChange={(e) => setAlbaran((p) => {
+                          const lineas = [...p.propuesta.lineas];
+                          lineas[i] = { ...lineas[i], descripcion: e.target.value };
+                          return { ...p, propuesta: { ...p.propuesta, lineas } };
+                        })}
+                        className="flex-1 border border-slate-200 rounded px-2 py-1"
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={l.importe}
+                        disabled={albaran.fase === "creando"}
+                        onChange={(e) => setAlbaran((p) => {
+                          const lineas = [...p.propuesta.lineas];
+                          lineas[i] = { ...lineas[i], importe: Number(e.target.value) };
+                          const total = Math.round(lineas.reduce((s, x) => s + (Number(x.importe) || 0), 0) * 100) / 100;
+                          return { ...p, propuesta: { ...p.propuesta, lineas, total } };
+                        })}
+                        className="w-24 border border-slate-200 rounded px-2 py-1 text-right"
+                      />
+                    </li>
+                  ))}
+                </ul>
+                <div className="text-right font-semibold mt-1">Total {Number(albaran.propuesta.total || 0).toLocaleString("es-ES", { minimumFractionDigits: 2 })} €</div>
+              </div>
+              <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-md p-2">
+                En confirmar se crearà el pedido de venta a BC, es registrarà només l'enviament (sense factura) i es baixarà el PDF de l'albarà.
+              </p>
+              <div className="flex justify-end gap-2">
+                <button type="button" disabled={albaran.fase === "creando"} onClick={() => setAlbaran(null)} className="text-sm border border-slate-300 rounded-md px-3 py-2 hover:bg-slate-50 disabled:opacity-50">Cancel·lar</button>
+                <button type="button" disabled={albaran.fase === "creando" || !albaran.propuesta.clienteBc} onClick={crearAlbaranVenta} className="text-sm font-semibold text-white bg-slate-800 hover:bg-slate-900 disabled:opacity-50 rounded-md px-4 py-2">
+                  {albaran.fase === "creando" ? "Creant a BC…" : "Crear i registrar a BC"}
+                </button>
+              </div>
+            </>
+          )}
+          {albaran.fase === "hecho" && albaran.resultado && (
+            <>
+              <div className="text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-md p-3 space-y-1">
+                <div>✓ Pedido <strong>{albaran.resultado.pedido}</strong> · Albarà <strong>{albaran.resultado.albaran}</strong></div>
+                <div>Client: {albaran.resultado.cliente?.number} · {albaran.resultado.cliente?.name}</div>
+                <div>OC: {albaran.resultado.ocCliente} · PDF: {albaran.resultado.pdf?.nombre}</div>
+                {(albaran.resultado.avisos || []).length > 0 && (
+                  <div className="text-amber-800 text-[12px]">{albaran.resultado.avisos.join(" · ")}</div>
+                )}
+              </div>
+              <div className="flex justify-end gap-2">
+                <button type="button" onClick={() => setAlbaran(null)} className="text-sm border border-slate-300 rounded-md px-3 py-2 hover:bg-slate-50">Tancar</button>
+                <button type="button" onClick={responderAmbAlbaran} className="text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-md px-4 py-2">
+                  Respondre amb l'albarà adjunt
+                </button>
+              </div>
+            </>
+          )}
+          {albaran.fase === "error" && !albaran.propuesta && (
+            <div className="flex justify-end">
+              <button type="button" onClick={() => setAlbaran(null)} className="text-sm border border-slate-300 rounded-md px-3 py-2 hover:bg-slate-50">Tancar</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
   const modalCompositor = compo && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={() => setCompo(null)}>
           <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full max-h-[92vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
@@ -378,6 +646,45 @@ export default function Correo({ onCrearTarea, usuario = null }) {
                 />
                 <div className="mt-3"><BloqueFirma /></div>
               </div>
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[12px] font-semibold text-slate-600">Adjunts</span>
+                  <button
+                    type="button"
+                    onClick={() => inputAdjuntoRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 text-sm rounded-md px-3 py-1.5 border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                  >
+                    <Paperclip size={14} /> Adjuntar
+                  </button>
+                  <span className="text-[10px] text-slate-400">PDF, foto (JPG o PNG), Excel o Word. Cadascun fins a 3 MB.</span>
+                  <input
+                    ref={inputAdjuntoRef}
+                    type="file"
+                    multiple
+                    accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx"
+                    className="hidden"
+                    onChange={(e) => anadirAdjuntos(e.target.files)}
+                  />
+                </div>
+                {adjuntos.length > 0 && (
+                  <ul className="flex flex-wrap gap-1.5 mt-2">
+                    {adjuntos.map((a) => (
+                      <li key={a.id} className="inline-flex items-center gap-1 text-[12px] bg-slate-50 border border-slate-200 rounded px-2 py-1">
+                        <Paperclip size={12} className="text-slate-400 shrink-0" />
+                        <span className="max-w-[260px] truncate" title={a.nombre}>{a.nombre}</span>
+                        <button
+                          type="button"
+                          onClick={() => { setAdjuntos((prev) => prev.filter((x) => x.id !== a.id)); setConfirmarEnvio(false); }}
+                          className="text-slate-400 hover:text-red-600"
+                          aria-label={`Treure ${a.nombre}`}
+                        >
+                          <X size={12} />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
               <div className="flex items-center gap-2 justify-end">
                 <button
                   onClick={() => { copiarConFirma(borrador); }}
@@ -397,7 +704,7 @@ export default function Correo({ onCrearTarea, usuario = null }) {
               </div>
               {confirmarEnvio && !enviando && (
                 <p className="text-[12px] text-amber-700 text-right">
-                  S'enviarà{buzon ? ` des de ${buzon}` : ""} a {compo.para}. Torna a prémer per confirmar.
+                  S'enviarà{buzon ? ` des de ${buzon}` : ""} a {compo.para}{adjuntos.length ? `, amb ${adjuntos.length} adjunt${adjuntos.length > 1 ? "s" : ""}` : ""}. Torna a prémer per confirmar.
                 </p>
               )}
             </div>
@@ -412,6 +719,8 @@ export default function Correo({ onCrearTarea, usuario = null }) {
     const siguiente = indiceAbierto >= 0 && indiceAbierto < mensajes.length - 1 ? mensajes[indiceAbierto + 1] : null;
     return (
       <div>
+        {modalCompositor}
+        {modalAlbaran}
         {aviso && <div className="mb-3 text-[13px] text-green-800 bg-green-50 border border-green-200 rounded-md px-3 py-2">{aviso}</div>}
         <div className="flex items-center justify-between gap-3 mb-4">
           <button onClick={() => setAbierto(null)} className="flex items-center gap-1 text-sm text-blue-700 hover:underline">
@@ -438,9 +747,18 @@ export default function Correo({ onCrearTarea, usuario = null }) {
             </button>
           </div>
         </div>
-        <div className="mb-3 flex gap-2">
+        <div className="mb-3 flex flex-wrap gap-2">
           <button onClick={() => abrirCompositor("responder", abierto)} className="flex items-center gap-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-md px-4 py-2">
             <Sparkles size={15} /> Respondre amb ajuda de Claude
+          </button>
+          <button
+            type="button"
+            onClick={proponerAlbaranVenta}
+            disabled={albaran?.fase === "leyendo" || albaran?.fase === "creando"}
+            className="flex items-center gap-2 text-sm font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 rounded-md px-4 py-2"
+            title="Llegeix l'OC adjunta, crea el pedido de venta a BC, el registra i treu el PDF de l'albarà"
+          >
+            <Paperclip size={15} /> Preparar albarà de venda
           </button>
           {onCrearTarea && (
             <button

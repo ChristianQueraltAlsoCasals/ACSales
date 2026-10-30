@@ -33,6 +33,7 @@ import {
   Send,
   Users,
   SlidersHorizontal,
+  Calendar,
 } from "lucide-react";
 import TeamsPendentsCampana from "./teamsPendents.jsx";
 import SimuladorTarifas2027 from "./simuladorTarifas2027.jsx";
@@ -77,6 +78,7 @@ import Precios from "./precios.jsx";
 import { EMAILS_DEPARTAMENTO, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
 import Correo from "./correo.jsx";
 import Tareas from "./tareas.jsx";
+import Calendario from "./calendario.jsx";
 import ChatIA from "./chatIA.jsx";
 import Ratios from "./ratios.jsx";
 import IAFlotante from "./iaFlotante.jsx";
@@ -2809,7 +2811,7 @@ function ChatOT({ fichas, incrustado = false }) {
   );
 }
 
-function AsistenteUnico({ seccion, fichas }) {
+function AsistenteUnico({ seccion, fichas, onAbrirSeccion }) {
   const [abierto, setAbierto] = useState(false);
   const [modo, setModo] = useState("general");
   if (!abierto && seccion === "ia") return null;
@@ -2837,7 +2839,7 @@ function AsistenteUnico({ seccion, fichas }) {
         <button type="button" onClick={() => setAbierto(false)} title="Minimizar" className="p-1 hover:bg-white/10 rounded"><Minimize2 size={16} /></button>
       </div>
       <div className={modo === "general" ? "flex-1 min-h-0 flex flex-col" : "hidden"}>
-        <IAFlotante seccion={seccion} incrustado />
+        <IAFlotante seccion={seccion} incrustado onAbrirSeccion={onAbrirSeccion} />
       </div>
       <div className={modo === "ots" ? "flex-1 min-h-0 flex flex-col" : "hidden"}>
         <ChatOT fichas={fichas} incrustado />
@@ -7736,6 +7738,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
                 {navItem("simuladortarifas", "Simulador tarifas 2027", SlidersHorizontal)}
                 {navItem("correo", "Correo", Mail)}
                 {navItem("tareas", "Mis tareas", CheckSquare)}
+                {navItem("calendario", "Calendario", Calendar)}
                 {navItem("ia", "Asistente IA", Bot)}
                 {navItem("ratios", "Ratios financieros", BarChart3)}
                 {navItem("horas", "Control de horas", Timer)}
@@ -7827,6 +7830,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           ))}
           {panel("correo", <Correo onCrearTarea={crearTareaDesdeCorreo} usuario={usuario} />)}
           {panel("tareas", <Tareas pendienteAlta={tareaPendiente} />)}
+          {panel("calendario", <Calendario activo={seccion === "calendario"} />)}
           {panel("ia", <ChatIA />)}
           {panel("ratios", <Ratios recursos={data.recursos?.rows || []} />)}
           {panel("horas", <ControlHoras recursos={data.recursos?.rows || []} usuario={usuario} />)}
@@ -7897,7 +7901,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
         </main>
       </div>
       {!soloHoras && (
-        <AsistenteUnico seccion={seccion} fichas={estadoInicial?.fichas?.length ? new Map(estadoInicial.fichas) : null} />
+        <AsistenteUnico seccion={seccion} fichas={estadoInicial?.fichas?.length ? new Map(estadoInicial.fichas) : null} onAbrirSeccion={abrirSeccion} />
       )}
     </div>
   );

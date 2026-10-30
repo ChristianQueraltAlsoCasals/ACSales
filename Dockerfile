@@ -21,7 +21,7 @@ COPY server/server.cjs server/db.js server/schema.sql \
      server/correoPC.cjs server/horas.cjs server/pedidosVentaSeguimiento.cjs \
      server/informePedidosPendientes.cjs \
      server/informeHoras.cjs \
-     server/teamsChatbot.cjs server/mapeoArticulos.cjs ./
+     server/teamsChatbot.cjs server/mapeoArticulos.cjs server/albaranVentaCorreo.cjs ./
 COPY data/mapeo_reemplazo_items.csv ./data/mapeo_reemplazo_items.csv
 COPY data/tarifas_mo_defecto.json ./data/tarifas_mo_defecto.json
 COPY --from=web /web/dist ./public

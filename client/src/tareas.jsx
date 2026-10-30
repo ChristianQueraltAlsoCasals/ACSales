@@ -11,12 +11,21 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { Plus, Trash2, Check, Circle, AlertTriangle, ArrowLeft, Mail } from "lucide-react";
 
-const LS_KEY = "agente_ventas_tareas_v1";
+export const LS_KEY_TAREAS = "agente_ventas_tareas_v1";
+const EVT_TAREAS = "acsales-tareas-cambio";
 
-const cargar = () => {
-  try { return JSON.parse(localStorage.getItem(LS_KEY) || "[]"); } catch { return []; }
+export const cargarTareas = () => {
+  try { return JSON.parse(localStorage.getItem(LS_KEY_TAREAS) || "[]"); } catch { return []; }
 };
-const guardar = (t) => { try { localStorage.setItem(LS_KEY, JSON.stringify(t)); } catch {} };
+export const guardarTareas = (t) => {
+  try { localStorage.setItem(LS_KEY_TAREAS, JSON.stringify(t)); } catch {}
+};
+export const avisarCambioTareas = () => {
+  try { window.dispatchEvent(new CustomEvent(EVT_TAREAS)); } catch {}
+};
+
+const cargar = cargarTareas;
+const guardar = guardarTareas;
 
 const hoyISO = () => new Date().toISOString().slice(0, 10);
 const sello = () => new Date().toLocaleString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
@@ -277,6 +286,12 @@ export default function Tareas({ pendienteAlta }) {
 
   useEffect(() => { guardar(tareas); }, [tareas]);
   useEffect(() => { setFeina(null); }, [abiertaId]);
+
+  useEffect(() => {
+    const recargar = () => setTareas(cargarTareas());
+    window.addEventListener(EVT_TAREAS, recargar);
+    return () => window.removeEventListener(EVT_TAREAS, recargar);
+  }, []);
 
   // Si llega una tarea pendiente desde el Correo (por prop), la añade una vez
   useEffect(() => {
