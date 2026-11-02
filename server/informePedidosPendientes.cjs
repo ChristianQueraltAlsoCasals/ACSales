@@ -214,6 +214,7 @@ async function pedidosPendientesEmpresa(token, empresa, fecha) {
       const depto = String(c.Shortcut_Dimension_1_Code || "").trim() || calc.depto;
       return {
         pedido: no,
+        deptoCodigo: depto || "",
         departamento: etiquetaDepartamento(depto),
         fecha: fechaCorta(c.Order_Date || fecha),
         proveedor: String(c.Buy_from_Vendor_Name || "").trim() || "—",
@@ -309,6 +310,13 @@ async function enviar({ db, fechaPedido, fechaHoy, marcar = false } = {}) {
       para,
       ts: new Date().toISOString(),
     });
+  }
+  // Seguimiento por teléfono (simulación o Vapi). Fallos no bloquean el informe.
+  try {
+    const llamadasPc = require("./llamadasPcPendientes.cjs");
+    await llamadasPc.trasInforme(informe);
+  } catch (err) {
+    console.error("[informe-pc] llamadas:", err.message || err);
   }
   return { ...envio, asunto: informe.asunto, fechaPedido: informe.fecha, fechaHoy: informe.fechaHoy, n: informe.n, empresas: informe.empresas.map((e) => ({ etiqueta: e.etiqueta, n: e.filas.length })) };
 }

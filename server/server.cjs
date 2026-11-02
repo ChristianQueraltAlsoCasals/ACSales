@@ -6581,6 +6581,68 @@ require("./albaranVentaCorreo.cjs").registrarRutas({
 });
 const informePedidosPendientes = require("./informePedidosPendientes.cjs");
 const informeHoras = require("./informeHoras.cjs");
+const informeDiarioFinanciero = require("./informeDiarioFinanciero.cjs");
+const llamadasPcPendientes = require("./llamadasPcPendientes.cjs");
+
+/** Vista previa del diario financiero (sin enviar). */
+app.get("/api/informe-diario-financiero/preparar", async (req, res) => {
+  try {
+    const informe = await informeDiarioFinanciero.preparar({ fechaHoy: req.query.fechaHoy || undefined });
+    res.json({
+      ok: true,
+      asunto: informe.asunto,
+      fechaHoy: informe.fechaHoy,
+      empresa: informe.empresa,
+      periodos: informe.periodos,
+      ventas: informe.contab.ventas,
+      consumos: informe.contab.consumos,
+      facturas: informe.facturas,
+      html: informe.html,
+    });
+  } catch (err) {
+    console.error("[informe-diario/preparar]", err.message || err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/** Envía ya el diario financiero (prueba manual). */
+app.post("/api/informe-diario-financiero/enviar", async (req, res) => {
+  try {
+    const r = await informeDiarioFinanciero.enviar({
+      db,
+      fechaHoy: req.body?.fechaHoy || undefined,
+      marcar: !!req.body?.marcar,
+    });
+    res.json({ ok: true, ...r });
+  } catch (err) {
+    console.error("[informe-diario/enviar]", err.message || err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+/** Prueba manual: prepara el informe de PCs y lanza el seguimiento (simular/vapi según .env). */
+app.post("/api/informe-pc/llamadas-prueba", async (req, res) => {
+  try {
+    const fechaPedido = req.body?.fechaPedido || undefined;
+    const fechaHoy = req.body?.fechaHoy || undefined;
+    const forzarModo = req.body?.modo; // "simular" | "vapi" | omitir → .env
+    const prev = process.env.INFORME_PC_LLAMADAS;
+    if (forzarModo) process.env.INFORME_PC_LLAMADAS = String(forzarModo);
+    try {
+      const informe = await informePedidosPendientes.preparar({ fechaPedido, fechaHoy });
+      const r = await llamadasPcPendientes.trasInforme(informe);
+      res.json({ ok: true, n: informe.n, asunto: informe.asunto, fechaPedido: informe.fecha, seguimiento: r });
+    } finally {
+      if (forzarModo) {
+        if (prev == null) delete process.env.INFORME_PC_LLAMADAS;
+        else process.env.INFORME_PC_LLAMADAS = prev;
+      }
+    }
+  } catch (err) {
+    console.error("[informe-pc/llamadas-prueba]", err.message || err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)
 app.get(/^\/(?!api).*/, (req, res) => {
@@ -6608,6 +6670,7 @@ async function arrancar() {
     console.log(`Agente de Ventas — backend escuchando en http://localhost:${PORT}`);
     informePedidosPendientes.programar({ db });
     informeHoras.programar({ db });
+    informeDiarioFinanciero.programar({ db });
     console.log(`[recepcion] Subir Documento: emparejamiento manual + coincidencia por raíz de palabra — ${PDFDocument ? "activo (pdf-lib OK)" : "INACTIVO — falta 'npm install pdf-lib'"}`);
     console.log("[facturas-compra] Entrar en BC 2026-09-04: SOLO cabecera (sin líneas) + fecha leída del PDF + adjunto con 2 intentos (A/B)");
     console.log("[facturas-compra] Duplicados 2026-09-04 (v2): carga completa + varios candidatos de servicio + auto-descubrimiento en catálogo BC");
