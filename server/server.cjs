@@ -64,11 +64,14 @@ const { soloControlHoras } = require("./permisos");
 app.use("/api/auth", authRouter);
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
+  // Integración S2S (Dashboard / ACTDrive): auth por X-Service-Key, sin cookie
+  if (req.path.startsWith("/integracio")) return next();
   return requiereSesion(req, res, next);
 });
 /** Usuarios con solo_control_horas: únicamente endpoints de Control de horas. */
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
+  if (req.path.startsWith("/integracio")) return next();
   if (!req.usuario || !soloControlHoras(req.usuario)) return next();
   if (req.path.startsWith("/horas")) return next();
   return res.status(403).json({
@@ -6642,6 +6645,15 @@ app.post("/api/informe-pc/llamadas-prueba", async (req, res) => {
     console.error("[informe-pc/llamadas-prueba]", err.message || err);
     res.status(500).json({ ok: false, error: err.message || String(err) });
   }
+});
+
+require("./ot-capas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE });
+require("./integracio-ot-ficha.cjs")({
+  app,
+  obtenerTokenBC,
+  fetchConReintento,
+  EMPRESA_NOMBRE,
+  FUENTES_WS,
 });
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)
