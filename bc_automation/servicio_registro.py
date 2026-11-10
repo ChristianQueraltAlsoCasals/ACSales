@@ -77,24 +77,19 @@ def url_pedido_directo(numero_pedido: str) -> str:
 
 
 def url_factura_compra(numero_factura: str) -> str:
-    """Abre la ficha del borrador por filtro de Nº (más fiable que bookmark)."""
-    from urllib.parse import quote
+    """Deep link page=51 + 'Purchase Header'.'No.' IS '{factura}' (&dc=0)."""
+    from traer_albaranes_compra import url_factura_compra as url_ficha
 
-    empresa = COMPANY_NAME.replace(" ", "%20")
-    filtro_q = quote(f"'No.' IS '{numero_factura}'", safe="")
-    return (
-        f"https://businesscentral.dynamics.com/{TENANT_ID}/{ENVIRONMENT}/"
-        f"?company={empresa}&page={PAGINA_FACTURA_COMPRA}&filter={filtro_q}"
-    )
+    return url_ficha(numero_factura)
 
 
 def cerrar_dialogo_pausa(pagina):
-    for _ in range(3):
+    for _ in range(2):
         try:
             boton = pagina.get_by_role("button", name="Refresh")
-            if boton.is_visible(timeout=4000):
+            if boton.is_visible(timeout=800):
                 boton.click()
-                pagina.wait_for_timeout(4000)
+                pagina.wait_for_timeout(400)
             else:
                 break
         except Exception:
@@ -198,24 +193,72 @@ def _pagina_viva(pagina) -> bool:
         return False
 
 
+def _corte_navegador(texto: str) -> bool:
+    t = (texto or "").lower()
+    return any(
+        s in t
+        for s in (
+            "epipe",
+            "broken pipe",
+            "target closed",
+            "targetclosed",
+            "has been closed",
+            "browser has been closed",
+            "browser closed",
+            "connection closed",
+        )
+    )
+
+
+def _liberar_perfil_edge():
+    """Si Edge ya tiene abierto bc_automation/perfil_navegador, Playwright no puede
+    relanzarlo («Abriendo en sesión de explorador existente» → TargetClosedError)."""
+    from traer_albaranes_compra import liberar_perfil_edge
+
+    n = liberar_perfil_edge()
+    if n:
+        print(f"[servicio_registro] Liberado el perfil: {n} proceso(s) Edge cerrados.")
+
+
 def abrir_navegador():
     """Abre (o vuelve a abrir) Edge con el perfil ya identificado."""
     global _contexto, _pagina
-    if _contexto is not None:
+    ultimo = None
+    for intento in range(2):
+        if _contexto is not None:
+            try:
+                _contexto.close()
+            except Exception:
+                pass
+            _contexto = None
+            _pagina = None
+        if intento == 0:
+            _liberar_perfil_edge()
         try:
-            _contexto.close()
-        except Exception:
-            pass
-        _contexto = None
-    _contexto = _playwright.chromium.launch_persistent_context(
-        str(CARPETA_PERFIL),
-        channel="msedge",
-        headless=False,
-        viewport=None,
-        args=["--start-minimized"],
-    )
-    _pagina = _contexto.pages[0] if _contexto.pages else _contexto.new_page()
-    return _pagina
+            _contexto = _playwright.chromium.launch_persistent_context(
+                str(CARPETA_PERFIL),
+                channel="msedge",
+                headless=False,
+                viewport=None,
+                args=["--start-maximized"],
+            )
+            _pagina = _contexto.pages[0] if _contexto.pages else _contexto.new_page()
+            try:
+                from traer_albaranes_compra import maximizar
+
+                maximizar(_pagina)
+            except Exception as e:
+                print(f"[servicio_registro] No he podido mostrar la ventana ({e}). Sigo.")
+            return _pagina
+        except Exception as e:
+            ultimo = e
+            print(f"[servicio_registro] Edge no ha arrancado ({e}).")
+            if intento == 0 and _corte_navegador(str(e)):
+                print("[servicio_registro] Reintento el navegador.")
+                time.sleep(1)
+                continue
+            raise
+    raise ultimo
 
 
 def asegurar_pagina():
@@ -413,19 +456,77 @@ class ManejadorPeticiones(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(cuerpo)))
         self.end_headers()
-        self.wfile.write(cuerpo)
+        try:
+            self.wfile.write(cuerpo)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            print("[servicio_registro] El cliente cerró la conexión. El servicio sigue.")
 
-    def do_POST(self):
-        if self.path != "/registrar":
-            self.send_response(404)
-            self.end_headers()
-            return
+    def _traer_albaranes(self, factura: str, pedido: str) -> dict:
+        """Si Edge se cae (EPIPE, ventana cerrada), lo reabre una vez y reintenta."""
+        from traer_albaranes_compra import traer_albaranes_en_pagina
+
+        ultimo = "No se ha podido traer los albaranes."
+        for intento in range(2):
+            try:
+                return traer_albaranes_en_pagina(asegurar_pagina(), factura, pedido)
+            except Exception as e:
+                ultimo = str(e)
+                if intento == 0 and _corte_navegador(ultimo):
+                    print(f"[servicio_registro] El navegador se ha cortado ({ultimo}). Lo vuelvo a abrir.")
+                    try:
+                        abrir_navegador()
+                    except Exception as e2:
+                        return {
+                            "ok": False,
+                            "factura": factura,
+                            "pedido": pedido,
+                            "registrada": False,
+                            "error": f"Edge se ha cerrado y no he podido reabrirlo: {e2}",
+                        }
+                    continue
+                return {
+                    "ok": False,
+                    "factura": factura,
+                    "pedido": pedido,
+                    "registrada": False,
+                    "error": f"Excepción inesperada: {ultimo}",
+                }
+        return {
+            "ok": False,
+            "factura": factura,
+            "pedido": pedido,
+            "registrada": False,
+            "error": f"El navegador se ha cortado: {ultimo}",
+        }
+
+    def _leer_json(self):
         try:
             longitud = int(self.headers.get("Content-Length", 0))
             cuerpo = self.rfile.read(longitud) if longitud else b"{}"
-            datos = json.loads(cuerpo or b"{}")
+            return json.loads(cuerpo or b"{}")
         except Exception:
-            datos = {}
+            return {}
+
+    def do_POST(self):
+        ruta = (self.path or "").split("?", 1)[0]
+        if ruta == "/traer-albaranes":
+            datos = self._leer_json()
+            factura = (datos.get("numero_factura") or "").strip()
+            pedido = (datos.get("numero_pedido") or "").strip()
+            if not factura or not pedido:
+                self._responder(400, {"ok": False, "error": "Faltan numero_factura y numero_pedido."})
+                return
+            print(f"[servicio_registro] Traer albaranes {factura} ← {pedido}...")
+            resultado = self._traer_albaranes(factura, pedido)
+            print(f"[servicio_registro] {factura}: {'OK' if resultado.get('ok') else 'ERROR — ' + str(resultado.get('error'))}")
+            self._responder(200 if resultado.get("ok") else 500, resultado)
+            return
+
+        if ruta != "/registrar":
+            self.send_response(404)
+            self.end_headers()
+            return
+        datos = self._leer_json()
         numero_pedido = (datos.get("numero_pedido") or "").strip()
         if not numero_pedido:
             self._responder(400, {"error": "Falta 'numero_pedido' en el cuerpo de la petición."})
@@ -459,10 +560,6 @@ def main():
     print("Arrancando el navegador (una sola vez, puede tardar unos segundos)...")
     with sync_playwright() as playwright:
         _playwright = playwright
-        # --start-minimized en vez de --start-maximized: sigue siendo un
-        # navegador normal (mismo comportamiento con BC, sin riesgos de
-        # detección de bot ni renderizado distinto por ir headless), solo
-        # que no te salta por encima mientras trabajas en otra ventana.
         abrir_navegador()
 
         servidor = HTTPServer(("0.0.0.0", PUERTO), ManejadorPeticiones)
