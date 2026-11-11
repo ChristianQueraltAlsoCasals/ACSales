@@ -23,7 +23,8 @@ COPY server/server.cjs server/db.js server/schema.sql \
      server/informeHoras.cjs \
      server/informeDiarioFinanciero.cjs \
      server/llamadasPcPendientes.cjs \
-     server/teamsChatbot.cjs server/mapeoArticulos.cjs server/albaranVentaCorreo.cjs ./
+     server/teamsChatbot.cjs server/mapeoArticulos.cjs server/albaranVentaCorreo.cjs \
+     server/ot-capas.cjs server/ot-coste-base.cjs server/ots-app.cjs server/integracio-ot-ficha.cjs ./
 COPY data/mapeo_reemplazo_items.csv ./data/mapeo_reemplazo_items.csv
 COPY data/tarifas_mo_defecto.json ./data/tarifas_mo_defecto.json
 COPY --from=web /web/dist ./public

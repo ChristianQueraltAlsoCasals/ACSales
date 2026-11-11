@@ -10,6 +10,7 @@
  * Fuera de sesión de usuario (middleware salta /api/integracio).
  */
 const otCapas = require("./ot-capas.cjs");
+const costeBase = require("./ot-coste-base.cjs");
 
 const TARIFA_MO = Number(process.env.RENTABILIDAD_TARIFA_MO || otCapas.TARIFA_MO || 21.5);
 const COEF_DIRECTO = Number(process.env.PREVISION_COEF_MAT || 1.68);
@@ -294,6 +295,7 @@ module.exports = function montarIntegracioOtFicha({
   fetchConReintento,
   EMPRESA_NOMBRE,
   FUENTES_WS,
+  db,
 }) {
   const servicioVenta = (FUENTES_WS && FUENTES_WS.lineas_venta && FUENTES_WS.lineas_venta.servicio)
     || process.env.BC_WS_LINEASVENTA
@@ -306,6 +308,8 @@ module.exports = function montarIntegracioOtFicha({
     res.json({
       ok: true,
       service: "acsales",
+      contrato_ficha: 2,
+      fecha_corte_config: costeBase.fechaCorteConfig(),
       endpoints: [
         "GET /api/integracio/health",
         "GET /api/integracio/ots/ficha?codigo=",
@@ -366,41 +370,77 @@ module.exports = function montarIntegracioOtFicha({
     const horasVenta = round2(
       (ventaRaw || []).filter(esResource).reduce((a, l) => a + num(l.Quantity), 0)
     );
-    const horas = esPresupuesto ? (movs.horas || 0) : horasVenta;
-    const costeMo = round2(horas * TARIFA_MO);
+    // Legacy (ACTDrive coste / economico): PR=movs; admin=resource BC
+    const horasLegacy = esPresupuesto ? (movs.horas || 0) : horasVenta;
+    const costeMoLegacy = round2(horasLegacy * TARIFA_MO);
 
     const cruce = cruceMaterial(ventaRaw, compraRaw);
     const costeMatApp = round2(
       (pack?.totales?.coste_material_obra || 0) + (pack?.totales?.coste_material_taller || 0)
     );
-    // Coste material de referencia operativa: compras PC (como valoración presupuesto)
+    // Compat ACTDrive: material_eur sigue siendo compras PC
     const materialEur = costeComprasPc;
-    const costeDirecto = round2(Math.max(0, materialEur - (cruce.coste_no_facturado || 0)) + costeMo);
+    const costeDirectoLegacy = round2(
+      Math.max(0, materialEur - (cruce.coste_no_facturado || 0)) + costeMoLegacy
+    );
 
-    const cliente = String(otRow?.cliente || pack?.ot?.descr || "").trim(); // descr is OT desc; cliente may be missing
+    const cliente = String(otRow?.cliente || pack?.ot?.descr || "").trim();
     const coef = coefCliente(cliente);
     const economico = {
+      legacy: true,
+      nota: "Bloque legado. Usar coste_base (criterio v2) como fuente oficial hacia Dashboard.",
       ingresos_venta_lineas: ingresosVenta,
-      horas,
+      horas: horasLegacy,
       horas_fuente: esPresupuesto ? "movs_proyecto" : "lineas_venta_resource",
-      coste_mo: costeMo,
+      coste_mo: costeMoLegacy,
       tarifa_mo: TARIFA_MO,
       coste_compras_pc: costeComprasPc,
       coste_material_app: costeMatApp,
       coste_no_facturado: cruce.coste_no_facturado,
-      coste_directo: costeDirecto,
+      coste_directo: costeDirectoLegacy,
       coef_venta_posible: coef,
-      venta_posible: round2(costeDirecto * coef),
+      venta_posible: round2(costeDirectoLegacy * coef),
       venta_objetivo_acsales: ventaObjetivoLocal(
-        costeDirecto,
+        costeDirectoLegacy,
         0,
         PCT_ESTRUCTURA_FALLBACK,
         MARGEN_OBJ,
         coef
       ),
       nota_venta_objetivo:
-        "venta_objetivo_acsales usa fallback estructura 22% sin tasas UN. Preferir el endpoint FinanceHub/Dashboard cuando exista.",
+        "venta_objetivo_acsales es fallback local. El número oficial lo calculará Dashboard.",
     };
+
+    const factInfo = costeBase.detectarFacturacion(ventaRaw);
+    const fechaCorte = costeBase.fechaCorteConfig();
+    const criterio = costeBase.aplicarCriterioV2({
+      facturada: factInfo.facturada,
+      fechaFactura: factInfo.fecha_factura,
+      fechaCorte,
+    });
+
+    let coste_base = null;
+    let control = null;
+    if (criterio.aplica_criterio_v2 && pack) {
+      const estadosSobra = await costeBase.leerEstadosSobra(db, codigo);
+      coste_base = costeBase.construirCosteBase({
+        pack,
+        estadosSobra,
+        // PR: Movs. proyecto; admin: horas App (pack.totales)
+        horasOverride: esPresupuesto ? (movs.horas || 0) : null,
+        fuenteHoras: esPresupuesto ? "movs_proyecto" : "partes_app",
+        tarifaMo: TARIFA_MO,
+      });
+      const alertas = [];
+      if (costeComprasPc > 0 && costeMatApp === 0) {
+        alertas.push({
+          codigo: "pc_sin_material_app",
+          mensaje: "Hay compras PC y no hay material App valorado",
+          importe: costeComprasPc,
+        });
+      }
+      control = costeBase.montarControlPc(costeComprasPc, comprasReales.length, alertas);
+    }
 
     const comprasLineas = comprasReales.map((l) => ({
       documento: String(l.Document_No || ""),
@@ -417,7 +457,7 @@ module.exports = function montarIntegracioOtFicha({
       ok: true,
       servicio: "acsales",
       contrato: "integracio/ots/ficha",
-      version: 1,
+      version: 2,
       generado_en: new Date().toISOString(),
       codigo: codigo,
       meta: {
@@ -434,7 +474,15 @@ module.exports = function montarIntegracioOtFicha({
         p_venta_app: otRow ? num(otRow.preuVenta) : null,
         p_despesa_app: otRow ? num(otRow.preuDespessa) : null,
         benefici_net_app: otRow ? num(otRow.beneficiNet) : null,
+        estado_ot: criterio.estado_ot,
+        facturada: factInfo.facturada,
+        fecha_factura: factInfo.fecha_factura,
+        fecha_corte_config: fechaCorte,
+        aplica_criterio_v2: criterio.aplica_criterio_v2,
+        motivo_exclusion: criterio.motivo_exclusion,
       },
+      coste_base,
+      control,
       bc_lineas: {
         n_venta: (ventaRaw || []).length,
         n_compra: (compraRaw || []).length,
@@ -458,9 +506,8 @@ module.exports = function montarIntegracioOtFicha({
       capas: pack ? resumenCapas(pack) : null,
       economico,
       coste: {
-        // Compat ACTDrive mapCosteBody
         ot_codigo: codigo,
-        horas,
+        horas: horasLegacy,
         material_eur: materialEur,
         coste_mat: materialEur,
         materiales: materialEur,
@@ -470,7 +517,8 @@ module.exports = function montarIntegracioOtFicha({
         app: "ALSOAPP dbo.ot + Parte_*",
         venta_bc: servicioVenta,
         compra_bc: servicioCompra,
-        horas: esPresupuesto ? "Movs. proyecto Uso/Recurso" : "líneas venta Type=Resource",
+        coste_base: "App precioC + horas (movs si PR) + sobra taller confirmada",
+        horas_v2: esPresupuesto ? "Movs. proyecto Uso/Recurso" : "partes App",
         capas: "/api/ot/capas (misma lógica)",
       },
     };

@@ -31,6 +31,10 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function round2Unit(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
 function capaBucket(extra = {}) {
   return { horas: 0, qty: 0, importe_coste: 0, importe_venta: 0, lineas: [], ...extra };
 }
@@ -423,7 +427,17 @@ function construirCapas({ otMeta, app, ventaRaw, esPresupuesto = false, movsUso 
     const gast = gastadoFaena.get(art) || { qty: 0, coste: 0, lineas: [], validated_any: false, partes: new Set() };
     const qtyFact = Math.min(prep.qty, gast.qty);
     const sobra = Math.max(0, prep.qty - gast.qty);
-    const unitCost = gast.qty > 0 ? gast.coste / gast.qty : 0;
+    // Coste unitario: preferir precioC medio del preparado; si no, del gastado en faena.
+    let sumPrep = 0;
+    let qtyPrepCost = 0;
+    for (const l of prep.lineas || []) {
+      const q = num(l.qty);
+      sumPrep += q * num(l.precioC);
+      qtyPrepCost += q;
+    }
+    const unitPrep = qtyPrepCost > 0 ? sumPrep / qtyPrepCost : 0;
+    const unitGast = gast.qty > 0 ? gast.coste / gast.qty : 0;
+    const unitCost = unitPrep > 0 ? unitPrep : unitGast;
     const costeFact = qtyFact * unitCost;
 
     let enBC = false;
@@ -454,8 +468,9 @@ function construirCapas({ otMeta, app, ventaRaw, esPresupuesto = false, movsUso 
         qty_preparada: prep.qty,
         qty_gastada: gast.qty,
         qty_sobra: sobra,
-        importe_coste: 0,
-        nota: "Preparado taller no gastado en parte de trabajo — no facturar",
+        precio_c: round2Unit(unitCost),
+        importe_coste: round2Unit(sobra * unitCost),
+        nota: "Preparado taller no gastado en faena — pendiente confirmacion (se_cobra / devuelto)",
       });
     }
   }
@@ -659,7 +674,37 @@ async function obtenerPackCapas(no, {
   return { pack, otRow, ventaRaw, parsed, empApp, appData };
 }
 
-module.exports = function montarOtCapas({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE }) {
+module.exports = function montarOtCapas({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, db }) {
+  const costeBase = require("./ot-coste-base.cjs");
+
+  async function enriquecerPack(no, pack, { esPresupuesto, movsUso } = {}) {
+    const estadosSobra = await costeBase.leerEstadosSobra(db, no);
+    const coste_base = costeBase.construirCosteBase({
+      pack,
+      estadosSobra,
+      horasOverride: esPresupuesto ? num(movsUso?.horas) : null,
+      fuenteHoras: esPresupuesto ? "movs_proyecto" : "partes_app",
+      tarifaMo: TARIFA_MO,
+    });
+    // Adjuntar estado a cada línea de sobra para la UI
+    const porArt = Object.fromEntries(
+      (coste_base.taller_sobra.lineas || []).map((l) => [l.articulo, l])
+    );
+    const taller_sobra = (pack.taller_sobra || []).map((r) => {
+      const art = String(r.articulo || "").trim().toUpperCase();
+      const lin = porArt[art];
+      return {
+        ...r,
+        precio_c: r.precio_c != null ? r.precio_c : lin?.precio_c,
+        importe_coste: r.importe_coste != null ? r.importe_coste : lin?.importe,
+        estado: lin?.estado || "pendiente",
+        confirmado_por: lin?.confirmado_por || null,
+        confirmado_en: lin?.confirmado_en || null,
+      };
+    });
+    return { ...pack, taller_sobra, coste_base };
+  }
+
   async function handler(req, res) {
     const no = String(req.params.no || req.query.no || "").trim();
     if (!no) return res.status(400).json({ error: "Falta no (ej. AC015317/2026)" });
@@ -675,7 +720,7 @@ module.exports = function montarOtCapas({ app, obtenerTokenBC, fetchConReintento
         esPresupuesto,
         movsUso,
       });
-      res.json(pack);
+      res.json(await enriquecerPack(no, pack, { esPresupuesto, movsUso }));
     } catch (err) {
       console.error("[ot-capas]", err);
       const status = err.status || (esErrorConectividadErp(err) ? 502 : 500);
@@ -696,6 +741,24 @@ module.exports = function montarOtCapas({ app, obtenerTokenBC, fetchConReintento
   app.post("/api/ot/capas/:no", (req, res, next) => {
     req.query.no = decodeURIComponent(req.params.no || "");
     return handler(req, res, next);
+  });
+
+  /** Confirmar sobra taller: pendiente | se_cobra | devuelto (sesión usuario). */
+  app.put("/api/ot/taller-sobra", async (req, res) => {
+    try {
+      const no = String(req.body?.no || req.body?.codigo || req.query?.no || "").trim();
+      const articulo = String(req.body?.articulo || "").trim();
+      const estado = String(req.body?.estado || "").trim();
+      if (!no) return res.status(400).json({ ok: false, error: "Falta no / codigo OT" });
+      const usuario =
+        (req.session && (req.session.usuario?.email || req.session.usuario?.nombre || req.session.user?.email)) ||
+        null;
+      const guardado = await costeBase.guardarEstadoSobra(db, no, articulo, estado, usuario);
+      res.json({ ok: true, codigo: no, articulo: String(articulo).trim().toUpperCase(), ...guardado });
+    } catch (err) {
+      const status = err.status || 500;
+      res.status(status).json({ ok: false, error: String(err.message || err) });
+    }
   });
 };
 

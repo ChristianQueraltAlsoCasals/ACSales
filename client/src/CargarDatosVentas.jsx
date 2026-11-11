@@ -5772,6 +5772,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
 
       {/* Capas App ↔ BC (horas / material obra / taller) */}
       <CapasAppOT
+        noBC={noBC}
         capas={capasApp}
         cargando={cargandoCapas}
         aviso={avisoCapas}
@@ -5780,6 +5781,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
           esPresupuesto,
           movsUso: movsUso && !movsUso.cargando ? movsUso : null,
         })}
+        onCapasPatch={(next) => setCapasApp(next)}
       />
 
       {/* Cargar líneas frescas desde BC + Excel cruce material */}
@@ -6795,9 +6797,11 @@ function FacturaOT({ lineasRaw, ficha, noBC }) {
 // obra, artículos...) hasta el siguiente "parte" o el fin del documento.
 const RE_PARTE_TRABAJO = /n[ºo]\.?\s*parte de trabajo[:\s]+(\S+)\s+ot[:\s]+(\S+)\s+fecha[:\s]+(\d{2}\/\d{2}\/\d{4})/i;
 
-/** Panel capas App↔BC: Registrado BC / Pedido de venta / Validado App / No validado App */
-function CapasAppOT({ capas, cargando, aviso, onRecargar, esPresupuesto = false }) {
+/** Panel capas App↔BC + confirmación sobra taller (criterio v2). */
+function CapasAppOT({ capas, cargando, aviso, onRecargar, esPresupuesto = false, noBC = "", onCapasPatch }) {
   const [abierto, setAbierto] = useState(true);
+  const [guardandoArt, setGuardandoArt] = useState(null);
+  const [errorSobra, setErrorSobra] = useState(null);
   const ESTADOS = [
     { key: "registrado_bc", label: "Registrado BC", cls: "bg-emerald-50 border-emerald-200 text-emerald-900" },
     { key: "pedido_venta", label: "Pedido de venta", cls: "bg-sky-50 border-sky-200 text-sky-900" },
@@ -6813,6 +6817,36 @@ function CapasAppOT({ capas, cargando, aviso, onRecargar, esPresupuesto = false 
   const fmt = (n) => (n == null || Number.isNaN(n) ? "—" : eur(n));
   const fmtH = (n) => `${(Number(n) || 0).toLocaleString("es-ES", { maximumFractionDigits: 2 })} h`;
   const ppto = esPresupuesto || !!capas?.es_presupuesto;
+  const cb = capas?.coste_base;
+
+  const confirmarSobra = async (articulo, estado) => {
+    if (!noBC || !articulo) return;
+    setGuardandoArt(articulo);
+    setErrorSobra(null);
+    try {
+      const r = await fetch("/api/ot/taller-sobra", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ no: noBC, articulo, estado }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if (typeof onRecargar === "function") onRecargar();
+      else if (typeof onCapasPatch === "function" && capas) {
+        const taller_sobra = (capas.taller_sobra || []).map((x) =>
+          String(x.articulo || "").toUpperCase() === String(articulo).toUpperCase()
+            ? { ...x, estado, confirmado_en: j.confirmado_en, confirmado_por: j.confirmado_por }
+            : x
+        );
+        onCapasPatch({ ...capas, taller_sobra });
+      }
+    } catch (err) {
+      console.error("[taller-sobra]", err);
+      setErrorSobra(err.message || String(err));
+    }
+    setGuardandoArt(null);
+  };
 
   return (
     <div className="bg-white border border-indigo-200 rounded-lg p-3 mb-3">
@@ -6825,8 +6859,8 @@ function CapasAppOT({ capas, cargando, aviso, onRecargar, esPresupuesto = false 
           {abierto ? "▾" : "▸"} Capas App ↔ BC
         </button>
         <span className="text-[10px] text-slate-400">
-          Coste MO × {capas?.tarifa_mo ?? 21.5} €/h · taller = preparado (recogida) fusionado con gastado (faena)
-          {ppto ? " · OT presupuesto: Registrado BC = Movs. proyecto · Pedido N/a" : " · Registrado BC = factura · Pedido = Order"}
+          Coste MO × {capas?.tarifa_mo ?? 21.5} €/h · material = App precioC · sobra taller confirmable
+          {ppto ? " · OT pressupost: Registrat BC = Movs. projecte · Pedido N/a" : " · Registrat BC = factura · Pedido = Order"}
         </span>
         <button
           type="button"
@@ -6838,9 +6872,24 @@ function CapasAppOT({ capas, cargando, aviso, onRecargar, esPresupuesto = false 
         </button>
       </div>
       {aviso && <div className="text-[11px] text-amber-700 mb-2">⚠ {aviso}</div>}
+      {errorSobra && <div className="text-[11px] text-rose-700 mb-2">No s&apos;ha pogut guardar la sobra: {errorSobra}</div>}
       {cargando && !capas && <div className="text-[11px] text-slate-400">Leyendo partes ALSOAPP…</div>}
       {abierto && capas && (
         <>
+          {cb && (
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <div className="border border-emerald-200 bg-emerald-50 rounded px-2 py-1.5 text-[11px]">
+                <div className="font-bold text-emerald-900">Coste Confirmado</div>
+                <div className="text-lg font-semibold tabular-nums text-emerald-950">{fmt(cb.coste_confirmado)}</div>
+                <div className="text-[10px] text-emerald-800/80">hores + obra + taller gastat + sobra «se cobra»</div>
+              </div>
+              <div className="border border-slate-300 bg-slate-50 rounded px-2 py-1.5 text-[11px]">
+                <div className="font-bold text-slate-800">Coste Total</div>
+                <div className="text-lg font-semibold tabular-nums text-slate-900">{fmt(cb.coste_total)}</div>
+                <div className="text-[10px] text-slate-500">Confirmado + sobra pendent de revisió</div>
+              </div>
+            </div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-2">
             {SECCIONES.map((sec) => {
               const s = capas.secciones?.[sec.key];
@@ -6871,31 +6920,43 @@ function CapasAppOT({ capas, cargando, aviso, onRecargar, esPresupuesto = false 
               );
             })}
           </div>
-          {capas.totales && (
-            <div className="text-[11px] text-slate-700 bg-slate-50 border border-slate-200 rounded px-2 py-1.5 mb-2">
-              <b>Total coste directo (capas):</b>{" "}
-              {fmt(capas.totales.coste_directo)}
-              <span className="text-slate-400">
-                {" "}(MO {fmt(capas.totales.coste_mo)} + obra {fmt(capas.totales.coste_material_obra)} + taller {fmt(capas.totales.coste_material_taller)})
-              </span>
-            </div>
-          )}
           {(capas.taller_sobra || []).length > 0 && (
-            <div className="text-[11px] border border-slate-200 rounded p-2 mb-1">
-              <div className="font-semibold text-slate-700 mb-1">Taller preparado no gastado (no facturar)</div>
-              {capas.taller_sobra.map((r, i) => (
-                <div key={i} className="text-slate-600 tabular-nums" title={r.descripcion || ""}>
-                  <span className="font-mono">{r.articulo}</span>
-                  {r.descripcion ? <> · <span className="text-slate-700">{r.descripcion}</span></> : null}
-                  {" · "}prep. {r.qty_preparada} · gastado {r.qty_gastada} · sobra <b>{r.qty_sobra}</b>
-                </div>
-              ))}
+            <div className="text-[11px] border border-amber-200 bg-amber-50/40 rounded p-2 mb-1">
+              <div className="font-semibold text-amber-950 mb-1">
+                Sobra taller (preparat − gastat) — per defecte «pendent» (només al Coste Total)
+              </div>
+              {capas.taller_sobra.map((r, i) => {
+                const art = String(r.articulo || "").toUpperCase();
+                const estado = r.estado || "pendiente";
+                const busy = guardandoArt === art;
+                return (
+                  <div key={i} className="flex flex-wrap items-center gap-2 text-slate-700 tabular-nums border-t border-amber-100 py-1.5 first:border-0 first:pt-0" title={r.descripcion || ""}>
+                    <span className="font-mono text-[10px]">{r.articulo}</span>
+                    {r.descripcion ? <span className="text-slate-600 truncate max-w-[12rem]">{r.descripcion}</span> : null}
+                    <span>
+                      prep. {r.qty_preparada} · gastat {r.qty_gastada} · sobra <b>{r.qty_sobra}</b>
+                      {r.importe_coste != null ? <> · {fmt(r.importe_coste)}</> : null}
+                    </span>
+                    <select
+                      className="text-[10px] border border-slate-300 rounded px-1 py-0.5 bg-white"
+                      value={estado}
+                      disabled={busy || !noBC}
+                      onChange={(ev) => confirmarSobra(art, ev.target.value)}
+                    >
+                      <option value="pendiente">Pendent (Total)</option>
+                      <option value="se_cobra">Se cobra (Confirmado)</option>
+                      <option value="devuelto">Devuelto (fora)</option>
+                    </select>
+                    {busy && <span className="text-[10px] text-slate-400">Guardant…</span>}
+                  </div>
+                );
+              })}
             </div>
           )}
           <div className="text-[10px] text-slate-400">
             OT App id {capas.ot?.id_ot} · partes BC detectados: {(capas.partes_bc_detectados || []).join(", ") || "—"}
             {capas.n_lineas_venta_bc != null ? ` · líneas venta BC: ${capas.n_lineas_venta_bc}` : ""}
-            {" · "}API <code className="text-[9px]">GET/POST /api/ot/capas?no=…</code>
+            {" · "}API <code className="text-[9px]">GET /api/ot/capas · PUT /api/ot/taller-sobra</code>
           </div>
         </>
       )}

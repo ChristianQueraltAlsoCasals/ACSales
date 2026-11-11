@@ -6647,13 +6647,15 @@ app.post("/api/informe-pc/llamadas-prueba", async (req, res) => {
   }
 });
 
-require("./ot-capas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE });
+require("./ot-capas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, db });
+require("./ots-app.cjs")({ app, EMPRESA_NOMBRE });
 require("./integracio-ot-ficha.cjs")({
   app,
   obtenerTokenBC,
   fetchConReintento,
   EMPRESA_NOMBRE,
   FUENTES_WS,
+  db,
 });
 
 // SPA: cualquier ruta que no sea /api → index.html (build de Vite en public/)
