@@ -25,6 +25,8 @@ export const SECCIONES_APP = [
   { id: "ia", nombre: "Asistente IA" },
   { id: "ratios", nombre: "Ratios financieros" },
   { id: "horas", nombre: "Control de horas" },
+  { id: "ropa", nombre: "Ropa" },
+  { id: "ofertas", nombre: "Comparador de ofertas" },
 ];
 
 export const cargarEventos = () => {

@@ -32,7 +32,7 @@
 import React, { Fragment, useState, useRef, useMemo, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { Upload, X, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Mail, Loader2, FileCheck2, RefreshCw, History, Search, Wallet, Inbox, Send, StickyNote } from "lucide-react";
-import { emailsPorCodigoDepartamento, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
+import { emailsPorCodigoDepartamento, listasCorreoDepartamento, aplicarRemitente, copiasAdministracion } from "./departamentos.js";
 import { empresaGuardada } from "./empresa.jsx";
 import { htmlPerEnviar } from "./correo.jsx";
 
@@ -156,6 +156,92 @@ function pedidoCuadra(p) {
   const lineas = p.lineas || [];
   if (!lineas.length) return false;
   return lineas.every((l) => l.coincidencia !== "sin_match" && l.lineaBC && !l.pendienteRecepcion && !l.diferenciaPrecio);
+}
+
+/** Importe de línea BC: amountExcludingTax / importeLinea; si no, qty×precio×(1−dto).
+ * Nunca qty×precio bruto sin dto (eso inventaba 59,44 en vez de 28,53). */
+function dtoPctLineaBc(l) {
+  if (!l) return null;
+  const raw = l.descuentoPct ?? l.discountPercent ?? l.lineDiscountPercent;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function importeLineaPedidoBc(l) {
+  if (!l) return null;
+  const fromBc =
+    l.importeLinea ?? l.amountExcludingTax ?? l.netAmount ?? l.Line_Amount ?? l.lineAmount;
+  if (fromBc != null && fromBc !== "" && Number.isFinite(Number(fromBc))) {
+    return Number(fromBc);
+  }
+  const precio = l.precioBC ?? l.precio ?? l.directUnitCost;
+  if (precio == null || precio === "") return null;
+  const qty = Number(l.cantidadPedida ?? l.quantity) || 0;
+  const dto = dtoPctLineaBc(l);
+  if (dto == null) return null; // sin importe ni % dto de BC → no inventar bruto
+  return Math.round(qty * Number(precio) * (1 - dto / 100) * 100) / 100;
+}
+
+/** Total pedido = cabecera BC o suma de importes BC (con dto). Nunca bruto PDF / qty×precio. */
+function totalPedidoPropuesta(grupo, lineasBc = []) {
+  const bc = (Array.isArray(lineasBc) && lineasBc.length ? lineasBc : (grupo?.lineasDisponiblesBC || []));
+  let sumImporteBc = 0;
+  let hayImporteBc = false;
+  let sumCalcDto = 0;
+  let hayCalcDto = false;
+  for (const l of bc) {
+    const raw = l?.importeLinea ?? l?.amountExcludingTax ?? l?.netAmount;
+    if (raw != null && raw !== "" && Number.isFinite(Number(raw))) {
+      hayImporteBc = true;
+      sumImporteBc += Number(raw);
+      continue;
+    }
+    const imp = importeLineaPedidoBc(l);
+    if (imp == null) continue;
+    hayCalcDto = true;
+    sumCalcDto += imp;
+  }
+  if (hayImporteBc) return Math.round(sumImporteBc * 100) / 100;
+  if (grupo?.importe != null && grupo.importe !== "" && Number.isFinite(Number(grupo.importe))) {
+    return Number(grupo.importe);
+  }
+  if (hayCalcDto) return Math.round(sumCalcDto * 100) / 100;
+  return null;
+}
+
+function fmtDtoPct(n) {
+  if (n === null || n === undefined || n === "" || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  const txt = Number.isInteger(v) || Math.abs(v - Math.round(v)) < 1e-9
+    ? String(Math.round(v))
+    : v.toLocaleString("es-ES", { maximumFractionDigits: 2 });
+  return `${txt} %`;
+}
+
+/** Importe para una qty parcial: proporción del importe neto del PC, o unit×(1−dto)×qty. */
+function importeParaCantidadDesdePedido(lineaPedido, cantidad) {
+  const qty = Number(cantidad) || 0;
+  if (!lineaPedido || qty <= 0) return null;
+  const pedida = Number(lineaPedido.cantidadPedida) || 0;
+  const importePo = lineaPedido.importeLinea ?? lineaPedido.amountExcludingTax ?? lineaPedido.netAmount;
+  if (importePo != null && importePo !== "" && Number.isFinite(Number(importePo)) && pedida > 0.0001) {
+    return Math.round((qty / pedida) * Number(importePo) * 100) / 100;
+  }
+  const precio = lineaPedido.precioBC ?? lineaPedido.precio ?? lineaPedido.directUnitCost;
+  if (precio == null || precio === "") return null;
+  const dto = dtoPctLineaBc(lineaPedido);
+  const factor = dto != null ? (1 - dto / 100) : 1;
+  return Math.round(qty * Number(precio) * factor * 100) / 100;
+}
+
+function claveLineaChooser(item) {
+  return item?.key || `${item?.albaran || "PO"}|${item?.id || item?.lineaPedidoId || item?.descripcion || ""}|${item?.cantidad ?? ""}`;
+}
+
+function sumaImportesElegidos(sel) {
+  if (!sel?.items?.length) return 0;
+  return Math.round(sel.items.reduce((s, it) => s + (Number(it.importe) || 0), 0) * 100) / 100;
 }
 
 function enlaceOtroPedido(enlace, numero) {
@@ -728,6 +814,34 @@ function coincideNombreProveedor(escrito, candidato) {
   return c.includes(q) || (q.includes(c) && c.length >= 4);
 }
 
+function normalizarCifProveedor(s) {
+  return String(s || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .replace(/^ES/, "");
+}
+
+function pareceCifProveedor(s) {
+  const t = normalizarCifProveedor(s);
+  if (!t || t.length < 8 || t.length > 10) return false;
+  return /^[A-Z]\d{7}[A-Z0-9]$/.test(t) || /^\d{8}[A-Z]$/.test(t);
+}
+
+function buscarProveedorBc(escrito, proveedoresBc) {
+  const texto = String(escrito || "").trim();
+  if (!texto || !Array.isArray(proveedoresBc) || !proveedoresBc.length) return null;
+  const porNombre = proveedoresBc.find((p) => p.nombre && p.nombre.toUpperCase() === texto.toUpperCase());
+  if (porNombre) return porNombre;
+  const cifN = normalizarCifProveedor(texto);
+  if (cifN && (pareceCifProveedor(texto) || cifN.length >= 8)) {
+    const porCif = proveedoresBc.find(
+      (p) => normalizarCifProveedor(p.cif) === cifN || normalizarCifProveedor(p.numero) === cifN
+    );
+    if (porCif) return porCif;
+  }
+  return null;
+}
+
 function nombrePdfDocumento(numero, esAlbaran) {
   const limpio = String(numero || "documento").replace(/[\\/:*?"<>|\s]+/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "") || "documento";
   return `${esAlbaran ? "Albaran" : "Factura"}_${limpio}.pdf`;
@@ -757,8 +871,83 @@ function cantidadPendienteLinea(l) {
   return Math.max(0, pedida - recibida);
 }
 
+function pendienteFacturarDeLinea(l) {
+  if (!l) return 0;
+  if (l.cantidadPendienteFacturar != null && l.cantidadPendienteFacturar !== "") {
+    return Math.max(0, Number(l.cantidadPendienteFacturar) || 0);
+  }
+  return Math.max(0, (Number(l.cantidadRecibida) || 0) - (Number(l.cantidadFacturada) || 0));
+}
+
+function lineaPedidoYaFacturada(l) {
+  const pedida = Number(l?.cantidadPedida) || 0;
+  if (pedida <= 0.0001) return true;
+  const facturada = Number(l?.cantidadFacturada) || 0;
+  return facturada + 0.0001 >= pedida && pendienteFacturarDeLinea(l) <= 0.0001;
+}
+
+/** Pedido completo ya facturado en BC: no se puede volver a incluir en la factura. */
+function pedidoYaFacturado(lineas) {
+  const lista = (lineas || []).filter((l) => (Number(l?.cantidadPedida) || 0) > 0.0001);
+  if (!lista.length) return false;
+  return lista.every(lineaPedidoYaFacturada);
+}
+
 function pedidoTienePendienteRecibir(lineas) {
   return (lineas || []).some((l) => cantidadPendienteLinea(l) > 0.001);
+}
+
+/**
+ * Motivo único para el aviso en pantalla y el correo al proveedor.
+ * Así no puede decir una cosa el comentario y otra el email.
+ */
+function motivoBloqueoPedidoProveedor(lineas, { tieneLineasBc = false, hayFilasChooser = false } = {}) {
+  if (!tieneLineasBc || hayFilasChooser) return null;
+  if (pedidoYaFacturado(lineas)) return "ya_facturado";
+  if (pedidoTienePendienteRecibir(lineas)) return "sin_recibir";
+  const algunaFacturada = (lineas || []).some((l) => (Number(l?.cantidadFacturada) || 0) > 0.0001);
+  if (algunaFacturada) return "ya_facturado";
+  return "sin_recibir";
+}
+
+const AVISO_PEDIDO_YA_FACTURADO = "ESTE PEDIDO ya se encuentra facturado";
+const AVISO_PEDIDO_SIN_RECIBIR = "No hay líneas recibidas / pendientes de facturar en BC para elegir.";
+
+function textoAvisoMotivoPedido(motivo) {
+  if (motivo === "ya_facturado") return AVISO_PEDIDO_YA_FACTURADO;
+  if (motivo === "sin_recibir") return AVISO_PEDIDO_SIN_RECIBIR;
+  return "";
+}
+
+function parrafoCorreoMotivoPedido(motivo, pedidoTxt) {
+  if (motivo === "ya_facturado") {
+    return `En la factura figura el pedido ${pedidoTxt}. Ese pedido ya está facturado y no corresponde al material de esta factura, así que no podemos tramitarla.\n\nPara poder tramitarla necesitamos el albarán firmado de la entrega.`;
+  }
+  if (motivo === "sin_recibir") {
+    return `En la factura figura el pedido ${pedidoTxt}, pero desgraciadamente en nuestro sistema nos aparece pendiente de recibir. Serían tan amables de enviarnos los albaranes valorados, así que no podemos tramitarla.`;
+  }
+  if (motivo === "albaran_firmado") {
+    return `En la factura figura el pedido ${pedidoTxt}. Para poder tramitarla necesitamos el albarán firmado de la entrega.`;
+  }
+  return `En la factura figura el pedido ${pedidoTxt}. No podemos tramitarla todavía.\n\nPara poder tramitarla necesitamos el albarán firmado de la entrega.`;
+}
+
+function asuntoCorreoMotivoPedido(factura, motivo) {
+  if (motivo === "ya_facturado") return `Factura ${factura || ""} — pedido ya facturado`;
+  if (motivo === "sin_recibir") return `Factura ${factura || ""} — necesitamos los albaranes valorados`;
+  if (motivo === "albaran_firmado") return `Factura ${factura || ""} — necesitamos el albarán firmado`;
+  return `Factura ${factura || ""} — necesitamos el albarán firmado`;
+}
+
+function cierreCorreoMotivoPedido(motivo) {
+  if (motivo === "sin_recibir" || motivo === "albaran_firmado") return "Quedamos a la espera de una respuesta";
+  return "Quedamos a la espera.\n\nGracias.";
+}
+
+function emailRemitenteFactura(origen) {
+  const cand = origen?.de || origen?.from || origen?.email || origen?.remitente || "";
+  const email = String(cand || "").trim();
+  return email.includes("@") ? email : "";
 }
 
 function normTextoLinea(s) {
@@ -904,7 +1093,161 @@ function lineasParaRegistrarRecepcion(lineasBC, lineasFactura) {
   return elegidas;
 }
 
-function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCancelarSeleccion, registrarAplicador, remitenteEmail = null, empezarAbierta = false, onIncidencia, onMinimizar, onEntrada, modoDiario = false, onCargarRecepcion = null }) {
+/** Misma búsqueda de artículos BC que Recepción (Validación → añadir al PC). */
+function BuscadorArticulo({ valor, inicial, disabled, onElegir }) {
+  const [q, setQ] = useState(inicial || "");
+  const [res, setRes] = useState([]);
+  const [abierto, setAbierto] = useState(false);
+  const [buscando, setBuscando] = useState(false);
+  useEffect(() => {
+    if (disabled || q.trim().length < 2) { setRes([]); return; }
+    const t = setTimeout(async () => {
+      setBuscando(true);
+      try {
+        const d = await (await fetch(`/api/bc/articulos?q=${encodeURIComponent(q.trim())}`)).json();
+        setRes(d.articulos || []);
+      } catch { setRes([]); }
+      setBuscando(false);
+    }, 350);
+    return () => clearTimeout(t);
+  }, [q, disabled]);
+  if (disabled) return <span className="font-mono">{valor}</span>;
+  return (
+    <div className="relative">
+      <input
+        value={q}
+        onChange={(e) => { setQ(e.target.value); setAbierto(true); }}
+        onFocus={() => setAbierto(true)}
+        onBlur={() => setTimeout(() => setAbierto(false), 200)}
+        placeholder="Buscar artículo (nº o texto)…"
+        className={`border rounded px-1 py-0.5 w-44 bg-white ${valor ? "border-emerald-300" : "border-amber-400"}`}
+      />
+      {valor && <div className="text-[10px] font-mono text-emerald-700">✓ {valor}</div>}
+      {abierto && (buscando || res.length > 0 || q.trim().length >= 2) && (
+        <div className="absolute z-20 mt-0.5 w-96 max-h-60 overflow-y-auto bg-white border border-slate-300 rounded shadow-lg">
+          {buscando && <div className="px-2 py-1 text-slate-400">Buscando en BC…</div>}
+          {!buscando && res.length === 0 && <div className="px-2 py-1 text-slate-400">Sin resultados — prueba con otra palabra.</div>}
+          {res.map((a) => (
+            <button
+              key={a.numero}
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => { onElegir(a); setQ(a.numero); setAbierto(false); }}
+              className="block w-full text-left px-2 py-1 hover:bg-blue-50"
+            >
+              <span className="font-mono text-slate-500">{a.numero}</span> — {a.descripcion}
+              {a.ud ? <span className="text-slate-400"> · {a.ud}</span> : null}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const CARGOS_PROD_RESPALDO_FC = [
+  { numero: "COMB", descripcion: "COMBUSTIBLE" },
+  { numero: "CORTE", descripcion: "CORTE" },
+  { numero: "DES", descripcion: "DESCUENTO" },
+  { numero: "ELEC", descripcion: "CARGA ELECTRICA" },
+  { numero: "MANIPULACION", descripcion: "MANIPULACION" },
+  { numero: "REPARACIÓN", descripcion: "REPARACIÓN VEHÍCULO" },
+  { numero: "REPFONDO", descripcion: "REPERCUSIÓN FONDO ECONÓMICO" },
+  { numero: "SEGURO", descripcion: "SEGUROS" },
+  { numero: "TASARES", descripcion: "TASA RESIDUOS" },
+  { numero: "TRANSPORTE", descripcion: "TRANSPORTE" },
+];
+
+/** Líneas del PDF sin pareja en BC para el PC de la propuesta (+ las sin pedido). */
+function candidatosAnadirAlPedido(grupo, pedidosDetalle, pedidoActual) {
+  const out = [];
+  const visto = new Set();
+  const push = (l, id, origen) => {
+    if (descripcionEsSoloPedido(l.descripcionFactura, pedidoActual)) return;
+    if (l.lineaBC && l.coincidencia !== "sin_match") return;
+    if (l.lineaBC) return;
+    const desc = String(l.descripcionFactura || "").trim();
+    const qty = Number(l.cantidadFacturada);
+    const precio = l.precioFacturado;
+    const firma = `${desc}|${qty}|${precio ?? ""}`;
+    if (visto.has(firma)) return;
+    visto.add(firma);
+    out.push({
+      id,
+      origen,
+      tipo: "Item",
+      codigo: "",
+      descripcion: desc,
+      busqueda: desc.split(/\s+/).filter(Boolean).slice(0, 3).join(" "),
+      cantidad: Number.isFinite(qty) && qty > 0 ? qty : 1,
+      coste: precio != null && precio !== "" ? Number(precio) : "",
+      marcada: true,
+    });
+  };
+  (grupo?.lineas || []).forEach((l, idx) => {
+    if (l.coincidencia === "sin_match" || !l.lineaBC) {
+      push(l, `sm-${colaPedido(pedidoActual) || "pc"}-${idx}`, "pedido");
+    }
+  });
+  (pedidosDetalle || []).forEach((pg, gi) => {
+    if (String(pg.pedido || "").trim()) return;
+    (pg.lineas || []).forEach((l, idx) => {
+      push(l, `sp-${gi}-${idx}`, "sin_pedido");
+    });
+  });
+  return out;
+}
+
+/** Tras crear líneas en BC, reengancha las del PDF que seguían sin_match. */
+function rematchLineasTrasAnadir(lineasFactura, lineasBc) {
+  const usadas = new Set();
+  for (const l of lineasFactura || []) {
+    if (l.lineaBC?.id && l.coincidencia !== "sin_match") usadas.add(l.lineaBC.id);
+  }
+  return (lineasFactura || []).map((l) => {
+    if (l.lineaBC && l.coincidencia !== "sin_match") {
+      const actual = (lineasBc || []).find((x) => x.id === l.lineaBC.id);
+      if (!actual) return l;
+      const pendienteRecepcion = (Number(actual.cantidadRecibida) || 0) + 0.001 < (Number(l.cantidadFacturada) || 0);
+      const diferenciaPrecio = precioDifiereCliente(l.precioFacturado, actual.precioBC ?? actual.precio);
+      return { ...l, lineaBC: { ...l.lineaBC, ...actual }, pendienteRecepcion, diferenciaPrecio };
+    }
+    let mejor = null;
+    let mejorPunt = 0;
+    for (const lb of lineasBc || []) {
+      if (usadas.has(lb.id)) continue;
+      const punt = Math.max(
+        puntuarTextoLinea(l.descripcionFactura, lb.descripcion),
+        puntuarTextoLinea(l.descripcionFactura, lb.codigo)
+      );
+      if (punt > mejorPunt) { mejorPunt = punt; mejor = lb; }
+    }
+    if ((!mejor || mejorPunt < 0.35) && l.precioFacturado != null && l.precioFacturado !== "") {
+      const precio = Number(l.precioFacturado);
+      if (Number.isFinite(precio)) {
+        const porPrecio = (lineasBc || []).find((lb) => {
+          if (usadas.has(lb.id)) return false;
+          const pBc = lb.precioBC ?? lb.precio;
+          if (pBc == null) return false;
+          if (Math.abs(Number(pBc) - precio) > Math.max(0.02, Math.abs(precio) * 0.02)) return false;
+          const qtyBc = Number(lb.cantidadPedida) || 0;
+          const qtyF = Number(l.cantidadFacturada) || 0;
+          return Math.abs(qtyBc - qtyF) < 0.001 || qtyF <= 0;
+        });
+        if (porPrecio) { mejor = porPrecio; mejorPunt = 0.5; }
+      }
+    }
+    if (!mejor || mejorPunt < 0.35) {
+      return { ...l, lineaBC: null, coincidencia: "sin_match", pendienteRecepcion: false, diferenciaPrecio: false };
+    }
+    usadas.add(mejor.id);
+    const pendienteRecepcion = (Number(mejor.cantidadRecibida) || 0) + 0.001 < (Number(l.cantidadFacturada) || 0);
+    const diferenciaPrecio = precioDifiereCliente(l.precioFacturado, mejor.precioBC ?? mejor.precio);
+    return { ...l, lineaBC: mejor, coincidencia: "manual", pendienteRecepcion, diferenciaPrecio };
+  });
+}
+
+function TarjetaFactura({ f, pedidos, proveedoresBc = null, seleccionActiva, onIniciarSeleccion, onCancelarSeleccion, registrarAplicador, remitenteEmail = null, empezarAbierta = false, onIncidencia, onMinimizar, onEntrada, modoDiario = false, onDescartar = null }) {
   const [abierta, setAbierta] = useState(empezarAbierta);
   const [buscaPedido, setBuscaPedido] = useState("");
   const [verTodosProv, setVerTodosProv] = useState(false);
@@ -914,8 +1257,21 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
   const [continia, setContinia] = useState({ estado: "idle" }); // idle | enviando | ok | error
   const [entrada, setEntrada] = useState({ estado: "idle" }); // idle | entrando | ok | error
   const [lineasBcPorPedido, setLineasBcPorPedido] = useState({});
+  const [albaranesPorPedido, setAlbaranesPorPedido] = useState({});
+  const [lineasElegidasPorPedido, setLineasElegidasPorPedido] = useState({});
+  const lineasElegidasRef = useRef(lineasElegidasPorPedido);
+  lineasElegidasRef.current = lineasElegidasPorPedido;
+  // Borrador siempre visible en el listado unificado (checks + qty a facturar).
+  const [borradorChooser, setBorradorChooser] = useState(null); // { keys: {}, qtys: {} }
   const [registroRecepcion, setRegistroRecepcion] = useState({ estado: "idle" });
+  const [nuevasLineasPorPedido, setNuevasLineasPorPedido] = useState({}); // cola PC → borrador a añadir
+  const [anadirLineasBc, setAnadirLineasBc] = useState({ estado: "idle" }); // idle | subiendo | ok | error
+  const [nuevasLineasPanelAbierto, setNuevasLineasPanelAbierto] = useState(false);
+  const [cargosProd, setCargosProd] = useState(CARGOS_PROD_RESPALDO_FC);
   const [recargaLineas, setRecargaLineas] = useState(0);
+  useEffect(() => {
+    fetch("/api/bc/cargos").then((r) => r.json()).then((d) => { if (d?.cargos?.length) setCargosProd(d.cargos); }).catch(() => {});
+  }, []);
   const [pedidoNuevo, setPedidoNuevo] = useState(() => (
     f.pedidoCreado?.numero ? { estado: "ok", ...f.pedidoCreado } : { estado: "idle" }
   ));
@@ -981,7 +1337,31 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
   // línea (no hay líneas de pedido que editar en este caso), así que se
   // toma directamente de `f`, sin recalcular.
   const esGasto = f.veredicto === "gasto" && !!f.gastoSugerido;
-  const ultima = f.ultimaEntrada || null;
+  const ultimaRaw = f.ultimaEntrada || null;
+  const nombreProvTarjeta = `${f.proveedor || ""} ${ultimaRaw?.proveedorBC || ""} ${ultimaRaw?.proveedorFactura || ""}`;
+  const esFerrosGrupo = ultimaRaw?.regla === "ferros-grupo"
+    || (/ferros/i.test(nombreProvTarjeta) && (/coll/i.test(nombreProvTarjeta) || /alba/i.test(nombreProvTarjeta) || /ferrosca/i.test(nombreProvTarjeta)));
+  const otFerros = ultimaRaw?.ot || f.otDetectada || "";
+  // Ferros: siempre se puede crear el pedido con cuenta 60700004, aunque
+  // la factura se hubiera leído antes de existir esta regla.
+  const ultima = esFerrosGrupo
+    ? {
+        ...(ultimaRaw || {}),
+        regla: "ferros-grupo",
+        cuenta: "60700004",
+        descripcionFija: "TRABAJOS ENTRE EMPRESAS DEL GRUPO",
+        lineType: "Account",
+        puedeCrear: true,
+        ot: otFerros || null,
+        proveedorBC: ultimaRaw?.proveedorBC || f.proveedor,
+        proveedorFactura: ultimaRaw?.proveedorFactura || f.proveedor,
+        resumen: ultimaRaw?.regla === "ferros-grupo"
+          ? ultimaRaw.resumen
+          : (otFerros
+            ? `Ferros Coll de l'Alba: pedido con cuenta 60700004, «TRABAJOS ENTRE EMPRESAS DEL GRUPO», OT ${otFerros}.`
+            : "Ferros Coll de l'Alba: pedido con cuenta 60700004 y «TRABAJOS ENTRE EMPRESAS DEL GRUPO». Indica la OT antes de crear."),
+      }
+    : ultimaRaw;
 
   // Copia local editable de los pedidos/líneas detectados — permite
   // corregir a mano una línea cuando el emparejamiento automático por
@@ -1028,6 +1408,11 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
     setPasoPedido(0);
     setIncluidosPedido({});
     setCorreccionPedido({});
+    setLineasElegidasPorPedido({});
+    setAlbaranesPorPedido({});
+    setBorradorChooser(null);
+    setNuevasLineasPorPedido({});
+    setAnadirLineasBc({ estado: "idle" });
   }, [firmaLectura]);
   const [pedidosLeidos, setPedidosLeidos] = useState(null);
   const [esAlbaranDoc, setEsAlbaranDoc] = useState(false);
@@ -1059,10 +1444,32 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       .then((r) => r.json())
       .then((j) => {
         if (!vivo) return;
-        setPedidosLeidos(Array.isArray(j.pedidos) ? j.pedidos : []);
+        const leidos = Array.isArray(j.pedidos) ? j.pedidos : [];
+        setPedidosLeidos(leidos);
         setEsAlbaranDoc(!!j.esAlbaran);
         setAlbaranDoc(j.albaran || "");
         setLineasDocPdf(Array.isArray(j.lineas) ? j.lineas : []);
+        // Reordenar grupos BC según el orden de lectura del PDF.
+        if (leidos.length) {
+          setPedidosDetalle((prev) => {
+            const rank = new Map();
+            leidos.forEach((n, i) => {
+              const c = colaPedido(n);
+              if (c && !rank.has(c)) rank.set(c, i);
+            });
+            if (!rank.size) return prev;
+            const scored = prev.map((p, i) => ({
+              p,
+              i,
+              r: rank.has(colaPedido(p.pedido)) ? rank.get(colaPedido(p.pedido)) : 10000 + i,
+            }));
+            scored.sort((a, b) => a.r - b.r || a.i - b.i);
+            const next = scored.map((x) => x.p);
+            if (next.length === prev.length && next.every((p, i) => p === prev[i])) return prev;
+            return next;
+          });
+          setPasoPedido(0);
+        }
       })
       .catch(() => { if (vivo) setPedidosLeidos([]); });
     return () => { vivo = false; };
@@ -1095,44 +1502,49 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
     }
     setDocAccion(null);
   };
-  const cargarEnRecepcion = async () => {
-    if (!onCargarRecepcion) {
-      setDocAccionError("No se puede abrir Recepción de material.");
+  const descartarDocumento = async () => {
+    if (!onDescartar) {
+      setDocAccionError("No se puede descartar este documento.");
       return;
     }
-    setDocAccion("recepcion");
+    setDocAccion("descartar");
     setDocAccionError("");
     try {
-      let nombre = nombrePdfDocumento(cabecera.factura, esAlbaranDoc);
-      let base64 = "";
-      const url = urlPdfBandeja("pdf");
-      if (url) {
-        const r = await fetch(url);
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok || !j.base64) throw new Error(j.detalle || j.error || "No se ha podido leer el PDF.");
-        if (j.nombre) nombre = j.nombre;
-        base64 = j.base64;
-      } else if (pdfB64) {
-        base64 = pdfB64;
-      } else {
-        throw new Error("Este documento no tiene PDF.");
-      }
-      onCargarRecepcion({
-        id: `${f.origen?.msg || "local"}|${f.origen?.att || ""}|${Date.now()}`,
-        nombre,
-        base64,
-      });
+      await onDescartar();
     } catch (err) {
-      setDocAccionError(err.message || "No se ha podido cargar en Recepción.");
+      setDocAccionError(err.message || "No se ha podido descartar el documento.");
+      setDocAccion(null);
     }
-    setDocAccion(null);
   };
   const editarCabecera = (campo, valor) => setCabecera((prev) => ({ ...prev, [campo]: valor }));
   const [proveedorFoco, setProveedorFoco] = useState(false);
+  const proveedoresLista = useMemo(() => {
+    const vistos = new Set();
+    const lista = [];
+    const anadir = (nombre) => {
+      const n = String(nombre || "").trim();
+      const clave = n.toUpperCase();
+      if (!n || vistos.has(clave)) return;
+      vistos.add(clave);
+      lista.push(n);
+    };
+    for (const p of proveedoresBc || []) anadir(p.nombre);
+    if (!lista.length) {
+      const cols = columnasPedidos(pedidos?.headers || []);
+      if (cols.proveedor) {
+        for (const fila of pedidos?.rows || []) anadir(fila[cols.proveedor]);
+      }
+    }
+    lista.sort((a, b) => a.localeCompare(b, "es"));
+    return lista;
+  }, [proveedoresBc, pedidos]);
   const indicarProveedor = (nombre) => {
     proveedorTocado.current = true;
-    setCabecera((prev) => ({ ...prev, proveedor: nombre }));
-    const exacto = proveedoresLista.find((n) => n.toUpperCase() === nombre.trim().toUpperCase());
+    const hit = buscarProveedorBc(nombre, proveedoresBc);
+    const exacto = hit?.nombre
+      || proveedoresLista.find((n) => n.toUpperCase() === String(nombre || "").trim().toUpperCase())
+      || "";
+    setCabecera((prev) => ({ ...prev, proveedor: exacto || nombre }));
     if (!exacto) return;
     setPedidosDetalle((prev) => {
       const marcados = prev.map((p) => (p.pedido && !p.bcError ? p : { ...p, vendorName: exacto }));
@@ -1146,27 +1558,46 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       }];
     });
   };
-  const proveedoresLista = useMemo(() => {
-    const cols = columnasPedidos(pedidos?.headers || []);
-    if (!cols.proveedor) return [];
-    const vistos = new Set();
-    const lista = [];
-    for (const fila of pedidos?.rows || []) {
-      const nombre = String(fila[cols.proveedor] || "").trim();
-      const clave = nombre.toUpperCase();
-      if (!nombre || vistos.has(clave)) continue;
-      vistos.add(clave);
-      lista.push(nombre);
+  // Si la IA dejó un CIF (p. ej. A28011864), lo sustituimos por el nombre de BC.
+  useEffect(() => {
+    const escrito = String(cabecera.proveedor || "").trim();
+    if (!escrito || !proveedoresBc?.length) return;
+    const hit = buscarProveedorBc(escrito, proveedoresBc);
+    if (!hit?.nombre) return;
+    if (hit.nombre.toUpperCase() === escrito.toUpperCase()) return;
+    if (!pareceCifProveedor(escrito) && normalizarCifProveedor(escrito) !== normalizarCifProveedor(hit.cif)
+        && normalizarCifProveedor(escrito) !== normalizarCifProveedor(hit.numero)) {
+      return;
     }
-    lista.sort((a, b) => a.localeCompare(b, "es"));
-    return lista;
-  }, [pedidos]);
-  const proveedorExacto = proveedoresLista.find((n) => n.toUpperCase() === String(cabecera.proveedor || "").trim().toUpperCase()) || "";
+    indicarProveedor(hit.nombre);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cabecera.proveedor, proveedoresBc]);
+  const proveedorExacto = (() => {
+    const escrito = String(cabecera.proveedor || "").trim();
+    if (!escrito) return "";
+    const hit = buscarProveedorBc(escrito, proveedoresBc);
+    if (hit?.nombre) return hit.nombre;
+    return proveedoresLista.find((n) => n.toUpperCase() === escrito.toUpperCase()) || "";
+  })();
   const sugerenciasProveedor = useMemo(() => {
     const escrito = String(cabecera.proveedor || "").trim();
     if (!escrito || proveedorExacto) return [];
-    return proveedoresLista.filter((n) => coincideNombreProveedor(escrito, n)).slice(0, 8);
-  }, [cabecera.proveedor, proveedoresLista, proveedorExacto]);
+    const cifN = normalizarCifProveedor(escrito);
+    const porCif = (proveedoresBc || [])
+      .filter((p) => cifN && (normalizarCifProveedor(p.cif).includes(cifN) || normalizarCifProveedor(p.numero).includes(cifN)))
+      .map((p) => p.nombre);
+    const porNombre = proveedoresLista.filter((n) => coincideNombreProveedor(escrito, n));
+    const vistos = new Set();
+    const out = [];
+    for (const n of [...porCif, ...porNombre]) {
+      const k = n.toUpperCase();
+      if (vistos.has(k)) continue;
+      vistos.add(k);
+      out.push(n);
+      if (out.length >= 8) break;
+    }
+    return out;
+  }, [cabecera.proveedor, proveedoresLista, proveedoresBc, proveedorExacto]);
   const nombresProveedorElegido = proveedorExacto
     ? [proveedorExacto]
     : (sugerenciasProveedor.length === 1 ? sugerenciasProveedor : [cabecera.proveedor || f.proveedor].map((n) => String(n || "").trim()).filter(Boolean));
@@ -1239,6 +1670,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             bcError: json.bcError,
             enlaceBC: json.enlaceBC ?? pp.enlaceBC,
             lineasDisponiblesBC: nuevasDisponibles,
+            importe: json.importe != null ? json.importe : pp.importe,
             lineas,
           };
         })
@@ -1287,6 +1719,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             bcError: json.bcError,
             enlaceBC: json.enlaceBC ?? null,
             lineasDisponiblesBC: nuevasDisponibles,
+            importe: json.importe != null ? json.importe : null,
             lineas,
           };
         })
@@ -1501,7 +1934,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
     if (pedidoNuevo.estado === "entrando" || (pedidoNuevo.estado === "ok" && pedidoNuevo.registro?.ok)) return;
     if (pedidoNuevo.numero) return crearPedidoComoUltima(e);
     setVistaPedido({
-      ot: ultima?.ot || "",
+      ot: otFerros || ultima?.ot || "",
       cargando: !ultima?.puedeCrear,
       error: null,
       propuesta: ultima?.puedeCrear ? ultima : null,
@@ -1511,12 +1944,12 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       const r = await fetch("/api/facturas-compra/ultima-entrada", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ proveedor: proveedorPedido }),
+        body: JSON.stringify({ proveedor: proveedorPedido, ot: otFerros || null, factura: cabecera.factura }),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
       if (!j.ultimaEntrada?.puedeCrear) throw new Error(j.ultimaEntrada?.resumen || "No hay una factura anterior de este proveedor para copiar el pedido.");
-      setVistaPedido({ ot: j.ultimaEntrada.ot || "", cargando: false, error: null, propuesta: j.ultimaEntrada });
+      setVistaPedido({ ot: j.ultimaEntrada.ot || otFerros || "", cargando: false, error: null, propuesta: j.ultimaEntrada });
     } catch (err) {
       setVistaPedido((prev) => ({ ...(prev || { ot: "" }), cargando: false, error: err.message || String(err) }));
     }
@@ -1527,6 +1960,23 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
     const proveedorPedido = cabecera.proveedor || ultima?.proveedorFactura || ultima?.proveedorBC || f.proveedor;
     if (!proveedorPedido) return;
     if (pedidoNuevo.estado === "entrando" || (pedidoNuevo.estado === "ok" && pedidoNuevo.registro?.ok)) return;
+    const otFinal = otElegida !== undefined ? String(otElegida ?? "").trim() : (otFerros || "");
+    if ((esFerrosGrupo || ultima?.regla === "ferros-grupo") && !otFinal) {
+      setVistaPedido({
+        ot: "",
+        cargando: false,
+        error: null,
+        propuesta: ultima?.puedeCrear ? ultima : {
+          regla: "ferros-grupo",
+          cuenta: "60700004",
+          descripcionFija: "TRABAJOS ENTRE EMPRESAS DEL GRUPO",
+          lineType: "Account",
+          proveedorBC: proveedorPedido,
+          puedeCrear: true,
+        },
+      });
+      return;
+    }
     setVistaPedido(null);
     setPedidoNuevo((prev) => ({ ...prev, estado: "entrando", error: undefined }));
     const lineas = lineasParaPedido();
@@ -1541,7 +1991,8 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           msg: f.origen?.msg || null,
           att: f.origen?.att || null,
           baseImponible: cabecera.baseImponible,
-          ...(otElegida !== undefined ? { ot: String(otElegida ?? "").trim() } : {}),
+          ...(otFinal ? { ot: otFinal } : {}),
+          ...(esFerrosGrupo || ultima?.regla === "ferros-grupo" ? { regla: "ferros-grupo" } : {}),
           lineas,
         }),
       });
@@ -1559,9 +2010,33 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
   const asuntoIncidencia = `Incidencia factura ${cabecera.factura}${pedidosDetalle?.[0]?.pedido ? ` — Pedido ${pedidosDetalle[0].pedido}` : ""}`;
   const [pedidosAvisados, setPedidosAvisados] = useState(() => new Set());
 
-  const textoCorreoProveedor = () => {
+  // Misma fuente de verdad que el aviso de la propuesta: primero el pedido en foco.
+  const motivoCorreoProveedorActual = () => {
+    const pedidos = (listaPedidosFactura.length ? listaPedidosFactura : pedidosDetalle.map((p) => p.pedido).filter(Boolean))
+      .map((n) => correccionPedido[n] || n)
+      .filter(Boolean);
+    const foco = numeroPropuesta || pedidos[0] || null;
+    const nums = foco ? [foco, ...pedidos.filter((n) => !mismoPedidoFactura(n, foco))] : pedidos;
+    for (const num of nums) {
+      const lineas = Array.isArray(lineasBcPorPedido[num])
+        ? lineasBcPorPedido[num]
+        : (pedidosDetalle.find((p) => mismoPedidoFactura(p.pedido, num))?.lineasDisponiblesBC || []);
+      const tiene = Array.isArray(lineasBcPorPedido[num])
+        || Array.isArray(pedidosDetalle.find((p) => mismoPedidoFactura(p.pedido, num))?.lineasDisponiblesBC);
+      if (!tiene) continue;
+      const restante = (lineas || []).some((l) => Math.max(0, (Number(l.cantidadRecibida) || 0) - (Number(l.cantidadFacturada) || 0)) > 0.0001);
+      const motivo = motivoBloqueoPedidoProveedor(lineas, { tieneLineasBc: true, hayFilasChooser: restante });
+      if (motivo) return motivo;
+    }
+    return null;
+  };
+
+  const textoCorreoProveedor = (motivo = null, pedidoFoco = null) => {
     const pedidos = (listaPedidosFactura.length ? listaPedidosFactura : pedidosDetalle.map((p) => p.pedido).filter(Boolean));
-    const pedidoTxt = pedidos.length ? pedidos.join(", ") : "el que figura en la factura";
+    const foco = pedidoFoco || numeroPropuesta || null;
+    const pedidoTxt = foco
+      ? (correccionPedido[foco] || foco)
+      : (pedidos.length ? pedidos.join(", ") : "el que figura en la factura");
     const mats = pedidosDetalle.flatMap((p) => (p.lineas || []).map((l) => ({
       descripcion: l.descripcionFactura,
       cantidad: l.cantidadFacturada,
@@ -1570,22 +2045,85 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       ? `\n\nMaterial de la factura:\n${mats.map((l) => `· ${l.descripcion}${l.cantidad != null && l.cantidad !== "" ? ` — cantidad ${l.cantidad}` : ""}`).join("\n")}`
       : "";
     const fechaTxt = cabecera.fecha ? fmtFechaFactura(cabecera.fecha) : "";
-    return `Buenos días,\n\nHemos recibido la factura ${cabecera.factura || ""}${fechaTxt && fechaTxt !== "—" ? ` de fecha ${fechaTxt}` : ""}${cabecera.proveedor || f.proveedor ? ` de ${cabecera.proveedor || f.proveedor}` : ""}.\n\nEn la factura figura el pedido ${pedidoTxt}. Ese pedido ya está facturado y no corresponde al material de esta factura, así que no podemos tramitarla.\n\nPara poder tramitarla necesitamos el albarán firmado de la entrega.${bloque}\n\nQuedamos a la espera.\n\nGracias.`;
+    const motivoFinal = motivo || motivoCorreoProveedorActual() || "sin_recibir";
+    return `Buenos días,\n\nHemos recibido la factura ${cabecera.factura || ""}${fechaTxt && fechaTxt !== "—" ? ` de fecha ${fechaTxt}` : ""}${cabecera.proveedor || f.proveedor ? ` de ${cabecera.proveedor || f.proveedor}` : ""}.\n\n${parrafoCorreoMotivoPedido(motivoFinal, pedidoTxt)}${bloque}\n\n${cierreCorreoMotivoPedido(motivoFinal)}`;
   };
 
-  const abrirCorreoProveedor = (e) => {
+  const textoCorreoInternoFactura = (motivo = null, pedidoFoco = null) => {
+    const pedidos = (listaPedidosFactura.length ? listaPedidosFactura : pedidosDetalle.map((p) => p.pedido).filter(Boolean));
+    const foco = pedidoFoco || numeroPropuesta || null;
+    const pedidoTxt = foco
+      ? (correccionPedido[foco] || foco)
+      : (pedidos.length ? pedidos.join(", ") : "el de la factura");
+    const fechaTxt = cabecera.fecha ? fmtFechaFactura(cabecera.fecha) : "";
+    const motivoFinal = motivo || motivoCorreoProveedorActual() || "sin_recibir";
+    return `Buenos días,\n\nOs escribimos por la factura ${cabecera.factura || ""}${fechaTxt && fechaTxt !== "—" ? ` de fecha ${fechaTxt}` : ""}${cabecera.proveedor || f.proveedor ? ` de ${cabecera.proveedor || f.proveedor}` : ""}.\n\nEl pedido ${pedidoTxt} figura pendiente de recibir o sin albarán firmado, y por eso no podemos registrar la factura.\n\n${parrafoCorreoMotivoPedido(motivoFinal, pedidoTxt)}\n\n¿Podéis confirmar si el material ya se ha recibido, si falta el albarán firmado o si hay alguna incidencia?`;
+  };
+
+  const destinosInternosFactura = (pedidoFoco = null) => {
+    const foco = pedidoFoco || numeroPropuesta || null;
+    const grupos = foco
+      ? [{ pedido: foco }]
+      : (pedidosDetalle || []).filter((p) => p.pedido).map((p) => ({ pedido: p.pedido }));
+    const listas = destinatariosFactura(grupos.length ? grupos : pedidosDetalle, pedidos, remitenteEmail);
+    const admin = copiasAdministracion(remitenteEmail);
+    const vistos = new Set();
+    const para = [];
+    for (const e of [...(listas.para || []), ...admin]) {
+      const k = String(e || "").trim().toLowerCase();
+      if (!k || vistos.has(k)) continue;
+      vistos.add(k);
+      para.push(String(e).trim());
+    }
+    return para;
+  };
+
+  const elegirTipoCorreoProveedor = (tipo) => {
+    setVistaCorreo((v) => {
+      if (!v?.alProveedor) return v;
+      const motivo = v.motivo || "sin_recibir";
+      if (tipo === "interno") {
+        return {
+          ...v,
+          tipoMensaje: "interno",
+          paraTexto: (v.paraInterno || destinosInternosFactura(v.pedido)).join("; "),
+          ccTexto: "",
+          cuerpo: textoCorreoInternoFactura(motivo, v.pedido),
+        };
+      }
+      return {
+        ...v,
+        tipoMensaje: "proveedor",
+        paraTexto: v.paraProveedor || "",
+        ccTexto: (v.ccProveedor || destinosInternosFactura(v.pedido)).join("; "),
+        cuerpo: textoCorreoProveedor(motivo, v.pedido),
+      };
+    });
+  };
+
+  const abrirCorreoProveedor = (e, motivoOverride = null, pedidoFoco = null) => {
     e?.stopPropagation?.();
     if (envio.estado === "enviando") return;
     if (envio.estado === "error") setEnvio({ estado: "idle" });
+    // Mismo motivo que el aviso UI de la propuesta (o el del pedido en foco).
+    const motivo = motivoOverride || motivoCorreoProveedorActual() || "sin_recibir";
+    const pedidoCorreo = pedidoFoco || numeroPropuesta || null;
+    const paraRemitente = emailRemitenteFactura(f.origen);
+    const internos = destinosInternosFactura(pedidoCorreo);
     setVistaCorreo({
       alProveedor: true,
-      pedido: null,
-      asunto: `Factura ${cabecera.factura || ""} — necesitamos el albarán firmado`,
-      cuerpo: textoCorreoProveedor(),
-      paraTexto: "",
-      ccTexto: "",
+      tipoMensaje: "proveedor",
+      motivo,
+      pedido: pedidoCorreo,
+      asunto: asuntoCorreoMotivoPedido(cabecera.factura, motivo),
+      cuerpo: textoCorreoProveedor(motivo, pedidoCorreo),
+      // Para = quien nos envió la factura (remitente bandeja), no vacío.
+      paraTexto: paraRemitente,
+      paraProveedor: paraRemitente,
+      paraInterno: internos,
+      ccTexto: internos.join("; "),
+      ccProveedor: internos,
     });
-    const nombre = String(cabecera.proveedor || f.proveedor || "").trim();
     if (!pdfB64 && f.origen?.msg) {
       const q = `msg=${encodeURIComponent(f.origen.msg)}&att=${encodeURIComponent(f.origen.att ?? "")}`;
       fetch(`/api/facturas-compra/bandeja/pdf?${q}`)
@@ -1596,12 +2134,20 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         })
         .catch(() => {});
     }
+    // Si el origen aún no trae el remitente, se completa desde BC solo como respaldo.
+    if (paraRemitente) return;
+    const nombre = String(cabecera.proveedor || f.proveedor || "").trim();
     if (!nombre) return;
     fetch(`/api/bc/proveedor-email?nombre=${encodeURIComponent(nombre)}`)
       .then((r) => r.json())
       .then((d) => {
         if (!d?.email) return;
-        setVistaCorreo((v) => (v?.alProveedor && !String(v.paraTexto || "").trim() ? { ...v, paraTexto: d.email } : v));
+        setVistaCorreo((v) => {
+          if (!v?.alProveedor || String(v.paraProveedor || "").trim()) return v;
+          const next = { ...v, paraProveedor: d.email };
+          if (v.tipoMensaje !== "interno") next.paraTexto = d.email;
+          return next;
+        });
       })
       .catch(() => {});
   };
@@ -1633,12 +2179,51 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
     e?.stopPropagation?.();
     const nums = listaVisible.filter((n) => incluidosPedido[colaPedido(n)]);
     if (!nums.length || entrada.estado === "entrando") return;
+    // Los checks del pedido abierto mandan: si se cambió la selección después
+    // de «Incluir», no se arrastran albaranes antiguos al borrador de BC.
+    let elegidas = { ...lineasElegidasPorPedido };
+    if (numeroPropuesta && incluidosPedido[colaPedido(numeroPropuesta)] && borradorChooser) {
+      const itemsVivos = itemsDesdeBorrador();
+      if (itemsVivos.length) {
+        const clave = colaPedido(numeroPropuesta);
+        const modoVivo = itemsVivos.some((it) => it.albaran) ? "albaran" : "pedido";
+        elegidas = { ...elegidas, [clave]: { modo: modoVivo, items: itemsVivos } };
+        setLineasElegidasPorPedido(elegidas);
+      }
+    }
+    for (const num of nums) {
+      const sel = elegidas[colaPedido(num)] || elegidas[num];
+      if (!sel?.items?.length) {
+        setEntrada({
+          estado: "error",
+          error: `Marca las líneas (o el albarán) de ${num} e Incluir en la factura antes de crear el borrador.`,
+        });
+        return;
+      }
+      const albs = [...new Set((sel.items || []).map((it) => it.albaran).filter(Boolean))];
+      if ((sel.modo || "").toLowerCase() === "albaran" && !albs.length) {
+        setEntrada({
+          estado: "error",
+          error: `El pedido ${num} tiene varios albaranes: marca solo el/los de esta factura e Incluir antes de crear el borrador.`,
+        });
+        return;
+      }
+    }
+    // Si ya hay albaranes incluidos, se puede crear el borrador aunque el
+    // pedido tenga cantidades pendientes de recibir. Solo se bloquea cuando
+    // no hay albarán marcado (entonces hace falta Registrar antes).
     if (pedidoIncluidoSinRecibir) {
-      setEntrada({
-        estado: "error",
-        error: "El pedido todavía no está recibido. Pulsa Registrar: solo recibe el pedido. No se crea la factura.",
+      const sinAlbaran = nums.some((num) => {
+        const sel = elegidas[colaPedido(num)] || elegidas[num];
+        return !(sel?.items || []).some((it) => it.albaran);
       });
-      return;
+      if (sinAlbaran) {
+        setEntrada({
+          estado: "error",
+          error: "El pedido todavía no está recibido. Pulsa Registrar: solo recibe el pedido. No se crea la factura.",
+        });
+        return;
+      }
     }
     setEntrada({ estado: "entrando" });
     try {
@@ -1651,6 +2236,25 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           if (rPdf.ok && jPdf.base64) pdfBase64 = jPdf.base64;
         } catch { /* el servidor busca el PDF por el correo */ }
       }
+      const seleccionPorPedido = {};
+      for (const num of nums) {
+        const sel = elegidas[colaPedido(num)] || elegidas[num];
+        if (!sel?.items?.length) continue;
+        const albaranes = [...new Set((sel.items || []).map((it) => it.albaran).filter(Boolean))];
+        seleccionPorPedido[num] = {
+          modo: sel.modo || (albaranes.length ? "albaran" : "pedido"),
+          albaranes,
+          lineas: (sel.items || []).map((it) => ({
+            id: it.id || null,
+            lineaPedidoId: it.lineaPedidoId || null,
+            codigo: it.codigo || null,
+            descripcion: it.descripcion || null,
+            cantidad: it.cantidad,
+            albaran: it.albaran || null,
+            importe: it.importe,
+          })),
+        };
+      }
       const r = await fetch("/api/facturas-compra/registrar", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1659,6 +2263,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           fechaFactura: cabecera.fecha || null,
           proveedor: cabecera.proveedor || f.proveedor || null,
           pedidos: nums,
+          seleccionPorPedido,
           msg: f.origen?.msg || null,
           att: f.origen?.att ?? null,
           pdfBase64,
@@ -1808,9 +2413,13 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
 
   const pcsFormanFactura = pedidosDetalle.filter((p) => p.pedido);
   const sinPedidoUtil = !esGasto && !pedidosDetalle.some((p) => p.pedido && !p.bcError);
+  // Chips / «Propuesta N de M»: orden del PDF (pedidosLeidos), no BC ni alpha.
   const listaPedidosFactura = [];
   const colasVistas = new Set();
-  for (const num of [...(pedidosLeidos || []), ...pedidosDetalle.map((p) => p.pedido).filter(Boolean)]) {
+  const fuenteOrden = (pedidosLeidos && pedidosLeidos.length)
+    ? [...pedidosLeidos, ...pedidosDetalle.map((p) => p.pedido).filter(Boolean)]
+    : pedidosDetalle.map((p) => p.pedido).filter(Boolean);
+  for (const num of fuenteOrden) {
     const cola = colaPedido(num);
     if (!cola) continue;
     const ya = listaPedidosFactura.findIndex((n) => colaPedido(n) === cola);
@@ -1828,12 +2437,20 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
   const numeroPropuesta = listaVisible[pasoSeguro] || null;
   useEffect(() => {
     setTextoPedido(numeroPropuesta || "");
+    setAnadirLineasBc({ estado: "idle" });
   }, [pasoSeguro, origenPropuesta, numeroPropuesta]);
   const corregirPedido = async (escrito) => {
     const numero = normalizarNumeroPedido(escrito);
     if (!origenPropuesta || !numero || numero === numeroPropuesta) return;
     setCorreccionPedido((prev) => ({ ...prev, [origenPropuesta]: numero }));
     setTextoPedido(numero);
+    setLineasElegidasPorPedido((prev) => {
+      const next = { ...prev };
+      delete next[colaPedido(origenPropuesta)];
+      delete next[colaPedido(numero)];
+      return next;
+    });
+    setBorradorChooser(null);
     setLeyendoPedidoCorr(true);
     try {
       const r = await fetch("/api/facturas-compra/refrescar-pedido", {
@@ -1854,6 +2471,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           bcError: json.bcError || null,
           enlaceBC: json.enlaceBC ?? null,
           lineasDisponiblesBC: json.lineasDisponiblesBC || [],
+          importe: json.importe != null ? json.importe : null,
           lineas: (base.lineas || []).map((l) => ({ ...l, lineaBC: null, coincidencia: "sin_match", pendienteRecepcion: false, diferenciaPrecio: false })),
         };
         if (idx >= 0) return prev.map((p, i) => (i === idx ? grupo : p));
@@ -1909,13 +2527,48 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
   const hayPedidosEnElPdf = listaPedidosFactura.some(pedidoVieneDeLaFactura);
   const numerosConjunto = listaVisible.filter((n) => incluidosPedido[colaPedido(n)]);
   const claveConjunto = numerosConjunto.join("|");
+  // Cada propuesta (y cada PC del conjunto) se relee en vivo de BC: % dto +
+  // importe línea excl. IVA. No reutilizar extract viejo sin descuentoPct.
+  useEffect(() => {
+    const pedido = numeroPropuesta;
+    if (!pedido) return;
+    let vivo = true;
+    (async () => {
+      try {
+        const r = await fetch("/api/facturas-compra/refrescar-pedido", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pedido }),
+        });
+        const json = await r.json().catch(() => ({}));
+        if (!vivo || !r.ok) return;
+        const lineas = json.lineasDisponiblesBC || [];
+        const albs = Array.isArray(json.albaranes) ? json.albaranes : [];
+        setLineasBcPorPedido((prev) => ({ ...prev, [pedido]: lineas }));
+        setAlbaranesPorPedido((prev) => ({ ...prev, [pedido]: albs }));
+        setPedidosDetalle((prev) => prev.map((p) => {
+          if (!mismoPedidoFactura(p.pedido, pedido)) return p;
+          return {
+            ...p,
+            lineasDisponiblesBC: lineas,
+            albaranes: albs,
+            importe: json.importe != null ? json.importe : p.importe,
+            vendorName: json.vendorName ?? p.vendorName,
+            bcError: json.bcError || null,
+            enlaceBC: json.enlaceBC ?? p.enlaceBC,
+          };
+        }));
+      } catch { /* se muestra lo que haya hasta el siguiente paso */ }
+    })();
+    return () => { vivo = false; };
+  }, [numeroPropuesta]);
   useEffect(() => {
     const nums = claveConjunto ? claveConjunto.split("|") : [];
     if (!nums.length) return;
     let vivo = true;
     (async () => {
       for (const num of nums) {
-        if (lineasBcPorPedido[num]) continue;
+        if (num === numeroPropuesta) continue; // ya lo pide el efecto de propuesta
         try {
           const r = await fetch("/api/facturas-compra/refrescar-pedido", {
             method: "POST",
@@ -1925,12 +2578,26 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           const json = await r.json().catch(() => ({}));
           if (!vivo || !r.ok) continue;
           const lineas = json.lineasDisponiblesBC || [];
-          setLineasBcPorPedido((prev) => (prev[num] ? prev : { ...prev, [num]: lineas }));
+          const albs = Array.isArray(json.albaranes) ? json.albaranes : [];
+          setLineasBcPorPedido((prev) => ({ ...prev, [num]: lineas }));
+          setAlbaranesPorPedido((prev) => ({ ...prev, [num]: albs }));
+          setPedidosDetalle((prev) => prev.map((p) => (
+            mismoPedidoFactura(p.pedido, num)
+              ? {
+                  ...p,
+                  lineasDisponiblesBC: lineas,
+                  albaranes: albs,
+                  importe: json.importe != null ? json.importe : p.importe,
+                  vendorName: json.vendorName ?? p.vendorName,
+                  bcError: json.bcError || null,
+                  enlaceBC: json.enlaceBC ?? p.enlaceBC,
+                }
+              : p
+          )));
         } catch { /* el botón se decide con lo que ya haya */ }
       }
     })();
     return () => { vivo = false; };
-    // Solo al cambiar el conjunto. lineasBcPorPedido se lee de este render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claveConjunto]);
   const pedidoIncluidoSinRecibir = numerosConjunto.some((num) => {
@@ -2056,7 +2723,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       {registroRecepcion.estado === "registrando" ? "Registrando…" : "Registrar"}
     </button>
   ) : null;
-  const ocupadoBc = entrada.estado === "entrando" || registroRecepcion.estado === "registrando";
+  const ocupadoBc = entrada.estado === "entrando" || registroRecepcion.estado === "registrando" || anadirLineasBc.estado === "subiendo";
   const textoBotonBc = entrada.estado === "entrando" ? "Trayendo albaranes…" : "Crear borrador en BC";
   const pulsarBotonBc = (e) => {
     crearYRegistrar(e);
@@ -2079,8 +2746,502 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
       ? pedidoTienePendienteRecibir(lineasBcPropuesta)
       : true
   );
+  const propuestaYaFacturada = !!numeroPropuesta && propuestaTieneLineasBc && pedidoYaFacturado(lineasBcPropuesta);
+  const totalPropuesta = totalPedidoPropuesta(grupoPropuesta, lineasBcPropuesta);
+  const albaranesPropuesta = !numeroPropuesta
+    ? []
+    : (Array.isArray(albaranesPorPedido[numeroPropuesta])
+      ? albaranesPorPedido[numeroPropuesta]
+      : (grupoPropuesta?.albaranes || []));
+  const opcionesChooserPropuesta = useMemo(() => {
+    if (!numeroPropuesta) return { modo: "pedido", filas: [] };
+    // Pedido ya facturado: no ofrecer líneas ni albaranes para incluir.
+    if (propuestaYaFacturada) return { modo: "pedido", filas: [] };
+    if (albaranesPropuesta.length) {
+      const filas = [];
+      for (const alb of albaranesPropuesta) {
+        for (const l of alb.lineas || []) {
+          const key = `ALB|${alb.numero}|${l.id || l.codigo || l.descripcion}`;
+          filas.push({
+            key,
+            modo: "albaran",
+            albaran: alb.numero,
+            fechaAlbaran: alb.fecha || "",
+            id: l.id,
+            lineaPedidoId: l.lineaPedidoId || null,
+            codigo: l.codigo || l.codigoPedido || "",
+            descripcion: l.descripcion || "",
+            cantidad: Number(l.cantidad) || 0,
+            cantidadMax: Number(l.cantidad) || 0,
+            precio: l.precioBC ?? l.precio,
+            descuentoPct: l.descuentoPct ?? l.discountPercent,
+            importe: l.importeLinea ?? l.amountExcludingTax,
+            preciosDesdePedido: !!l.preciosDesdePedido,
+          });
+        }
+      }
+      return { modo: "albaran", filas };
+    }
+    // Solo lo recibido y aún no facturado. Si el pedido ya está facturado,
+    // filas queda vacío y la UI muestra el aviso (no se puede incluir).
+    const filas = (lineasBcPropuesta || []).map((l) => {
+      const restante = Math.max(0, (Number(l.cantidadRecibida) || 0) - (Number(l.cantidadFacturada) || 0));
+      if (restante <= 0.0001) return null;
+      const staged = pendienteFacturarDeLinea(l);
+      const qty = staged > 0.0001 ? Math.min(staged, restante) : restante;
+      return {
+        key: `PO|${l.id || l.codigo || l.descripcion}`,
+        modo: "pedido",
+        albaran: null,
+        id: l.id,
+        lineaPedidoId: l.id,
+        codigo: l.codigo || "",
+        descripcion: l.descripcion || "",
+        cantidad: qty,
+        cantidadMax: qty,
+        cantidadPedida: l.cantidadPedida,
+        cantidadRecibida: l.cantidadRecibida,
+        cantidadPendienteFacturar: qty,
+        precio: l.precioBC ?? l.precio ?? l.directUnitCost,
+        descuentoPct: dtoPctLineaBc(l),
+        importe: importeParaCantidadDesdePedido(l, qty) ?? importeLineaPedidoBc(l),
+        preciosDesdePedido: true,
+        lineaPedido: l,
+      };
+    }).filter(Boolean);
+    return { modo: "pedido", filas };
+  }, [numeroPropuesta, albaranesPropuesta, lineasBcPropuesta, propuestaYaFacturada]);
+
+  // Mismo motivo para el aviso en pantalla y el correo al proveedor.
+  const motivoPropuesta = motivoBloqueoPedidoProveedor(lineasBcPropuesta, {
+    tieneLineasBc: propuestaTieneLineasBc,
+    hayFilasChooser: (opcionesChooserPropuesta.filas || []).length > 0,
+  });
+  const avisoPropuesta = textoAvisoMotivoPedido(motivoPropuesta);
+
+  const firmaSinMatchPropuesta = useMemo(() => {
+    if (!numeroPropuesta) return "";
+    return candidatosAnadirAlPedido(grupoPropuesta, pedidosDetalle, numeroPropuesta)
+      .map((c) => `${c.id}|${c.descripcion}|${c.cantidad}|${c.coste}`)
+      .join("||");
+  }, [numeroPropuesta, grupoPropuesta, pedidosDetalle]);
+
+  useEffect(() => {
+    if (!numeroPropuesta || propuestaYaFacturada) return;
+    const cola = colaPedido(numeroPropuesta);
+    if (!cola) return;
+    const cands = candidatosAnadirAlPedido(grupoPropuesta, pedidosDetalle, numeroPropuesta);
+    setNuevasLineasPorPedido((prev) => {
+      const prevArr = prev[cola] || [];
+      const byId = Object.fromEntries(prevArr.map((n) => [n.id, n]));
+      const next = cands.map((c) => {
+        const old = byId[c.id];
+        if (!old) return c;
+        if (old.creadaId) return { ...c, ...old, creadaId: old.creadaId };
+        return {
+          ...c,
+          tipo: old.tipo || c.tipo,
+          codigo: old.codigo ?? c.codigo,
+          descripcion: old.descripcion ?? c.descripcion,
+          cantidad: old.cantidad ?? c.cantidad,
+          coste: old.coste ?? c.coste,
+          marcada: old.marcada !== false,
+          busqueda: old.busqueda || c.busqueda,
+        };
+      });
+      // Conservar líneas manuales o ya creadas que no vienen del PDF detectado
+      const extras = prevArr.filter((n) =>
+        !next.some((x) => x.id === n.id) && (n.creadaId || n.origen === "manual" || String(n.id || "").startsWith("manual-"))
+      );
+      const merged = [...next, ...extras];
+      const misma = prevArr.length === merged.length
+        && merged.every((n, i) => prevArr[i]?.id === n.id && prevArr[i]?.codigo === n.codigo
+          && prevArr[i]?.tipo === n.tipo && prevArr[i]?.marcada === n.marcada
+          && String(prevArr[i]?.cantidad) === String(n.cantidad)
+          && String(prevArr[i]?.coste) === String(n.coste)
+          && prevArr[i]?.descripcion === n.descripcion
+          && prevArr[i]?.creadaId === n.creadaId);
+      if (misma) return prev;
+      return { ...prev, [cola]: merged };
+    });
+  }, [numeroPropuesta, firmaSinMatchPropuesta, propuestaYaFacturada, grupoPropuesta, pedidosDetalle]);
+
+  useEffect(() => {
+    setNuevasLineasPanelAbierto(false);
+  }, [numeroPropuesta]);
+
+  const colaPropuesta = colaPedido(numeroPropuesta);
+  const borradorNuevasPropuesta = (colaPropuesta && nuevasLineasPorPedido[colaPropuesta]) || [];
+  const editarNuevaLineaPropuesta = (id, campo, valor) => {
+    if (!colaPropuesta) return;
+    setNuevasLineasPorPedido((prev) => ({
+      ...prev,
+      [colaPropuesta]: (prev[colaPropuesta] || []).map((n) => (n.id === id ? { ...n, [campo]: valor } : n)),
+    }));
+  };
+  const pendientesNuevasMarcadas = () => {
+    if (!numeroPropuesta) return [];
+    const cola = colaPedido(numeroPropuesta);
+    return (nuevasLineasPorPedido[cola] || []).filter((n) => n.marcada && !n.creadaId);
+  };
+
+  const abrirVistaPedidoLineasMarcadas = async () => {
+    if (!numeroPropuesta || anadirLineasBc.estado === "subiendo" || pedidoNuevo.estado === "entrando") return;
+    const pendientes = pendientesNuevasMarcadas();
+    if (!pendientes.length) {
+      setAnadirLineasBc({ estado: "error", error: "Marca al menos una línea para crear el pedido." });
+      return;
+    }
+    const sinCodigo = pendientes.filter((n) => !String(n.codigo || "").trim());
+    if (sinCodigo.length) {
+      setAnadirLineasBc({
+        estado: "error",
+        error: "Falta el código de artículo (o cargo) en BC. Búscalo y elígelo antes de crear el pedido.",
+      });
+      return;
+    }
+    setAnadirLineasBc({ estado: "idle" });
+    const proveedorPedido = cabecera.proveedor || ultima?.proveedorFactura || ultima?.proveedorBC || f.proveedor;
+    const lineasVista = pendientes.map((n) => ({
+      id: n.id,
+      tipo: n.tipo === "Charge" ? "Charge" : "Item",
+      codigo: String(n.codigo).trim(),
+      descripcion: n.descripcion || "",
+      cantidad: Number(n.cantidad) || 0,
+      coste: n.coste === "" || n.coste == null ? null : Number(n.coste),
+    }));
+    setVistaPedido({
+      modo: "lineasMarcadas",
+      ot: otFerros || ultima?.ot || "",
+      cargando: !ultima?.puedeCrear,
+      error: null,
+      propuesta: ultima?.puedeCrear
+        ? { ...ultima, lineasMarcadas: lineasVista }
+        : { puedeCrear: true, proveedorBC: proveedorPedido, lineasMarcadas: lineasVista },
+    });
+    if (ultima?.puedeCrear) return;
+    if (!proveedorPedido) {
+      setVistaPedido((prev) => ({
+        ...(prev || { ot: "", modo: "lineasMarcadas" }),
+        cargando: false,
+        error: null,
+        propuesta: { puedeCrear: true, proveedorBC: "", lineasMarcadas: lineasVista },
+      }));
+      return;
+    }
+    try {
+      const r = await fetch("/api/facturas-compra/ultima-entrada", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proveedor: proveedorPedido, ot: otFerros || null, factura: cabecera.factura }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.ultimaEntrada?.puedeCrear) {
+        setVistaPedido({
+          modo: "lineasMarcadas",
+          ot: j.ultimaEntrada.ot || otFerros || "",
+          cargando: false,
+          error: null,
+          propuesta: { ...j.ultimaEntrada, lineasMarcadas: lineasVista },
+        });
+      } else {
+        setVistaPedido({
+          modo: "lineasMarcadas",
+          ot: otFerros || "",
+          cargando: false,
+          error: null,
+          propuesta: { puedeCrear: true, proveedorBC: proveedorPedido, lineasMarcadas: lineasVista },
+        });
+      }
+    } catch {
+      setVistaPedido({
+        modo: "lineasMarcadas",
+        ot: otFerros || "",
+        cargando: false,
+        error: null,
+        propuesta: { puedeCrear: true, proveedorBC: proveedorPedido, lineasMarcadas: lineasVista },
+      });
+    }
+  };
+
+  const crearPedidoDesdeLineasMarcadas = async (otElegida) => {
+    const pendientes = pendientesNuevasMarcadas();
+    if (!pendientes.length) {
+      setAnadirLineasBc({ estado: "error", error: "Marca al menos una línea para crear el pedido." });
+      return;
+    }
+    const proveedorPedido = cabecera.proveedor || ultima?.proveedorFactura || ultima?.proveedorBC || f.proveedor
+      || vistaPedido?.propuesta?.proveedorBC;
+    if (!proveedorPedido) {
+      setAnadirLineasBc({ estado: "error", error: "Falta el proveedor para crear el pedido." });
+      return;
+    }
+    const otFinal = String(otElegida ?? vistaPedido?.ot ?? "").trim();
+    setVistaPedido(null);
+    setAnadirLineasBc({ estado: "subiendo" });
+    setPedidoNuevo((prev) => ({ ...prev, estado: "entrando", error: undefined }));
+    const cola = colaPedido(numeroPropuesta);
+    try {
+      const r = await fetch("/api/facturas-compra/crear-pedido", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          proveedor: proveedorPedido,
+          fecha: cabecera.fecha || null,
+          factura: cabecera.factura,
+          msg: f.origen?.msg || null,
+          att: f.origen?.att || null,
+          ...(otFinal ? { ot: otFinal } : {}),
+          ...(numeroPropuesta ? { pedidoOrigen: numeroPropuesta } : {}),
+          lineasBC: pendientes.map((n) => ({
+            tipo: n.tipo === "Charge" ? "Charge" : "Item",
+            codigo: String(n.codigo).trim(),
+            descripcion: n.descripcion || "",
+            cantidad: Number(n.cantidad) || 0,
+            coste: n.coste === "" || n.coste == null ? null : Number(n.coste),
+          })),
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.error || `Error ${r.status}`);
+      setPedidoNuevo({ estado: "ok", ...json });
+      if (!json.registro?.ok) {
+        throw new Error(json.registro?.error || "El pedido se creó pero no se registró la recepción.");
+      }
+      const creadasIds = {};
+      for (const n of pendientes) creadasIds[n.id] = json.numero || "ok";
+      setNuevasLineasPorPedido((prev) => ({
+        ...prev,
+        [cola]: (prev[cola] || []).map((n) => (creadasIds[n.id] ? { ...n, creadaId: creadasIds[n.id], marcada: false } : n)),
+      }));
+
+      const rRef = await fetch("/api/facturas-compra/refrescar-pedido", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pedido: json.numero }),
+      });
+      const jRef = await rRef.json().catch(() => ({}));
+      if (!rRef.ok) throw new Error(jRef.error || "No se ha podido refrescar el pedido nuevo.");
+      const frescas = jRef.lineasDisponiblesBC || [];
+      const albs = Array.isArray(jRef.albaranes) ? jRef.albaranes : [];
+      setLineasBcPorPedido((prev) => ({ ...prev, [json.numero]: frescas }));
+      setAlbaranesPorPedido((prev) => ({ ...prev, [json.numero]: albs }));
+      setPedidosDetalle((prev) => {
+        const ya = prev.some((p) => mismoPedidoFactura(p.pedido, json.numero));
+        if (ya) {
+          return prev.map((p) => (mismoPedidoFactura(p.pedido, json.numero)
+            ? {
+              ...p,
+              lineasDisponiblesBC: frescas,
+              albaranes: albs,
+              importe: jRef.importe != null ? jRef.importe : p.importe,
+              vendorName: jRef.vendorName ?? p.vendorName,
+              bcError: jRef.bcError || null,
+              enlaceBC: jRef.enlaceBC ?? p.enlaceBC ?? json.enlace,
+            }
+            : p));
+        }
+        return [
+          ...prev,
+          {
+            pedido: json.numero,
+            lineas: [],
+            lineasDisponiblesBC: frescas,
+            albaranes: albs,
+            importe: jRef.importe != null ? jRef.importe : json.importe,
+            vendorName: jRef.vendorName ?? json.vendorName,
+            bcError: jRef.bcError || null,
+            enlaceBC: jRef.enlaceBC ?? json.enlace,
+          },
+        ];
+      });
+      setRecargaLineas((n) => n + 1);
+      setAnadirLineasBc({ estado: "ok", pedido: json.numero });
+    } catch (err) {
+      const error = err.message || String(err);
+      setAnadirLineasBc({ estado: "error", error });
+      setPedidoNuevo((prev) => (prev.numero
+        ? { ...prev, estado: "ok", registro: { ok: false, error } }
+        : { estado: "error", error }));
+    }
+  };
+
+  // Mantener el borrador de checks alineado con el pedido de la propuesta.
+  // Si ya se pulsó «Incluir», se restaura esa selección.
+  // Si no: con varios albaranes no se marca nada (hay que elegir); con uno solo, sí.
+  useEffect(() => {
+    if (!numeroPropuesta) {
+      setBorradorChooser(null);
+      return;
+    }
+    const cola = colaPedido(numeroPropuesta);
+    const prev = lineasElegidasRef.current[cola] || lineasElegidasRef.current[numeroPropuesta];
+    const filas = opcionesChooserPropuesta.filas || [];
+    const keys = {};
+    const qtys = {};
+    if (prev?.items?.length) {
+      for (const it of prev.items) {
+        const k = claveLineaChooser(it);
+        keys[k] = true;
+        qtys[k] = Number(it.cantidad) || 0;
+      }
+      for (const fila of filas) {
+        if (qtys[fila.key] == null) qtys[fila.key] = fila.cantidad;
+      }
+    } else {
+      const albaranesDistintos = new Set(filas.map((f) => f.albaran).filter(Boolean));
+      const marcarTodas = albaranesDistintos.size <= 1;
+      for (const fila of filas) {
+        if (marcarTodas) keys[fila.key] = true;
+        qtys[fila.key] = fila.cantidad;
+      }
+    }
+    setBorradorChooser({ keys, qtys });
+  }, [numeroPropuesta, opcionesChooserPropuesta]);
+
+  // Si el pedido ya está en el conjunto y se cambian los checks, actualizar
+  // lo guardado: «Crear borrador» debe llevar solo lo marcado ahora.
+  useEffect(() => {
+    if (!numeroPropuesta || !borradorChooser) return;
+    const clave = colaPedido(numeroPropuesta);
+    if (!clave || !incluidosPedido[clave]) return;
+    const items = [];
+    for (const fila of opcionesChooserPropuesta.filas || []) {
+      if (!borradorChooser.keys?.[fila.key]) continue;
+      const qtyRaw = borradorChooser.qtys?.[fila.key];
+      const qty = Math.min(
+        Number(fila.cantidadMax) || 0,
+        Math.max(0, qtyRaw != null && qtyRaw !== "" ? Number(qtyRaw) : Number(fila.cantidad) || 0)
+      );
+      if (qty <= 0.0001) continue;
+      items.push({
+        key: fila.key,
+        modo: fila.modo,
+        albaran: fila.albaran || null,
+        id: fila.id,
+        lineaPedidoId: fila.lineaPedidoId,
+        codigo: fila.codigo,
+        descripcion: fila.descripcion,
+        cantidad: qty,
+        precio: fila.precio,
+        descuentoPct: fila.descuentoPct,
+        importe: fila.importe,
+      });
+    }
+    setLineasElegidasPorPedido((prev) => {
+      const actual = prev[clave];
+      const misma = actual?.items?.length === items.length
+        && items.every((it, i) => actual.items[i]?.key === it.key && Number(actual.items[i]?.cantidad) === Number(it.cantidad));
+      if (misma) return prev;
+      if (!items.length) {
+        const next = { ...prev };
+        delete next[clave];
+        return next;
+      }
+      const modo = items.some((it) => it.albaran) ? "albaran" : "pedido";
+      return { ...prev, [clave]: { modo, items } };
+    });
+    if (!items.length) {
+      setIncluidosPedido((prev) => {
+        if (!prev[clave]) return prev;
+        const next = { ...prev };
+        delete next[clave];
+        return next;
+      });
+    }
+  }, [borradorChooser, numeroPropuesta, incluidosPedido, opcionesChooserPropuesta]);
+
+  const itemsDesdeBorrador = () => {
+    if (!borradorChooser) return [];
+    const opts = opcionesChooserPropuesta.filas || [];
+    const items = [];
+    for (const fila of opts) {
+      if (!borradorChooser.keys?.[fila.key]) continue;
+      const qtyRaw = borradorChooser.qtys?.[fila.key];
+      const qty = Math.min(
+        Number(fila.cantidadMax) || 0,
+        Math.max(0, qtyRaw != null && qtyRaw !== "" ? Number(qtyRaw) : Number(fila.cantidad) || 0)
+      );
+      if (qty <= 0.0001) continue;
+      const importe = fila.modo === "pedido" && fila.lineaPedido
+        ? (importeParaCantidadDesdePedido(fila.lineaPedido, qty) ?? fila.importe)
+        : (fila.importe != null && Math.abs(qty - Number(fila.cantidad)) < 0.0001
+          ? fila.importe
+          : (fila.precio != null
+            ? Math.round(qty * Number(fila.precio) * (1 - (Number(fila.descuentoPct) || 0) / 100) * 100) / 100
+            : fila.importe));
+      items.push({
+        key: fila.key,
+        modo: fila.modo,
+        albaran: fila.albaran || null,
+        id: fila.id,
+        lineaPedidoId: fila.lineaPedidoId,
+        codigo: fila.codigo,
+        descripcion: fila.descripcion,
+        cantidad: qty,
+        precio: fila.precio,
+        descuentoPct: fila.descuentoPct,
+        importe,
+      });
+    }
+    return items;
+  };
+
+  const marcarTodasLineas = () => {
+    setBorradorChooser((prev) => {
+      const keys = {};
+      const qtys = { ...(prev?.qtys || {}) };
+      for (const fila of opcionesChooserPropuesta.filas || []) {
+        keys[fila.key] = true;
+        if (qtys[fila.key] == null) qtys[fila.key] = fila.cantidad;
+      }
+      return { keys, qtys };
+    });
+  };
+
+  const desmarcarTodasLineas = () => {
+    setBorradorChooser((prev) => ({ keys: {}, qtys: { ...(prev?.qtys || {}) } }));
+  };
+
+  const incluirPropuestaEnFactura = () => {
+    if (propuestaYaFacturada) return;
+    const claveInc = colaPedido(actualPropuesta?.numero);
+    if (!claveInc) return;
+    const items = itemsDesdeBorrador();
+    if (!items.length) return;
+    const modo = items.some((it) => it.albaran) ? "albaran" : "pedido";
+    setLineasElegidasPorPedido((prev) => ({ ...prev, [claveInc]: { modo, items } }));
+    setIncluidosPedido((prev) => ({ ...prev, [claveInc]: true }));
+    setPasoPedido((p) => Math.min(listaVisible.length - 1, p + 1));
+  };
+
+  // Si BC confirma que el pedido de la propuesta ya está facturado, no puede
+  // quedar en el conjunto ni con líneas elegidas.
+  useEffect(() => {
+    if (!propuestaYaFacturada || !numeroPropuesta) return;
+    const clave = colaPedido(numeroPropuesta);
+    if (!clave) return;
+    setIncluidosPedido((prev) => {
+      if (!prev[clave] && !prev[numeroPropuesta]) return prev;
+      const next = { ...prev };
+      delete next[clave];
+      delete next[numeroPropuesta];
+      return next;
+    });
+    setLineasElegidasPorPedido((prev) => {
+      if (!prev[clave] && !prev[numeroPropuesta]) return prev;
+      const next = { ...prev };
+      delete next[clave];
+      delete next[numeroPropuesta];
+      return next;
+    });
+    setBorradorChooser(null);
+  }, [propuestaYaFacturada, numeroPropuesta]);
+
   const importeConjunto = listaVisible.reduce((sum, num) => {
     if (!incluidosPedido[colaPedido(num)]) return sum;
+    const sel = lineasElegidasPorPedido[colaPedido(num)] || lineasElegidasPorPedido[num];
+    if (sel?.items?.length) return sum + sumaImportesElegidos(sel);
     const g = pedidosDetalle.find((p) => mismoPedidoFactura(p.pedido, num));
     return sum + (g?.lineas || []).reduce((s, l) => s + (Number(l.cantidadFacturada) || 0) * (Number(l.precioFacturado) || 0), 0);
   }, 0);
@@ -2168,10 +3329,13 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
 
   const sinNumero = !f.factura;
   const marcaCampo = (bien) => bien ? "text-emerald-700" : "text-red-700";
+  // Registrada (FC*) o borrador (PFC*): no se vuelve a entrar. Aviso antes
+  // de cualquier formulario / botón de incluir.
+  const bloqueadaPorDuplicado = estaEntrada(f) || estaBorradorBC(f);
   return (
-    <div className={modoDiario ? "bg-white" : `border rounded-lg overflow-hidden ${esGasto ? "border-blue-300" : ok ? "border-emerald-300" : "border-red-300"}`}>
+    <div className={modoDiario ? "bg-white" : `border rounded-lg overflow-hidden ${bloqueadaPorDuplicado ? (estaEntrada(f) ? "border-amber-400" : "border-sky-400") : esGasto ? "border-blue-300" : ok ? "border-emerald-300" : "border-red-300"}`}>
       {!modoDiario && <div
-        className={`flex items-center justify-between px-3 py-2 cursor-pointer ${esGasto ? "bg-blue-50" : ok ? "bg-emerald-50" : "bg-red-50"}`}
+        className={`flex items-center justify-between px-3 py-2 cursor-pointer ${bloqueadaPorDuplicado ? (estaEntrada(f) ? "bg-amber-50" : "bg-sky-50") : esGasto ? "bg-blue-50" : ok ? "bg-emerald-50" : "bg-red-50"}`}
         onClick={() => {
           if (modoDiario) return;
           if (onMinimizar && abierta) onMinimizar();
@@ -2208,7 +3372,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               {cabecera.fecha && <span className="text-slate-400 font-normal"> · {cabecera.fecha}</span>}
             </div>
             <div className="text-xs text-slate-500">
-              {f.yaEntrada ? "ya está entrada en BC — no se sigue" : pedidosPendRecibir.length > 0 ? "no está entrada — el pedido sigue pendiente de recibir" : esGasto ? "sin pedido — proveedor de gasto" : ultima ? "sin pedido — proponer pedido como la última factura" : `${pedidosDetalle.length} pedido(s) en la factura`}
+              {f.yaEntrada ? "ya está registrada en BC — no se sigue" : (f.yaBorrador || f.veredicto === "ya_borrador") ? "ya tiene borrador en BC — no se crea otro" : pedidosPendRecibir.length > 0 ? "no está entrada — el pedido sigue pendiente de recibir" : esGasto ? "sin pedido — proveedor de gasto" : esFerrosGrupo ? "sin pedido — Ferros · cuenta 60700004 · trabajos grupo" : ultima ? "sin pedido — proponer pedido como la última factura" : `${pedidosDetalle.length} pedido(s) en la factura`}
               {" "}· páginas {f.paginas.join(", ")}
               {cabecera.importeTotal !== null && cabecera.importeTotal !== undefined && ` · total ${fmtEur(cabecera.importeTotal)}`}
             </div>
@@ -2245,7 +3409,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               Minimizar
             </button>
           )}
-          {ultima?.puedeCrear && !f.yaEntrada && pedidosPendRecibir.length === 0 && !esGasto ? (
+          {ultima?.puedeCrear && !bloqueadaPorDuplicado && pedidosPendRecibir.length === 0 && !esGasto ? (
             <button
               type="button"
               onClick={abrirVistaPedido}
@@ -2258,22 +3422,46 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                   ? "Registrar pedido"
                   : pedidoNuevo.registro?.ok
                     ? "Pedido registrado"
-                    : "Crear pedido como la última"}
+                    : esFerrosGrupo
+                      ? "Crear pedido Ferros"
+                      : "Crear pedido como la última"}
             </button>
           ) : (
             <span
               className={`text-xs font-semibold px-2 py-1 rounded-full ${
-                f.yaEntrada ? "bg-amber-500 text-white" : pedidosPendRecibir.length > 0 ? "bg-orange-600 text-white" : esGasto ? "bg-blue-600 text-white" : ok ? "bg-emerald-600 text-white" : "bg-red-600 text-white"
+                f.yaEntrada ? "bg-amber-500 text-white" : (f.yaBorrador || f.veredicto === "ya_borrador") ? "bg-sky-600 text-white" : pedidosPendRecibir.length > 0 ? "bg-orange-600 text-white" : esGasto ? "bg-blue-600 text-white" : ok ? "bg-emerald-600 text-white" : "bg-red-600 text-white"
               }`}
             >
-              {f.yaEntrada ? "Ya entrada en BC" : pedidosPendRecibir.length > 0 ? "Pendiente de recibir" : esGasto ? "Proveedor de gasto" : ok ? "OK · lista para BC" : "No cuadra — revisar"}
+              {f.yaEntrada ? "Ya registrada en BC" : (f.yaBorrador || f.veredicto === "ya_borrador") ? "Borrador en BC" : pedidosPendRecibir.length > 0 ? "Pendiente de recibir" : esGasto ? "Proveedor de gasto" : ok ? "OK · lista para BC" : "No cuadra — revisar"}
             </span>
           )}
           {abierta ? <ChevronDown size={16} className="text-slate-400" /> : <ChevronRight size={16} className="text-slate-400" />}
         </div>
       </div>}
 
-      {modoDiario && abierta && (
+      {abierta && bloqueadaPorDuplicado && (
+        <div className={`px-4 py-3 border-t text-sm ${estaEntrada(f) ? "bg-amber-50 border-amber-300 text-amber-950" : "bg-sky-50 border-sky-300 text-sky-950"}`}>
+          <div className="font-semibold text-[15px]">
+            {estaEntrada(f)
+              ? "Esta factura YA ESTÁ ENTRADA — no se puede volver a entrar"
+              : "Esta factura YA TIENE BORRADOR EN BC — no se puede volver a entrar"}
+          </div>
+          <div className="mt-1.5 text-[13px]">
+            {f.entradaInfo?.numeroBC ? <>Documento BC: <span className="font-semibold">{f.entradaInfo.numeroBC}</span>. </> : null}
+            {f.entradaInfo?.proveedor || cabecera.proveedor || f.proveedor
+              ? <>Proveedor: <span className="font-semibold">{f.entradaInfo?.proveedor || cabecera.proveedor || f.proveedor}</span>. </>
+              : null}
+            Nº factura proveedor: <span className="font-semibold">{cabecera.factura || f.factura || "—"}</span>.
+          </div>
+          <div className="mt-1 text-[12px]">
+            {estaEntrada(f)
+              ? "Sale de Pendientes. No se analizan pedidos ni se crea otro documento."
+              : "No se crea otro borrador. Cuando esté registrada en el histórico, saldrá de Pendientes."}
+          </div>
+        </div>
+      )}
+
+      {modoDiario && abierta && !bloqueadaPorDuplicado && (
         <div className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
           <div className="grid grid-cols-2 gap-x-4 gap-y-2">
             <label className="text-[11px] text-slate-500 block">
@@ -2372,16 +3560,8 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             <button type="button" onClick={() => setVerDetalle((v) => !v)} className="text-[11px] font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded px-2 py-1">
               {verDetalle ? "Ocultar líneas" : "Líneas"}
             </button>
-            <button type="button" onClick={abrirCorreoProveedor} className="text-[11px] font-semibold text-white bg-slate-700 hover:bg-slate-800 rounded px-2 py-1">
+            <button type="button" onClick={(e) => abrirCorreoProveedor(e, motivoPropuesta)} className="text-[11px] font-semibold text-white bg-slate-700 hover:bg-slate-800 rounded px-2 py-1">
               Correo al proveedor
-            </button>
-            <button
-              type="button"
-              onClick={cargarEnRecepcion}
-              disabled={!!docAccion}
-              className="text-[11px] font-semibold text-white bg-purple-700 hover:bg-purple-800 disabled:opacity-60 rounded px-2 py-1"
-            >
-              {docAccion === "recepcion" ? "Abriendo recepción…" : "Cargar en Recepción de material"}
             </button>
             <button
               type="button"
@@ -2391,6 +3571,17 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             >
               {docAccion === "descarga" ? "Descargando…" : "Descargar documento"}
             </button>
+            {onDescartar && (
+              <button
+                type="button"
+                onClick={descartarDocumento}
+                disabled={!!docAccion}
+                className="text-[11px] font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 rounded px-2 py-1"
+                title="Sale de Pendientes; la lectura y el PDF se quedan guardados (Ver descartadas)"
+              >
+                {docAccion === "descartar" ? "Descartando…" : "Descartar documento"}
+              </button>
+            )}
           </div>
           {esAlbaranDoc && <div className="mt-1 text-[12px] font-semibold text-amber-800">Este documento es un albarán</div>}
           {docAccionError && <div className="mt-1 text-[12px] text-red-700">{docAccionError}</div>}
@@ -2402,70 +3593,448 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             <div className="mt-3 border-t border-slate-200 pt-2" onClick={(e) => e.stopPropagation()}>
               <div className="text-[13px] font-semibold text-slate-800">Pedidos de la factura, en su orden</div>
               <div className="mt-1 flex flex-wrap gap-1">
-                {listaVisible.map((num, i) => (
+                {listaVisible.map((num, i) => {
+                  const lineasChip = Array.isArray(lineasBcPorPedido[num])
+                    ? lineasBcPorPedido[num]
+                    : (pedidosDetalle.find((p) => mismoPedidoFactura(p.pedido, num))?.lineasDisponiblesBC || null);
+                  const chipYaFacturado = Array.isArray(lineasChip) && pedidoYaFacturado(lineasChip);
+                  return (
                   <button
                     key={listaPedidosFactura[i] || num}
                     type="button"
                     onClick={() => setPasoPedido(i)}
-                    className={`text-[11px] rounded px-2 py-0.5 border ${i === pasoSeguro ? "bg-sky-700 text-white border-sky-700" : incluidosPedido[colaPedido(num)] ? "bg-emerald-50 text-emerald-800 border-emerald-300" : "bg-white text-slate-700 border-slate-300"}`}
+                    title={chipYaFacturado ? "ESTE PEDIDO ya se encuentra facturado" : undefined}
+                    className={`text-[11px] rounded px-2 py-0.5 border ${i === pasoSeguro ? (chipYaFacturado ? "bg-amber-800 text-white border-amber-800" : "bg-sky-700 text-white border-sky-700") : chipYaFacturado ? "bg-amber-50 text-amber-900 border-amber-400" : incluidosPedido[colaPedido(num)] ? "bg-emerald-50 text-emerald-800 border-emerald-300" : "bg-white text-slate-700 border-slate-300"}`}
                   >
-                    {i + 1}. {num}{incluidosPedido[colaPedido(num)] ? " ✓" : ""}
+                    {i + 1}. {num}{chipYaFacturado ? " · facturado" : incluidosPedido[colaPedido(num)] ? " ✓" : ""}
                   </button>
-                ))}
+                  );
+                })}
               </div>
               {actualPropuesta && (
                 <div className="mt-2 border border-slate-200 rounded p-2">
                   <div className="text-[12px] text-slate-500">Propuesta {pasoSeguro + 1} de {listaVisible.length}</div>
-                  <label className="block mt-1 text-[11px] text-slate-500">
-                    Nº de pedido
-                    <input
-                      value={textoPedido}
-                      onChange={(e) => setTextoPedido(e.target.value)}
-                      onBlur={() => corregirPedido(textoPedido)}
-                      onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
-                      className="mt-0.5 w-full bg-white border border-slate-300 rounded px-1.5 py-1 text-[14px] font-semibold text-slate-800 focus:outline-none focus:border-sky-600"
-                    />
-                  </label>
-                  <div className="mt-1 text-[11px] text-slate-500">Si no es este, cámbialo y se vuelve a leer en Business Central.</div>
+                  <div className="mt-1 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-2 items-end">
+                    <label className="block text-[11px] text-slate-500 min-w-0">
+                      Nº de pedido
+                      <input
+                        value={textoPedido}
+                        onChange={(e) => setTextoPedido(e.target.value)}
+                        onBlur={() => corregirPedido(textoPedido)}
+                        onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+                        className="mt-0.5 w-full bg-white border border-slate-300 rounded px-1.5 py-1 text-[14px] font-semibold text-slate-800 focus:outline-none focus:border-sky-600"
+                      />
+                    </label>
+                    <div className="text-[11px] text-slate-500 sm:text-right">
+                      Total pedido
+                      <div className="mt-0.5 bg-white border border-slate-300 rounded px-1.5 py-1 text-[14px] font-semibold text-slate-800 whitespace-nowrap">
+                        {totalPropuesta != null ? fmtEur(totalPropuesta) : "—"}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-1 text-[11px] text-slate-500">Si no es este, cámbialo y se vuelve a leer en Business Central. Total = pedido BC (tras descuentos).</div>
                   {leyendoPedidoCorr && <div className="mt-1 text-[12px] text-slate-500">Leyendo el pedido…</div>}
                   {actualPropuesta.grupo?.bcError && <div className="text-[12px] text-amber-800">{actualPropuesta.grupo.bcError}</div>}
-                  <div className="mt-1 divide-y divide-slate-100">
-                    {(actualPropuesta.grupo?.lineas || []).map((l, i) => (
-                      <div key={i} className="py-1 flex items-baseline gap-2 text-[12px]">
-                        <span className="flex-1 text-slate-800">{l.descripcionFactura || "—"}</span>
-                        <span className="text-slate-500">{l.cantidadFacturada ?? ""}</span>
-                        <span className="text-slate-800">{l.precioFacturado != null ? fmtEur(Number(l.cantidadFacturada || 0) * Number(l.precioFacturado || 0)) : ""}</span>
+                  {avisoPropuesta && (
+                    <div className={`mt-2 rounded px-2 py-1.5 border ${motivoPropuesta === "ya_facturado" ? "text-[13px] font-bold text-amber-950 bg-amber-100 border-amber-400" : "text-[12px] font-semibold text-amber-900 bg-amber-50 border-amber-300"}`}>
+                      {avisoPropuesta}
+                    </div>
+                  )}
+                  <div className="mt-1">
+                    {motivoPropuesta === "ya_facturado" ? (
+                      <div className="text-[12px] text-amber-900 py-1">No se puede incluir en esta factura: en Business Central ya está facturado.</div>
+                    ) : motivoPropuesta === "sin_recibir" ? null : (opcionesChooserPropuesta.filas?.length > 0 && borradorChooser) ? (
+                      <div>
+                        <div className="text-[11px] text-slate-500 mb-0.5">
+                          {opcionesChooserPropuesta.modo === "albaran"
+                            ? "Líneas por albarán (marca las de esta factura · qty albarán · precios del pedido)"
+                            : "Líneas del pedido (marca las de esta factura)"}
+                        </div>
+                        <div className="mt-0.5 mb-1 text-[11px] text-slate-500">
+                          Si el pedido llega en varios albaranes, elige solo las líneas/cantidades de los albaranes de esta factura (no todo el PC).
+                          Cantidad del albarán + precio y % dto del pedido.
+                        </div>
+                        <div className="max-h-72 overflow-y-auto">
+                          {opcionesChooserPropuesta.modo === "albaran" ? (
+                            [...new Set(opcionesChooserPropuesta.filas.map((f) => f.albaran))].map((albNum) => {
+                              const filasAlb = opcionesChooserPropuesta.filas.filter((f) => f.albaran === albNum);
+                              const fecha = filasAlb[0]?.fechaAlbaran || "";
+                              return (
+                                <div key={albNum} className="mb-2 last:mb-0">
+                                  <div className="text-[11px] font-semibold text-sky-900 bg-sky-50 rounded px-1.5 py-0.5 mb-0.5">
+                                    {albNum}{fecha ? ` · ${fecha}` : ""}
+                                  </div>
+                                  <div className="grid grid-cols-[auto_minmax(0,1fr)_auto_auto_auto_auto] gap-x-2 text-[10px] text-slate-500 border-b border-slate-100 pb-0.5">
+                                    <span></span>
+                                    <span>Descripción</span>
+                                    <span className="text-right">Cant.</span>
+                                    <span className="text-right">P. unit.</span>
+                                    <span className="text-right">% Dto.</span>
+                                    <span className="text-right">Importe</span>
+                                  </div>
+                                  {filasAlb.map((fila) => (
+                                    <label key={fila.key} className="py-1 grid grid-cols-[auto_minmax(0,1fr)_auto_auto_auto_auto] gap-x-2 items-center text-[12px] cursor-pointer">
+                                      <input
+                                        type="checkbox"
+                                        checked={!!borradorChooser.keys?.[fila.key]}
+                                        onChange={(e) => {
+                                          const on = e.target.checked;
+                                          setBorradorChooser((prev) => ({
+                                            ...prev,
+                                            keys: { ...prev.keys, [fila.key]: on },
+                                            qtys: { ...prev.qtys, [fila.key]: prev.qtys?.[fila.key] ?? fila.cantidad },
+                                          }));
+                                        }}
+                                      />
+                                      <span className="min-w-0 text-slate-800 truncate" title={fila.descripcion}>{fila.descripcion || fila.codigo || "—"}</span>
+                                      <span className="text-right tabular-nums text-slate-700">{fila.cantidad}</span>
+                                      <span className="text-right tabular-nums text-slate-700 whitespace-nowrap">{fila.precio != null ? Number(fila.precio).toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 3 }) : "—"}</span>
+                                      <span className="text-right tabular-nums text-slate-700 whitespace-nowrap">{fmtDtoPct(fila.descuentoPct)}</span>
+                                      <span className="text-right tabular-nums font-medium text-slate-800 whitespace-nowrap">{fila.importe != null ? fmtEur(fila.importe) : "—"}</span>
+                                    </label>
+                                  ))}
+                                </div>
+                              );
+                            })
+                          ) : (
+                            <>
+                              <div className="grid grid-cols-[auto_minmax(0,1fr)_auto_auto_auto_auto_auto] gap-x-2 text-[10px] text-slate-500 border-b border-slate-100 pb-0.5">
+                                <span></span>
+                                <span>Descripción</span>
+                                <span className="text-right">Pedida</span>
+                                <span className="text-right">A facturar</span>
+                                <span className="text-right">P. unit.</span>
+                                <span className="text-right">% Dto.</span>
+                                <span className="text-right">Importe</span>
+                              </div>
+                              {opcionesChooserPropuesta.filas.map((fila) => {
+                                const marcada = !!borradorChooser.keys?.[fila.key];
+                                const qty = borradorChooser.qtys?.[fila.key] ?? fila.cantidad;
+                                const imp = fila.lineaPedido
+                                  ? importeParaCantidadDesdePedido(fila.lineaPedido, qty)
+                                  : fila.importe;
+                                return (
+                                  <div key={fila.key} className="py-1 grid grid-cols-[auto_minmax(0,1fr)_auto_auto_auto_auto_auto] gap-x-2 items-center text-[12px]">
+                                    <input
+                                      type="checkbox"
+                                      checked={marcada}
+                                      onChange={(e) => {
+                                        const on = e.target.checked;
+                                        setBorradorChooser((prev) => ({
+                                          ...prev,
+                                          keys: { ...prev.keys, [fila.key]: on },
+                                          qtys: { ...prev.qtys, [fila.key]: prev.qtys?.[fila.key] ?? fila.cantidad },
+                                        }));
+                                      }}
+                                    />
+                                    <span className="min-w-0 text-slate-800 truncate" title={fila.descripcion}>{fila.descripcion || fila.codigo || "—"}</span>
+                                    <span className="text-right tabular-nums text-slate-500">{fila.cantidadPedida ?? "—"}</span>
+                                    <input
+                                      type="number"
+                                      step="any"
+                                      min={0}
+                                      max={fila.cantidadMax}
+                                      disabled={!marcada}
+                                      value={marcada ? qty : ""}
+                                      onChange={(e) => {
+                                        const v = e.target.value === "" ? "" : Number(e.target.value);
+                                        setBorradorChooser((prev) => ({
+                                          ...prev,
+                                          qtys: { ...prev.qtys, [fila.key]: v },
+                                        }));
+                                      }}
+                                      className="w-16 text-right border border-slate-300 rounded px-1 py-0.5 text-[12px] disabled:opacity-40"
+                                    />
+                                    <span className="text-right tabular-nums text-slate-700 whitespace-nowrap">{fila.precio != null ? Number(fila.precio).toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 3 }) : "—"}</span>
+                                    <span className="text-right tabular-nums text-slate-700 whitespace-nowrap">{fmtDtoPct(fila.descuentoPct)}</span>
+                                    <span className="text-right tabular-nums font-medium text-slate-800 whitespace-nowrap">{imp != null ? fmtEur(imp) : "—"}</span>
+                                  </div>
+                                );
+                              })}
+                            </>
+                          )}
+                        </div>
                       </div>
-                    ))}
-                    {!(actualPropuesta.grupo?.lineas || []).length && !(actualPropuesta.grupo?.lineasDisponiblesBC || []).length && (
-                      <div className="py-1 text-[12px] text-slate-500">Este pedido está en la factura. Las líneas se ven en el PDF.</div>
-                    )}
-                    {(actualPropuesta.grupo?.lineasDisponiblesBC || []).length > 0 && (
-                      <div className="mt-1 border-t border-slate-100 pt-1">
-                        <div className="text-[11px] text-slate-500">Líneas de este pedido en BC</div>
-                        {(actualPropuesta.grupo.lineasDisponiblesBC || []).map((l) => (
-                          <div key={l.id || l.descripcion} className="py-1 flex items-baseline gap-2 text-[12px]">
-                            <span className="flex-1 text-slate-800">{l.descripcion || l.codigo || "—"}</span>
-                            <span className="text-slate-500">pedida {l.cantidadPedida ?? ""}</span>
-                            <span className="text-slate-500">recibida {l.cantidadRecibida ?? ""}</span>
+                    ) : (actualPropuesta.grupo?.lineas || []).length > 0 ? (
+                      <div className="divide-y divide-slate-100">
+                        <div className="text-[11px] text-slate-500 mb-0.5">Líneas leídas de la factura (sin cruce BC aún)</div>
+                        {(actualPropuesta.grupo?.lineas || []).map((l, i) => (
+                          <div key={i} className="py-1 flex items-baseline gap-2 text-[12px]">
+                            <span className="flex-1 text-slate-800">{l.descripcionFactura || "—"}</span>
+                            <span className="text-slate-500">{l.cantidadFacturada ?? ""}</span>
+                            <span className="text-slate-800">{l.precioFacturado != null ? fmtEur(Number(l.cantidadFacturada || 0) * Number(l.precioFacturado || 0)) : ""}</span>
                           </div>
                         ))}
                       </div>
+                    ) : (
+                      <div className="py-1 text-[12px] text-slate-500">Este pedido está en la factura. Las líneas se ven en el PDF.</div>
                     )}
                   </div>
-                  <div className="mt-2 flex gap-2 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const claveInc = colaPedido(actualPropuesta.numero);
-                        setIncluidosPedido((prev) => ({ ...prev, [claveInc]: true }));
-                        setPasoPedido((p) => Math.min(listaVisible.length - 1, p + 1));
-                      }}
-                      className="text-[11px] font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded px-2 py-1"
-                    >
-                      Incluir en la factura
-                    </button>
-                    {propuestaSinRecibir && (
+                  {!propuestaYaFacturada && (() => {
+                    const viva = itemsDesdeBorrador();
+                    if (!viva.length) return null;
+                    const modo = viva.some((it) => it.albaran) ? "albaran" : "pedido";
+                    return (
+                      <div className="mt-1.5 text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-1">
+                        Marcadas para esta factura: {viva.length} línea(s)
+                        {modo === "albaran"
+                          ? ` · albarán ${[...new Set(viva.map((it) => it.albaran).filter(Boolean))].join(", ")}`
+                          : ""}
+                        {" · "}{fmtEur(sumaImportesElegidos({ items: viva }))}
+                      </div>
+                    );
+                  })()}
+                  {!propuestaYaFacturada && !borradorNuevasPropuesta.some((n) => !n.creadaId) && (
+                    <div className="mt-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!colaPropuesta) return;
+                          const id = `manual-${Date.now()}`;
+                          setNuevasLineasPorPedido((prev) => ({
+                            ...prev,
+                            [colaPropuesta]: [
+                              ...(prev[colaPropuesta] || []),
+                              {
+                                id,
+                                origen: "manual",
+                                tipo: "Item",
+                                codigo: "",
+                                descripcion: "",
+                                busqueda: "",
+                                cantidad: 1,
+                                coste: "",
+                                marcada: true,
+                              },
+                            ],
+                          }));
+                          setNuevasLineasPanelAbierto(true);
+                        }}
+                        className="text-[11px] font-semibold text-amber-900 border border-amber-300 bg-amber-50 hover:bg-amber-100 rounded px-2 py-1"
+                      >
+                        Añadir al pedido una línea que no está en BC
+                      </button>
+                    </div>
+                  )}
+                  {!propuestaYaFacturada && borradorNuevasPropuesta.some((n) => !n.creadaId) && (
+                    <div className="mt-2 border border-amber-200 bg-amber-50/60 rounded p-2">
+                      <button
+                        type="button"
+                        onClick={() => setNuevasLineasPanelAbierto((v) => !v)}
+                        className="w-full flex items-center gap-2 text-left"
+                        aria-expanded={nuevasLineasPanelAbierto}
+                      >
+                        <span className="text-[11px] text-amber-800 w-3 shrink-0" aria-hidden="true">
+                          {nuevasLineasPanelAbierto ? "▾" : "▸"}
+                        </span>
+                        <span className="text-[11px] font-semibold text-amber-900 flex-1 min-w-0">
+                          Líneas de la factura que no están en este pedido — se añaden a {numeroPropuesta}
+                          <span className="font-normal text-amber-800">
+                            {" · "}{borradorNuevasPropuesta.filter((n) => !n.creadaId).length} línea(s)
+                          </span>
+                        </span>
+                      </button>
+                      {anadirLineasBc.estado === "error" && !nuevasLineasPanelAbierto && (
+                        <div className="mt-1 text-[12px] text-red-700">{anadirLineasBc.error}</div>
+                      )}
+                      {anadirLineasBc.estado === "ok" && !nuevasLineasPanelAbierto && (
+                        <div className="mt-1 text-[12px] text-emerald-800">
+                          Pedido {anadirLineasBc.pedido || pedidoNuevo.numero || ""} creado y registrado. Inclúyelo en la factura.
+                        </div>
+                      )}
+                      {nuevasLineasPanelAbierto && (
+                        <>
+                          <div className="text-[10px] text-amber-800 mb-1.5 mt-1.5">
+                            Elige el código de artículo en BC (por defecto Artículo). Se crea un pedido nuevo solo con las líneas marcadas (OT a mano), se registra y luego puedes Incluirlas.
+                          </div>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-[11px]">
+                              <thead>
+                                <tr className="text-slate-500 text-left">
+                                  <th className="px-1 py-0.5 w-6"></th>
+                                  <th className="px-1 py-0.5">Tipo</th>
+                                  <th className="px-1 py-0.5">Nº BC</th>
+                                  <th className="px-1 py-0.5">Descripción</th>
+                                  <th className="px-1 py-0.5 text-right">Cant.</th>
+                                  <th className="px-1 py-0.5 text-right">Coste</th>
+                                  <th className="px-1 py-0.5 text-right">Importe</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {borradorNuevasPropuesta.filter((n) => !n.creadaId).map((n) => (
+                                  <tr key={n.id} className="border-t border-amber-100 align-top">
+                                    <td className="px-1 py-0.5">
+                                      <input
+                                        type="checkbox"
+                                        checked={n.marcada !== false}
+                                        onChange={(e) => editarNuevaLineaPropuesta(n.id, "marcada", e.target.checked)}
+                                      />
+                                    </td>
+                                    <td className="px-1 py-0.5 whitespace-nowrap">
+                                      <select
+                                        value={n.tipo || "Item"}
+                                        onChange={(e) => {
+                                          const t = e.target.value;
+                                          editarNuevaLineaPropuesta(n.id, "tipo", t);
+                                          editarNuevaLineaPropuesta(n.id, "codigo", t === "Item" ? "" : (n.codigo || "TRANSPORTE"));
+                                        }}
+                                        className="border border-slate-300 rounded px-1 py-0.5 bg-white"
+                                      >
+                                        <option value="Item">Artículo</option>
+                                        <option value="Charge">Cargo</option>
+                                      </select>
+                                    </td>
+                                    <td className="px-1 py-0.5">
+                                      {(n.tipo || "Item") === "Item" ? (
+                                        <BuscadorArticulo
+                                          valor={n.codigo}
+                                          inicial={n.busqueda}
+                                          onElegir={(a) => {
+                                            editarNuevaLineaPropuesta(n.id, "codigo", a.numero);
+                                            if (a.descripcion) editarNuevaLineaPropuesta(n.id, "descripcion", a.descripcion);
+                                          }}
+                                        />
+                                      ) : (
+                                        <select
+                                          value={n.codigo || ""}
+                                          onChange={(e) => {
+                                            const c = cargosProd.find((x) => x.numero === e.target.value);
+                                            editarNuevaLineaPropuesta(n.id, "codigo", e.target.value);
+                                            if (c) editarNuevaLineaPropuesta(n.id, "descripcion", c.descripcion);
+                                          }}
+                                          className="border border-slate-300 rounded px-1 py-0.5 w-40 font-mono bg-white"
+                                        >
+                                          <option value="">— elegir —</option>
+                                          {!cargosProd.some((c) => c.numero === n.codigo) && n.codigo && (
+                                            <option value={n.codigo}>{n.codigo}</option>
+                                          )}
+                                          {cargosProd.map((c) => (
+                                            <option key={c.numero} value={c.numero}>{c.numero} — {c.descripcion}</option>
+                                          ))}
+                                        </select>
+                                      )}
+                                    </td>
+                                    <td className="px-1 py-0.5">
+                                      <input
+                                        value={n.descripcion || ""}
+                                        onChange={(e) => editarNuevaLineaPropuesta(n.id, "descripcion", e.target.value)}
+                                        className="border border-slate-300 rounded px-1 py-0.5 w-full min-w-[8rem] bg-white"
+                                      />
+                                      {n.origen === "sin_pedido" && (
+                                        <div className="text-[10px] text-slate-400">venía sin nº de pedido en el PDF</div>
+                                      )}
+                                    </td>
+                                    <td className="px-1 py-0.5 text-right">
+                                      <input
+                                        type="number"
+                                        value={n.cantidad}
+                                        onChange={(e) => editarNuevaLineaPropuesta(n.id, "cantidad", e.target.value)}
+                                        className="border border-slate-300 rounded px-1 py-0.5 w-14 text-right bg-white"
+                                      />
+                                    </td>
+                                    <td className="px-1 py-0.5 text-right">
+                                      <input
+                                        type="number"
+                                        step="0.01"
+                                        value={n.coste}
+                                        onChange={(e) => editarNuevaLineaPropuesta(n.id, "coste", e.target.value)}
+                                        className="border border-slate-300 rounded px-1 py-0.5 w-20 text-right bg-white"
+                                      />
+                                    </td>
+                                    <td className="px-1 py-0.5 text-right whitespace-nowrap text-slate-600">
+                                      {n.coste !== "" && n.coste != null
+                                        ? fmtEur((Number(n.cantidad) || 0) * Number(n.coste))
+                                        : "—"}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={abrirVistaPedidoLineasMarcadas}
+                              disabled={anadirLineasBc.estado === "subiendo" || pedidoNuevo.estado === "entrando" || !borradorNuevasPropuesta.some((n) => n.marcada && !n.creadaId)}
+                              className="text-[11px] font-semibold text-white bg-amber-700 hover:bg-amber-800 disabled:opacity-60 rounded px-2 py-1"
+                            >
+                              {anadirLineasBc.estado === "subiendo" || pedidoNuevo.estado === "entrando" ? "Creando pedido…" : "Crear pedido"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!colaPropuesta) return;
+                                const id = `manual-${Date.now()}`;
+                                setNuevasLineasPorPedido((prev) => ({
+                                  ...prev,
+                                  [colaPropuesta]: [
+                                    ...(prev[colaPropuesta] || []),
+                                    {
+                                      id,
+                                      origen: "manual",
+                                      tipo: "Item",
+                                      codigo: "",
+                                      descripcion: "",
+                                      busqueda: "",
+                                      cantidad: 1,
+                                      coste: "",
+                                      marcada: true,
+                                    },
+                                  ],
+                                }));
+                              }}
+                              className="text-[11px] font-semibold text-amber-900 border border-amber-400 bg-white hover:bg-amber-50 rounded px-2 py-1"
+                            >
+                              + Otra línea
+                            </button>
+                            <span className="text-[10px] text-slate-500">
+                              Crea un pedido nuevo con estas líneas, lo registra y refresca el listado para Incluir.
+                            </span>
+                          </div>
+                          {anadirLineasBc.estado === "error" && (
+                            <div className="mt-1 text-[12px] text-red-700">{anadirLineasBc.error}</div>
+                          )}
+                          {anadirLineasBc.estado === "ok" && (
+                            <div className="mt-1 text-[12px] text-emerald-800">
+                              Pedido {anadirLineasBc.pedido || pedidoNuevo.numero || ""} creado y registrado. Inclúyelo en la factura.
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                  {!propuestaYaFacturada && borradorNuevasPropuesta.some((n) => n.creadaId) && anadirLineasBc.estado !== "ok" && (
+                    <div className="mt-1 text-[11px] text-emerald-800">
+                      Ya se creó pedido para {borradorNuevasPropuesta.filter((n) => n.creadaId).length} línea(s) sueltas.
+                    </div>
+                  )}
+                  <div className="mt-2 flex gap-2 flex-wrap items-center">
+                    {!propuestaYaFacturada && opcionesChooserPropuesta.filas?.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const todas = (opcionesChooserPropuesta.filas || []).every((f) => borradorChooser?.keys?.[f.key]);
+                          if (todas) desmarcarTodasLineas();
+                          else marcarTodasLineas();
+                        }}
+                        className="text-[11px] font-semibold text-slate-800 bg-white border border-slate-400 hover:bg-slate-50 rounded px-2 py-1"
+                      >
+                        {(opcionesChooserPropuesta.filas || []).every((f) => borradorChooser?.keys?.[f.key])
+                          ? "Desmarcar todas"
+                          : "Marcar todas"}
+                      </button>
+                    )}
+                    {!propuestaYaFacturada && (
+                      <button
+                        type="button"
+                        onClick={incluirPropuestaEnFactura}
+                        disabled={!itemsDesdeBorrador().length}
+                        className="text-[11px] font-semibold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-40 rounded px-2 py-1"
+                      >
+                        Incluir en la factura
+                      </button>
+                    )}
+                    {!propuestaYaFacturada && propuestaSinRecibir && (
                       <button
                         type="button"
                         onClick={(e) => registrarPedidoEnBc(e, [numeroPropuesta])}
@@ -2558,7 +4127,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           Nº de OT sugeridos (los más usados históricamente con este
           proveedor en BC), con transparencia de qué más se ha visto por
           si el detectado no es el correcto esta vez. */}
-      {abierta && esGasto && !ultima && (
+      {abierta && esGasto && !ultima && !bloqueadaPorDuplicado && (
         <div className="px-4 py-3 bg-blue-50/60 border-t border-blue-100 text-sm">
           <div className="text-blue-900">
             <span className="font-semibold">{f.gastoSugerido.proveedorBC || f.gastoSugerido.proveedorFactura}</span> no lleva
@@ -2601,24 +4170,20 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
 
-      {abierta && f.yaEntrada && (
-        <div className="px-4 py-3 bg-amber-50 border-t border-amber-300 text-sm text-amber-950">
-          <div className="font-semibold">Esta factura ya está entrada en BC. No sigo.</div>
-          <div className="mt-1">
-            {f.entradaInfo?.numeroBC ? <>Factura BC {f.entradaInfo.numeroBC}</> : "Ya consta en el historial de facturas de compra"}
-            {f.entradaInfo?.proveedor ? <> · {f.entradaInfo.proveedor}</> : null}.
-            No se analizan pedidos ni se crea un borrador.
-          </div>
-        </div>
-      )}
-
-      {abierta && !modoDiario && !f.yaEntrada && sinPedidoUtil && (
+      {abierta && !modoDiario && !bloqueadaPorDuplicado && sinPedidoUtil && (
         <div className="px-4 py-3 bg-sky-50 border-t border-sky-200 text-sm" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-start justify-between gap-3 flex-wrap">
             <div className="text-sky-950 min-w-[240px] flex-1">
               <div className="font-semibold">Esta factura no trae pedido de compra.</div>
               <div className="mt-1 text-sky-900">
-                {ultima?.puedeCrear ? (
+                {esFerrosGrupo ? (
+                  <>
+                    Ferros Coll de l'Alba: se crea un pedido con cuenta <span className="font-semibold">60700004</span>,
+                    descripción <span className="font-semibold">TRABAJOS ENTRE EMPRESAS DEL GRUPO</span>
+                    {otFerros ? <> y OT <span className="font-semibold">{otFerros}</span></> : <> — indica la OT (en la factura suele ser AC00…/AAAA o OT …)</>}
+                    . Importe de este PDF. Después se factura como el resto.
+                  </>
+                ) : ultima?.puedeCrear ? (
                   <>
                     Se crea igual que la última factura de {ultima.proveedorBC || ultima.proveedorFactura}
                     {ultima.numeroBC ? <> ({ultima.numeroBC})</> : null}
@@ -2652,14 +4217,16 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                     ? "Registrar pedido"
                     : pedidoNuevo.estado === "error"
                       ? "Reintentar pedido"
-                      : "Crear pedido de compra"}
+                      : esFerrosGrupo
+                        ? "Crear pedido Ferros"
+                        : "Crear pedido de compra"}
               </button>
             )}
           </div>
         </div>
       )}
 
-      {abierta && !modoDiario && !ok && !esGasto && !f.yaEntrada && !ultima?.puedeCrear && motivos.filter((m) => !m.startsWith("No se puede entrar: el pedido")).length > 0 && (
+      {abierta && !modoDiario && !ok && !esGasto && !bloqueadaPorDuplicado && !ultima?.puedeCrear && motivos.filter((m) => !m.startsWith("No se puede entrar: el pedido")).length > 0 && (
         <div className="px-4 py-3 bg-red-50/60 border-t border-red-100">
           <div className="text-xs font-semibold text-red-800 mb-1.5">Por qué no cuadra esta factura</div>
           <div className="text-xs text-red-700 space-y-1">
@@ -2670,7 +4237,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
 
-      {abierta && !f.yaEntrada && pedidosPendRecibir.length > 0 && (
+      {abierta && !bloqueadaPorDuplicado && pedidosPendRecibir.length > 0 && (
         <div className="px-4 py-3 bg-orange-50/70 border-t border-orange-200" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
             <div>
@@ -2715,6 +4282,16 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                     >
                       {envio.estado === "enviando" ? <Loader2 size={12} className="animate-spin" /> : <Mail size={12} />}
                       {pedidosAvisados.has(String(p.pedido).toUpperCase()) ? "Enviada" : "Enviar al responsable"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => abrirCorreoProveedor(e, "albaran_firmado", p.pedido)}
+                      disabled={envio.estado === "enviando"}
+                      className="flex items-center gap-1 text-[11px] font-semibold text-white bg-slate-700 hover:bg-slate-800 disabled:opacity-60 rounded px-2 py-1"
+                      title={`Pedir al proveedor el albarán firmado de ${p.pedido}`}
+                    >
+                      <Mail size={12} />
+                      Pedir albarán firmado
                     </button>
                   </div>
                   <table className="w-full text-[12px] border-t border-orange-100">
@@ -2763,7 +4340,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
 
-      {abierta && ok && !esGasto && !f.yaEntrada && pcsFormanFactura.length > 0 && (
+      {abierta && ok && !esGasto && !bloqueadaPorDuplicado && pcsFormanFactura.length > 0 && (
         <div className="px-4 py-2.5 bg-emerald-50/70 border-t border-emerald-100 text-xs text-emerald-900">
           <span className="font-semibold">Esta factura está formada por:</span>{" "}
           {pcsFormanFactura.map((p, i) => (
@@ -2782,7 +4359,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
 
-      {abierta && !(modoDiario && pedidosPendRecibir.length > 0) && !ok && !esGasto && !f.yaEntrada && !ultima?.puedeCrear && (
+      {abierta && !(modoDiario && pedidosPendRecibir.length > 0) && !ok && !esGasto && !bloqueadaPorDuplicado && !ultima?.puedeCrear && (
         <div className="px-4 py-2 border-t border-red-100 bg-white flex items-center justify-between gap-3 flex-wrap" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-1.5 text-xs text-slate-500 flex-1 min-w-[220px]">
             Responsable (dpto. del pedido):
@@ -2834,14 +4411,6 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
             {envio.estado === "error" && <span className="text-xs text-red-600" title={envio.error}>Error al enviar</span>}
             {!destinatarios.length && <span className="text-xs text-amber-600">Sin destinatarios válidos</span>}
             <button
-              type="button"
-              onClick={abrirCorreoProveedor}
-              disabled={envio.estado === "enviando"}
-              className="flex items-center gap-1.5 text-xs font-semibold text-white bg-slate-700 hover:bg-slate-800 disabled:opacity-60 rounded-md px-3 py-1.5"
-            >
-              <Mail size={13} /> Correo al proveedor
-            </button>
-            <button
               onClick={abrirVistaCorreo}
               disabled={envio.estado === "enviando" || envio.estado === "ok" || !destinatarios.length}
               className="flex items-center gap-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-md px-3 py-1.5"
@@ -2853,7 +4422,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
       {/* Entrada forzada en BC: también cuando no hay pedido, copiando la última factura */}
-      {abierta && !ok && !esGasto && !f.yaEntrada && (
+      {abierta && !ok && !esGasto && !bloqueadaPorDuplicado && (
         <div
           className="px-4 py-2 border-t border-amber-100 bg-amber-50/40 flex items-center justify-between gap-3 flex-wrap"
           onClick={(e) => e.stopPropagation()}
@@ -2878,7 +4447,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           </button>
         </div>
       )}
-      {abierta && ok && !f.yaEntrada && (
+      {abierta && ok && !bloqueadaPorDuplicado && (
         <div className="px-4 py-2.5 border-t border-emerald-100 bg-white flex items-center justify-between gap-3 flex-wrap" onClick={(e) => e.stopPropagation()}>
           <div className="text-xs text-slate-600">
             Toda la factura cuadra. Pulsa el botón para crear el <b>borrador</b> en BC con el proveedor, el nº de factura y la fecha, y traer las líneas desde los albaranes de compra.
@@ -2956,7 +4525,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         <div className="px-4 py-2 text-xs text-red-600 bg-red-50 border-t border-red-100">{envio.error}</div>
       )}
 
-      {abierta && !modoDiario && !f.yaEntrada && (
+      {abierta && !modoDiario && !bloqueadaPorDuplicado && (
         <div className="px-4 py-2 border-t border-slate-200 bg-white flex justify-end" onClick={(e) => e.stopPropagation()}>
           <button
             type="button"
@@ -2968,7 +4537,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
 
-      {abierta && !f.yaEntrada && verDetalle && (
+      {abierta && !bloqueadaPorDuplicado && verDetalle && (
         <div className="border-t border-slate-200 bg-[#f4f6f8]" onClick={(e) => e.stopPropagation()}>
           <div>
             <div className="min-w-0 bg-white">
@@ -3277,7 +4846,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
         </div>
       )}
 
-      {abierta && !f.yaEntrada && !esGasto && !ultima?.puedeCrear && verDetalle && (
+      {abierta && !bloqueadaPorDuplicado && !esGasto && !ultima?.puedeCrear && verDetalle && (
         <div className="px-4 py-3 border-t border-slate-100" onClick={(e) => e.stopPropagation()}>
             <div>
               <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-2">
@@ -3325,21 +4894,53 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
           onClick={() => { if (pedidoNuevo.estado !== "entrando") setVistaPedido(null); }}
         >
           <div className="bg-white rounded-lg shadow-xl w-full max-w-md" onClick={(e) => e.stopPropagation()}>
-            <div className="px-4 py-3 border-b border-slate-200 text-sm font-semibold text-slate-800">Vista previa del pedido de compra</div>
+            <div className="px-4 py-3 border-b border-slate-200 text-sm font-semibold text-slate-800">
+              {vistaPedido.propuesta?.regla === "ferros-grupo"
+                ? "Pedido Ferros · trabajos entre empresas"
+                : vistaPedido.modo === "lineasMarcadas"
+                  ? "Vista previa del pedido de compra"
+                  : "Vista previa del pedido de compra"}
+            </div>
             <div className="px-4 py-3 space-y-3 text-sm">
-              {vistaPedido.cargando && <div className="text-slate-500">Buscando la última factura de este proveedor…</div>}
+              {vistaPedido.cargando && <div className="text-slate-500">{vistaPedido.propuesta?.regla === "ferros-grupo" ? "Preparando el pedido de Ferros…" : "Buscando la última factura de este proveedor…"}</div>}
               {vistaPedido.error && <div className="text-red-700">{vistaPedido.error}</div>}
               {vistaPedido.propuesta && (
                 <>
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[13px]">
                     <div className="text-slate-500">Proveedor</div>
                     <div className="text-slate-800">{vistaPedido.propuesta.proveedorBC || cabecera.proveedor || f.proveedor}</div>
-                    <div className="text-slate-500">Como la factura</div>
-                    <div className="text-slate-800">{vistaPedido.propuesta.numeroBC || "—"}{vistaPedido.propuesta.fecha ? ` · ${vistaPedido.propuesta.fecha}` : ""}</div>
-                    <div className="text-slate-500">Cuenta</div>
-                    <div className="text-slate-800">{vistaPedido.propuesta.cuenta || "—"}</div>
-                    <div className="text-slate-500">Dimensión</div>
-                    <div className="text-slate-800">{vistaPedido.propuesta.departamento || "—"}</div>
+                    {vistaPedido.propuesta.regla === "ferros-grupo" ? (
+                      <>
+                        <div className="text-slate-500">Cuenta</div>
+                        <div className="text-slate-800 font-semibold">{vistaPedido.propuesta.cuenta || "60700004"}</div>
+                        <div className="text-slate-500">Descripción</div>
+                        <div className="text-slate-800">{vistaPedido.propuesta.descripcionFija || "TRABAJOS ENTRE EMPRESAS DEL GRUPO"}</div>
+                        <div className="text-slate-500">Importe</div>
+                        <div className="text-slate-800">{cabecera.baseImponible != null ? fmtEur(cabecera.baseImponible) : "—"}</div>
+                      </>
+                    ) : vistaPedido.modo === "lineasMarcadas" ? (
+                      <>
+                        {vistaPedido.propuesta.numeroBC && (
+                          <>
+                            <div className="text-slate-500">Como la factura</div>
+                            <div className="text-slate-800">{vistaPedido.propuesta.numeroBC}{vistaPedido.propuesta.fecha ? ` · ${vistaPedido.propuesta.fecha}` : ""}</div>
+                          </>
+                        )}
+                        <div className="text-slate-500">Artículo / cargo</div>
+                        <div className="text-slate-800">{(vistaPedido.propuesta.lineasMarcadas || []).map((l) => l.codigo).filter(Boolean).join(", ") || "—"}</div>
+                        <div className="text-slate-500">Dimensión</div>
+                        <div className="text-slate-800">{vistaPedido.propuesta.departamento || "—"}</div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="text-slate-500">Como la factura</div>
+                        <div className="text-slate-800">{vistaPedido.propuesta.numeroBC || "—"}{vistaPedido.propuesta.fecha ? ` · ${vistaPedido.propuesta.fecha}` : ""}</div>
+                        <div className="text-slate-500">Cuenta</div>
+                        <div className="text-slate-800">{vistaPedido.propuesta.cuenta || "—"}</div>
+                        <div className="text-slate-500">Dimensión</div>
+                        <div className="text-slate-800">{vistaPedido.propuesta.departamento || "—"}</div>
+                      </>
+                    )}
                   </div>
                   <label className="block">
                     <span className="text-[11px] font-semibold text-slate-700">Nº de OT</span>
@@ -3347,10 +4948,27 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                       autoFocus
                       value={vistaPedido.ot}
                       onChange={(e) => setVistaPedido((v) => ({ ...v, ot: e.target.value }))}
-                      placeholder="La de la última factura. Cámbiala si esta obra es otra."
+                      placeholder={vistaPedido.propuesta.regla === "ferros-grupo" ? "AC00XXXXX/2026 o OT XXXXX" : "La de la última factura. Cámbiala si esta obra es otra."}
                       className="mt-1 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
                     />
+                    {vistaPedido.propuesta.regla === "ferros-grupo" && !String(vistaPedido.ot || "").trim() && (
+                      <div className="mt-1 text-[11px] text-amber-800">Obligatoria para Ferros. Si no está en el PDF, escríbela tú.</div>
+                    )}
                   </label>
+                  {vistaPedido.modo === "lineasMarcadas" ? (
+                  <div>
+                    <div className="text-[11px] text-slate-500 mb-1">Líneas del pedido nuevo</div>
+                    <div className="border border-slate-200 rounded divide-y divide-slate-100">
+                      {(vistaPedido.propuesta.lineasMarcadas || []).map((l, i) => (
+                        <div key={l.id || i} className="px-2 py-1.5 flex items-baseline gap-2 text-[12px]">
+                          <span className="flex-1 text-slate-800 truncate">{l.codigo ? `${l.codigo} · ${l.descripcion || ""}` : (l.descripcion || "—")}</span>
+                          <span className="text-slate-500 shrink-0">{l.cantidad ?? 1}</span>
+                          <span className="text-slate-800 shrink-0">{l.coste != null ? fmtEur(l.coste) : "—"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  ) : vistaPedido.propuesta.regla !== "ferros-grupo" && (
                   <div>
                     <div className="text-[11px] text-slate-500 mb-1">Líneas de esta factura</div>
                     <div className="border border-slate-200 rounded divide-y divide-slate-100">
@@ -3363,6 +4981,7 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
                       ))}
                     </div>
                   </div>
+                  )}
                 </>
               )}
             </div>
@@ -3370,8 +4989,10 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               <button type="button" onClick={() => setVistaPedido(null)} className="text-sm font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md px-3 py-1.5">Cancelar</button>
               <button
                 type="button"
-                disabled={vistaPedido.cargando || !!vistaPedido.error || !vistaPedido.propuesta || pedidoNuevo.estado === "entrando"}
-                onClick={() => crearPedidoComoUltima(null, vistaPedido.ot)}
+                disabled={vistaPedido.cargando || !!vistaPedido.error || !vistaPedido.propuesta || pedidoNuevo.estado === "entrando" || (vistaPedido.propuesta?.regla === "ferros-grupo" && !String(vistaPedido.ot || "").trim())}
+                onClick={() => (vistaPedido.modo === "lineasMarcadas"
+                  ? crearPedidoDesdeLineasMarcadas(vistaPedido.ot)
+                  : crearPedidoComoUltima(null, vistaPedido.ot))}
                 className="text-sm font-semibold text-white bg-sky-700 hover:bg-sky-800 disabled:opacity-60 rounded-md px-3 py-1.5"
               >
                 Crear pedido
@@ -3391,23 +5012,59 @@ function TarjetaFactura({ f, pedidos, seleccionActiva, onIniciarSeleccion, onCan
               {vistaCorreo.alProveedor ? "Correo al proveedor" : vistaCorreo.alResponsable ? "Preguntar al responsable de la OT" : `Revisa el correo antes de enviarlo${vistaCorreo.pedido ? ` · ${vistaCorreo.pedido}` : ""}`}
             </div>
             <div className="px-4 py-3 space-y-3 text-sm">
+              {vistaCorreo.alProveedor && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-semibold text-slate-500">Mensaje</span>
+                  <button
+                    type="button"
+                    onClick={() => elegirTipoCorreoProveedor("proveedor")}
+                    className={`text-sm rounded-md px-3 py-1.5 border ${(vistaCorreo.tipoMensaje || "proveedor") === "proveedor" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+                  >
+                    Proveedor
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => elegirTipoCorreoProveedor("interno")}
+                    className={`text-sm rounded-md px-3 py-1.5 border ${vistaCorreo.tipoMensaje === "interno" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+                  >
+                    Interno
+                  </button>
+                </div>
+              )}
               <div>
                 <div className="text-[11px] text-slate-500">De</div>
                 <div className="text-slate-800">{remitenteEmail || "Tu correo de empresa"}</div>
               </div>
               <label className="block">
-                <span className="text-[11px] text-slate-500">Para{vistaCorreo.pedido ? ` · responsables de ${vistaCorreo.pedido}` : ""}</span>
+                <span className="text-[11px] text-slate-500">
+                  {vistaCorreo.alProveedor
+                    ? (vistaCorreo.tipoMensaje === "interno" ? "Para · responsables internos" : "Para · proveedor")
+                    : `Para${vistaCorreo.pedido ? ` · responsables de ${vistaCorreo.pedido}` : ""}`}
+                </span>
                 <input
                   value={vistaCorreo.paraTexto || ""}
-                  onChange={(e) => setVistaCorreo((v) => ({ ...v, paraTexto: e.target.value }))}
+                  onChange={(e) => setVistaCorreo((v) => {
+                    const next = { ...v, paraTexto: e.target.value };
+                    if (v?.alProveedor && v.tipoMensaje !== "interno") next.paraProveedor = e.target.value;
+                    return next;
+                  })}
                   className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
                 />
+                {vistaCorreo.alProveedor && vistaCorreo.tipoMensaje === "interno" && (
+                  <div className="text-[10px] text-slate-400 mt-0.5">Mensaje interno: el correo del proveedor no se incluye.</div>
+                )}
               </label>
               <label className="block">
                 <span className="text-[11px] text-slate-500">Copia</span>
                 <input
                   value={vistaCorreo.ccTexto || ""}
-                  onChange={(e) => setVistaCorreo((v) => ({ ...v, ccTexto: e.target.value }))}
+                  onChange={(e) => setVistaCorreo((v) => {
+                    const next = { ...v, ccTexto: e.target.value };
+                    if (v?.alProveedor && v.tipoMensaje !== "interno") {
+                      next.ccProveedor = emailsDeCampo(e.target.value);
+                    }
+                    return next;
+                  })}
                   className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1.5 text-[13px]"
                 />
               </label>
@@ -3930,7 +5587,11 @@ function PedidosPendientesFacturar({ pedidos, proveedores, modoSeleccion, onEleg
                       <td className="py-1.5 px-3">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-semibold text-slate-800">{p.pedido}</span>
-                          {typeof onIncluirPedido === "function" && (
+                          {verFacturados ? (
+                            <span className="text-[11px] font-bold text-amber-950 bg-amber-100 border border-amber-400 rounded px-2 py-0.5">
+                              ESTE PEDIDO ya se encuentra facturado
+                            </span>
+                          ) : typeof onIncluirPedido === "function" && (
                             incluido ? (
                               <span className="text-xs font-semibold text-emerald-800 bg-white border border-emerald-400 rounded px-2.5 py-1">Incluido</span>
                             ) : (
@@ -4158,6 +5819,40 @@ function itemsEnVentana(items, dias) {
   });
 }
 
+/** YYYY-MM a partir de la fecha de emisión leída del PDF. */
+function claveMesEmision(fecha) {
+  const m = String(fecha || "").match(/^(\d{4})-(\d{2})/);
+  return m ? `${m[1]}-${m[2]}` : null;
+}
+
+/** Últimos N meses para el desplegable Emisión (mes actual primero). */
+function opcionesMesEmision(n = 12) {
+  const out = [];
+  const d = new Date();
+  d.setDate(1);
+  d.setHours(0, 0, 0, 0);
+  for (let i = 0; i < n; i++) {
+    const y = d.getFullYear();
+    const m = d.getMonth() + 1;
+    const clave = `${y}-${String(m).padStart(2, "0")}`;
+    const etiqueta = d.toLocaleDateString("es-ES", { month: "long", year: "numeric" });
+    out.push({ clave, etiqueta: etiqueta.charAt(0).toUpperCase() + etiqueta.slice(1) });
+    d.setMonth(d.getMonth() - 1);
+  }
+  return out;
+}
+
+/** Días de correo a cubrir desde el día 1 del mes YYYY-MM hasta hoy. */
+function diasParaMesEmision(ym) {
+  const m = String(ym || "").match(/^(\d{4})-(\d{2})$/);
+  if (!m) return 7;
+  const inicio = new Date(Number(m[1]), Number(m[2]) - 1, 1);
+  inicio.setHours(0, 0, 0, 0);
+  const hoy = new Date();
+  hoy.setHours(0, 0, 0, 0);
+  return Math.max(1, Math.round((hoy - inicio) / 86400000) + 1);
+}
+
 function facturasDeFila(facturas, it) {
   return (facturas || []).filter((f) => f.origen?.msg === it.msg && String(f.origen?.att ?? "") === String(it.att ?? ""));
 }
@@ -4248,6 +5943,8 @@ function resumenLectura(f) {
     motivos: f.motivos || [],
     pdfGuardado: !!(f.pdfBase64 || f.pdfGuardado),
     yaEntrada: !!f.yaEntrada,
+    yaBorrador: !!(f.yaBorrador || f.veredicto === "ya_borrador"),
+    entradaInfo: f.entradaInfo || null,
     pendientesRecibir: completa ? pendientesRecibirDe(f) : (f.pendientesRecibir || []),
     incidencia: completa ? textoIncidencia(f) : (f.incidencia || textoIncidencia(f)),
     pedidos,
@@ -4291,9 +5988,14 @@ function estaEntrada(f) {
   return !!(f?.yaEntrada || f?.veredicto === "ya_entrada");
 }
 
+function estaBorradorBC(f) {
+  return !!(f?.yaBorrador || f?.veredicto === "ya_borrador" || f?.entradaInfo?.estado === "borrador" || f?.entradaInfo?.borrador);
+}
+
 function estadoCorto(f) {
   if (!f) return { texto: "Sin leer", clase: "bg-slate-100 text-slate-600", detalle: "" };
   if (estaEntrada(f)) return { texto: "Entrada", clase: "bg-emerald-100 text-emerald-800", detalle: "" };
+  if (estaBorradorBC(f)) return { texto: "Borrador BC", clase: "bg-sky-100 text-sky-800", detalle: "" };
   if (f.veredicto === "gasto") return { texto: "Gasto", clase: "bg-blue-100 text-blue-800", detalle: "" };
   if (f.veredicto === "ok") return { texto: "Lista", clase: "bg-emerald-100 text-emerald-800", detalle: "" };
   const err = String(f.incidencia || "").trim();
@@ -4390,6 +6092,7 @@ function PanelNotasFila({ pedidos, notasMap, onGuardada }) {
 function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, errorFila, erroresLectura = {}, facturas = [], lecturas = {}, renderFactura, onPorLeer }) {
   const [abierta, setAbierta] = useState(true);
   const [dias, setDias] = useState(7);
+  const [mesEmision, setMesEmision] = useState(null); // null = todas | "YYYY-MM"
   const [cargando, setCargando] = useState(false);
   const [sincronizando, setSincronizando] = useState(false);
   const [error, setError] = useState(null);
@@ -4398,6 +6101,7 @@ function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, erro
   const [verProcesadas, setVerProcesadas] = useState(false);
   const [vista, setVista] = useState("pendientes");
   const [busca, setBusca] = useState("");
+  const mesesEmision = useMemo(() => opcionesMesEmision(12), []);
   const empresa = empresaGuardada();
   const datosRef = useRef(null);
   const arranque = useRef(false);
@@ -4515,6 +6219,13 @@ function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, erro
     }
   };
 
+  const elegirMesEmision = async (ym) => {
+    setMesEmision(ym || null);
+    if (!ym) return;
+    const necesarios = diasParaMesEmision(ym);
+    if (necesarios > dias) await ampliarVentana(necesarios);
+  };
+
   useEffect(() => {
     let vivo = true;
     const pintarCache = async () => {
@@ -4569,6 +6280,14 @@ function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, erro
       .toLowerCase();
     return blob.includes(qBusca);
   };
+  // Con mes de emisión: se quedan las que ya tienen ese mes y las aún sin leer
+  // (la cola las lee poco a poco; al salir la fecha entran o salen solas).
+  const coincideMesEmision = (it) => {
+    if (!mesEmision) return true;
+    const leidas = leidasDe(it);
+    if (!leidas.length) return true;
+    return leidas.some((f) => claveMesEmision(f.fecha) === mesEmision);
+  };
   const esPendiente = (it) => {
     const c = clasificarEntrada(it);
     return c === "sin" || c === "no" || c === "mixta";
@@ -4584,7 +6303,11 @@ function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, erro
   const visibles = candidatos
     .filter((it) => (vista === "todas" ? true : vista === "entradas" ? esEntrada(it) : esPendiente(it)))
     .filter(coincideBusca)
+    .filter(coincideMesEmision)
     .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
+  const diasOpciones = [1, 3, 7, 15, 30, 60].includes(dias)
+    ? [1, 3, 7, 15, 30, 60]
+    : [...[1, 3, 7, 15, 30, 60], dias].sort((a, b) => a - b);
   const nPorLeer = [...deEsta, ...sinAsignar].filter((it) => !it.procesada && !it.entrada && clasificarEntrada(it) === "sin" && !erroresLectura[`${it.msg}|${it.att}`]).length;
   const leyendoVista = { ...leyendoMap };
   for (const it of leyendoServidor) {
@@ -4655,7 +6378,13 @@ function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, erro
             </button>
             <label className="flex items-center gap-1 text-slate-500">Últimos
               <select value={dias} onChange={(e) => ampliarVentana(Number(e.target.value))} className="border border-slate-300 rounded px-1 py-0.5 bg-white">
-                {[1, 3, 7, 15, 30, 60].map((d) => <option key={d} value={d}>{d} día{d > 1 ? "s" : ""}</option>)}
+                {diasOpciones.map((d) => <option key={d} value={d}>{d} día{d > 1 ? "s" : ""}</option>)}
+              </select>
+            </label>
+            <label className="flex items-center gap-1 text-slate-500">Emisión
+              <select value={mesEmision || ""} onChange={(e) => elegirMesEmision(e.target.value || null)} className="border border-slate-300 rounded px-1 py-0.5 bg-white">
+                <option value="">Todas</option>
+                {mesesEmision.map((m) => <option key={m.clave} value={m.clave}>{m.etiqueta}</option>)}
               </select>
             </label>
             <button onClick={() => cargar()} disabled={sincronizando} className="flex items-center gap-1 text-purple-700 hover:underline disabled:opacity-50">
@@ -4679,11 +6408,15 @@ function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, erro
             <div className="text-[12px] text-slate-400">
               {qBusca
                 ? "Ninguna factura coincide con la búsqueda."
-                : vista === "entradas"
-                  ? "Ninguna factura entrada en este periodo."
-                  : vista === "todas"
-                    ? "No hay facturas en este periodo."
-                    : `No hay facturas pendientes de ${empresa?.displayName || "esta empresa"} en este periodo.`}
+                : mesEmision
+                  ? (nPorLeer > 0
+                    ? `Ninguna factura leída de ese mes todavía. Quedan ${nPorLeer} por leer; irán apareciendo solas.`
+                    : "Ninguna factura con fecha de emisión de ese mes en este periodo.")
+                  : vista === "entradas"
+                    ? "Ninguna factura entrada en este periodo."
+                    : vista === "todas"
+                      ? "No hay facturas en este periodo."
+                      : `No hay facturas pendientes de ${empresa?.displayName || "esta empresa"} en este periodo.`}
             </div>
           )}
           {visibles.length > 0 && (
@@ -4806,14 +6539,45 @@ function BandejaFacturas({ onAbrir, onVolver, leyendoMap = {}, filaAbierta, erro
             {docError && !docFila.length && (
               <div className="p-3 text-[13px] text-red-700">Error leyendo el documento: {docError}</div>
             )}
-            {docFila.length > 0 && (
-              <div className="divide-y divide-slate-100">
-                {docFila.map((f, i) => renderFactura(f, i))}
-              </div>
-            )}
-            {!docFila.length && !docError && (
-              <div className="p-4 text-sm text-slate-500">Leyendo la factura. El PDF ya se puede ver a la derecha.</div>
-            )}
+            {(() => {
+              const claveDoc = docAbierto ? `${docAbierto.msg}|${docAbierto.att ?? ""}` : "";
+              const comprobando = !!(claveDoc && leyendoVista[claveDoc]);
+              if (comprobando) {
+                return (
+                  <div className="p-4 text-sm text-amber-900 bg-amber-50 border-b border-amber-200 font-semibold">
+                    {leyendoVista[claveDoc]}
+                  </div>
+                );
+              }
+              if (docFila.length > 0) {
+                return (
+                  <div className="divide-y divide-slate-100">
+                    {docFila.map((f, i) => renderFactura({
+                      ...f,
+                      origen: {
+                        ...(f.origen || {}),
+                        msg: f.origen?.msg || docAbierto.msg,
+                        att: f.origen?.att ?? docAbierto.att,
+                        // Remitente del correo de la bandeja (Para del correo al proveedor).
+                        de: f.origen?.de || docAbierto.de || "",
+                        deNombre: f.origen?.deNombre || docAbierto.deNombre || "",
+                      },
+                    }, i, {
+                      onDescartar: async () => {
+                        await marcar(docAbierto);
+                        onVolver?.();
+                      },
+                    }))}
+                  </div>
+                );
+              }
+              if (!docError) {
+                return (
+                  <div className="p-4 text-sm text-slate-500">Leyendo la factura. El PDF ya se puede ver a la derecha.</div>
+                );
+              }
+              return null;
+            })()}
           </div>
           )}
           </div>
@@ -5077,12 +6841,25 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
   const [remitenteEmail, setRemitenteEmail] = useState(
     usuario?.email_envio || usuario?.email_empresa || null
   );
+  const [proveedoresBc, setProveedoresBc] = useState(null);
 
   useEffect(() => {
     fetch("/api/correo/remitente")
       .then((r) => r.json())
       .then((d) => { if (d.email) setRemitenteEmail(d.email); })
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let vivo = true;
+    fetch("/api/bc/proveedores")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!vivo) return;
+        if (Array.isArray(d.proveedores)) setProveedoresBc(d.proveedores);
+      })
+      .catch(() => {});
+    return () => { vivo = false; };
   }, []);
 
   // Lecturas ya hechas, por correo. No se pintan solas: solo al pulsar la fila.
@@ -5151,7 +6928,13 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
 
   const validarDesdeBandeja = async (it) => {
     try {
-      return await procesarFactura(it.nombre, null, { msg: it.msg, att: it.att });
+      return await procesarFactura(it.nombre, null, {
+        msg: it.msg,
+        att: it.att,
+        // Remitente del correo de la bandeja → Para del «Correo al proveedor».
+        de: it.de || "",
+        deNombre: it.deNombre || "",
+      });
     } catch (err) {
       ultimoError.current = err.message || String(err);
       return false;
@@ -5252,7 +7035,7 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
   };
 
   const faltaHistorial = (fac) => {
-    if (!fac || fac.yaEntrada || !fac.proveedor) return false;
+    if (!fac || fac.yaEntrada || estaBorradorBC(fac) || !fac.proveedor) return false;
     return !(fac.pedidosDetalle || []).some((p) => p.pedido && !p.bcError);
   };
 
@@ -5287,17 +7070,31 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
         continue;
       }
       try {
-        const r = await fetch(`/api/facturas-compra/ya-entrada?factura=${encodeURIComponent(fac.factura)}`);
+        const qs = new URLSearchParams({ factura: fac.factura });
+        if (fac.proveedor) qs.set("proveedor", fac.proveedor);
+        if (fac.origen?.msg) qs.set("msg", fac.origen.msg);
+        if (fac.origen?.att != null && fac.origen?.att !== "") qs.set("att", String(fac.origen.att));
+        const r = await fetch(`/api/facturas-compra/ya-entrada?${qs}`);
         const j = await r.json().catch(() => ({}));
         if (r.ok && j.encontrada) {
-          salida.push({
+          const esBorrador = !!(j.borrador || j.estado === "borrador");
+          const revisada = {
             ...fac,
-            yaEntrada: true,
+            yaEntrada: !esBorrador,
+            yaBorrador: esBorrador,
             entradaInfo: j,
-            veredicto: "ya_entrada",
+            veredicto: esBorrador ? "ya_borrador" : "ya_entrada",
             ultimaEntrada: null,
-            motivos: [`⚠ Esta factura ya está entrada en BC (factura ${j.numeroBC || "?"}${j.proveedor ? " · " + j.proveedor : ""}). No se analiza ni se crea borrador.`],
-          });
+            motivos: [
+              esBorrador
+                ? `⚠ Esta factura ya tiene un borrador en BC (${j.numeroBC || "PFC…"}${j.proveedor ? " · " + j.proveedor : ""}). No se crea otro.`
+                : `⚠ Esta factura ya está registrada en BC: ${j.numeroBC || "?"}${j.proveedor ? " · " + j.proveedor : ""}. No se analiza ni se crea borrador.`,
+            ],
+          };
+          salida.push(revisada);
+          if (!esBorrador && fac.origen?.msg) {
+            marcarEntradaEnListado({ msg: fac.origen.msg, att: fac.origen.att, factura: fac.factura });
+          }
           continue;
         }
       } catch { /* si BC no responde, se enseña la lectura */ }
@@ -5342,17 +7139,70 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
   };
   leerSinAbrirRef.current = leerSinAbrir;
 
+  // Lee las facturas pendientes una a una en segundo plano (fecha de emisión,
+  // proveedor, etc.) para poder filtrar por mes sin abrirlas a mano.
+  useEffect(() => {
+    let vivo = true;
+    let ocupada = false;
+    const tick = async () => {
+      if (!vivo || ocupada) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (leyendoAhora.current.size > 0) return;
+      if (!lecturasListasRef.current) return;
+      const siguiente = (porLeerRef.current || []).find((it) => {
+        if (!it?.msg) return false;
+        const clave = `${it.msg}|${it.att}`;
+        if (fallosLectura.current.has(clave)) return false;
+        if (origenesHechas.current.has(clave)) return false;
+        if (leyendoAhora.current.has(clave)) return false;
+        if (guardadasRef.current.get(clave)?.length) return false;
+        return true;
+      });
+      if (!siguiente) return;
+      ocupada = true;
+      try {
+        await leerSinAbrirRef.current?.(siguiente);
+      } finally {
+        ocupada = false;
+      }
+    };
+    const id = setInterval(tick, 2500);
+    tick();
+    return () => { vivo = false; clearInterval(id); };
+  }, []);
+
   const publicarLectura = (clave, it, lista) => {
-    guardadasRef.current.set(clave, lista);
+    const conRemitente = (lista || []).map((f) => ({
+      ...f,
+      origen: {
+        ...(f.origen || {}),
+        msg: f.origen?.msg || it.msg,
+        att: f.origen?.att ?? it.att,
+        de: f.origen?.de || it.de || "",
+        deNombre: f.origen?.deNombre || it.deNombre || "",
+      },
+    }));
+    guardadasRef.current.set(clave, conRemitente);
     origenesHechas.current.add(clave);
     setFilaAbierta(clave);
     setErrorFila(null);
     setResultado((prev) => {
       const ya = (prev?.facturas || []).some((f) => f.origen?.msg === it.msg && String(f.origen?.att || "") === String(it.att || ""));
-      const base = ya ? (prev?.facturas || []) : [...lista, ...(prev?.facturas || [])];
+      const base = ya ? (prev?.facturas || []) : [...conRemitente, ...(prev?.facturas || [])];
       const facturas = base.map((f) => {
-        const nueva = lista.find((r) => r.origen?.msg === f.origen?.msg && String(r.origen?.att || "") === String(f.origen?.att || "") && r.factura === f.factura);
-        return nueva || f;
+        const nueva = conRemitente.find((r) => r.origen?.msg === f.origen?.msg && String(r.origen?.att || "") === String(f.origen?.att || "") && r.factura === f.factura);
+        if (nueva) return nueva;
+        if (f.origen?.msg === it.msg && String(f.origen?.att || "") === String(it.att || "")) {
+          return {
+            ...f,
+            origen: {
+              ...(f.origen || {}),
+              de: f.origen?.de || it.de || "",
+              deNombre: f.origen?.deNombre || it.deNombre || "",
+            },
+          };
+        }
+        return f;
       });
       const paginas = facturas.reduce((n, f) => n + (f.paginas?.length || 0), 0);
       return { archivo: it.nombre || it.asunto || "Factura", paginas, facturas, guardadas: true };
@@ -5374,11 +7224,16 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
       } catch { /* si no hay lectura guardada, se lee el PDF */ }
     }
     if (guardadas?.length) {
-      publicarLectura(clave, it, guardadas);
-      marcarSiYaEntrada(guardadas).then((revisadas) => {
-        publicarLectura(clave, it, revisadas);
-        if (!revisadas.some((f) => f.yaEntrada)) completarUltimaEntrada(revisadas, clave);
+      // Primero comprobar duplicado en BC; solo después enseñar el formulario.
+      setLeyendoMap((prev) => ({ ...prev, [clave]: "Comprobando si ya está entrada…" }));
+      const revisadas = await marcarSiYaEntrada(guardadas);
+      setLeyendoMap((prev) => {
+        const siguiente = { ...prev };
+        delete siguiente[clave];
+        return siguiente;
       });
+      publicarLectura(clave, it, revisadas);
+      if (!revisadas.some((f) => estaEntrada(f) || estaBorradorBC(f))) completarUltimaEntrada(revisadas, clave);
       return;
     }
     if (leyendoAhora.current.has(clave)) {
@@ -5508,13 +7363,14 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
     }));
   };
 
-  const pintarTarjeta = (f, i, empezarAbierta = false) => {
+  const pintarTarjeta = (f, i, empezarAbierta = false, opts = {}) => {
     const facturaKey = `${f.factura ? "" : "sin-"}${claveTarjeta(f, i)}#${i}`;
     return (
       <TarjetaFactura
         key={facturaKey}
         f={f}
         pedidos={pedidos}
+        proveedoresBc={proveedoresBc}
         remitenteEmail={remitenteEmail}
         empezarAbierta={empezarAbierta}
         seleccionActiva={objetivoSeleccion?.facturaKey === facturaKey ? objetivoSeleccion.pedidoIdx : null}
@@ -5527,7 +7383,7 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
         onEntrada={marcarEntradaEnListado}
         onMinimizar={empezarAbierta ? () => setFilaAbierta(null) : undefined}
         modoDiario={empezarAbierta}
-        onCargarRecepcion={onCargarRecepcion}
+        onDescartar={opts.onDescartar || null}
       />
     );
   };
@@ -5594,7 +7450,7 @@ export default function FacturasCompra({ pedidos, usuario = null, onCargarRecepc
         facturas={resultado?.facturas || []}
         lecturas={porFila}
         onPorLeer={onPorLeer}
-        renderFactura={(f, i) => pintarTarjeta(f, i, true)}
+        renderFactura={(f, i, opts) => pintarTarjeta(f, i, true, opts)}
       />
 
       {error && (

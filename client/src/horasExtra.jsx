@@ -703,16 +703,22 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
   const [nueva, setNueva] = useState({ recurso: "", tipo: "Festivo local", fecha: "", desc: "" });
   useEffect(() => { if (!sucio) setLineas(listaFestivos(ajustes)); }, [ajustes]); // eslint-disable-line react-hooks/exhaustive-deps
   const nombreDe = (rec) => (rec ? trabajadores.find((t) => t.recurso === rec)?.nombre || rec : "Todos");
-  const cambiar = (l) => { setLineas(l); setSucio(true); setMsg(""); };
 
+  async function persistir(nuevas) {
+    setLineas(nuevas);
+    setSucio(false);
+    setMsg("Guardando…");
+    const ok = await guardarAjustes({ ...ajustes, festivosLista: nuevas, festivos: nuevas.filter((l) => !l.recurso).map((l) => l.fecha) });
+    setMsg(ok === false ? "No se pudo guardar" : "Guardado ✓");
+    if (ok === false) setSucio(true);
+  }
   const añadir = () => {
     if (!nueva.fecha) return alert("Indica la fecha.");
-    cambiar([...lineas, { ...nueva, id: `${Date.now()}` }].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)));
+    persistir([...lineas, { ...nueva, id: `${Date.now()}` }].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)));
     setNueva({ ...nueva, fecha: "", desc: "" });
   };
   async function guardar() {
-    await guardarAjustes({ ...ajustes, festivosLista: lineas, festivos: lineas.filter((l) => !l.recurso).map((l) => l.fecha) });
-    setSucio(false); setMsg("Guardado ✓");
+    await persistir(lineas);
   }
   async function cargar(file) {
     if (!file) return;
@@ -749,8 +755,9 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
       const clave = (l) => `${l.recurso}|${l.fecha}`;
       const existentes = new Set(lineas.map(clave));
       const añadidas = nuevas.filter((l) => !existentes.has(clave(l)));
-      cambiar([...lineas, ...añadidas].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)));
-      setMsg(`Cargadas ${añadidas.length} líneas${nuevas.length - añadidas.length ? ` (${nuevas.length - añadidas.length} ya existían)` : ""}${errores.length ? ` · No reconocidas: ${errores.slice(0, 5).join(", ")}${errores.length > 5 ? "…" : ""}` : ""}. Pulsa «Guardar».`);
+      const juntas = [...lineas, ...añadidas].sort((a, b) => (a.fecha < b.fecha ? -1 : 1));
+      await persistir(juntas);
+      setMsg(`Guardadas ${añadidas.length} líneas${nuevas.length - añadidas.length ? ` (${nuevas.length - añadidas.length} ya existían)` : ""}${errores.length ? ` · No reconocidas: ${errores.slice(0, 5).join(", ")}${errores.length > 5 ? "…" : ""}` : ""}.`);
     } catch (e) {
       setMsg(`✗ No se pudo leer el fichero${String(e.message || e).includes("import") || String(e.message || e).includes("fetch") ? " (para .xlsx hace falta internet; prueba con CSV)" : `: ${e.message || e}`}`);
     }
@@ -781,7 +788,7 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
               <td className="px-2 py-1 border">{l.tipo}</td>
               <td className="px-2 py-1 border whitespace-nowrap">{fmtF(l.fecha)}</td>
               <td className="px-2 py-1 border text-slate-500">{l.desc}</td>
-              <td className="border text-center"><button onClick={() => cambiar(lineas.filter((x) => x.id !== l.id))} className="text-red-500" title="Quitar">✕</button></td>
+              <td className="border text-center"><button onClick={() => persistir(lineas.filter((x) => x.id !== l.id))} className="text-red-500" title="Quitar">✕</button></td>
             </tr>
           ))}
           <tr className="bg-blue-50/40">
@@ -803,6 +810,184 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
         </tbody>
       </table>
       <p className="text-xs text-slate-400">«Todos» = festivo para toda la plantilla. Si eliges un trabajador, solo cuenta para él. Para cargar desde Excel: columnas Trabajador (nombre, Nº recurso o «Todos») · Tipo · Fecha · Descripción.</p>
+    </div>
+  );
+}
+
+/** Jornada distinta para un trabajador entre dos fechas (p. ej. Iker, 6 h/día). */
+export function JornadaPorTrabajador({ ajustes, guardarAjustes, trabajadores = [] }) {
+  const [nueva, setNueva] = useState({ recurso: "", desde: "", hasta: "", horas: "6" });
+  const [error, setError] = useState("");
+  const nombreDe = (rec) => trabajadores.find((t) => t.recurso === rec)?.nombre || rec;
+  const lineas = (ajustes.incidencias || [])
+    .filter((i) => i.tipo === "reduccion" && i.recurso && i.desde)
+    .slice()
+    .sort((a, b) => nombreDe(a.recurso).localeCompare(nombreDe(b.recurso), "es") || String(a.desde).localeCompare(String(b.desde)));
+
+  const añadir = () => {
+    if (!nueva.recurso) { setError("Elige un trabajador."); return; }
+    if (!nueva.desde) { setError("Indica la fecha desde."); return; }
+    const hasta = nueva.hasta || nueva.desde;
+    if (hasta < nueva.desde) { setError("La fecha hasta no puede ser anterior a la de desde."); return; }
+    const horas = Number(String(nueva.horas).replace(",", "."));
+    if (!(horas > 0)) { setError("Indica las horas al día."); return; }
+    const i = {
+      id: `j${Date.now()}`,
+      recurso: nueva.recurso,
+      tipo: "reduccion",
+      desde: nueva.desde,
+      hasta,
+      horas,
+      codigo: "",
+      motivo: "Jornada del trabajador",
+    };
+    guardarAjustes({ ...ajustes, incidencias: [...(ajustes.incidencias || []), i] });
+    setNueva({ recurso: "", desde: "", hasta: "", horas: "6" });
+    setError("");
+  };
+
+  const quitar = (id) => {
+    guardarAjustes({ ...ajustes, incidencias: (ajustes.incidencias || []).filter((x) => x.id !== id) });
+  };
+
+  return (
+    <div className="mt-1">
+      <div className="font-medium text-slate-800">Jornada de un trabajador</div>
+      <p className="text-xs text-slate-400 mb-2">Si alguien no hace la jornada general, indica desde qué día hasta qué día y cuántas horas le tocan. Por ejemplo, Iker del 01/11/2026 al 30/11/2026 a 6 h al día: con 6 h el día queda completo.</p>
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="text-xs text-slate-500">Trabajador
+          <select value={nueva.recurso} onChange={(e) => setNueva({ ...nueva, recurso: e.target.value })} className={`${input} block mt-1 max-w-[240px]`}>
+            <option value="">— Elige —</option>
+            {[...trabajadores].sort((a, b) => a.nombre.localeCompare(b.nombre, "es")).map((t) => (
+              <option key={t.recurso} value={t.recurso}>{t.nombre}</option>
+            ))}
+          </select>
+        </label>
+        <label className="text-xs text-slate-500">Desde
+          <input type="date" value={nueva.desde} onChange={(e) => setNueva({ ...nueva, desde: e.target.value })} className={`${input} block mt-1`} />
+        </label>
+        <label className="text-xs text-slate-500">Hasta
+          <input type="date" value={nueva.hasta} onChange={(e) => setNueva({ ...nueva, hasta: e.target.value })} className={`${input} block mt-1`} />
+        </label>
+        <label className="text-xs text-slate-500">Horas al día
+          <input type="number" step="0.25" min="0.25" value={nueva.horas} onChange={(e) => setNueva({ ...nueva, horas: e.target.value })} className={`${input} block mt-1 w-20`} />
+        </label>
+        <button type="button" onClick={añadir} className="px-3 py-1 rounded bg-blue-700 text-white text-sm">Añadir</button>
+      </div>
+      {error && <p className="text-xs text-red-600 mt-1">{error}</p>}
+      {lineas.length > 0 && (
+        <table className="w-full text-sm border-collapse mt-2">
+          <thead>
+            <tr className="text-left text-xs text-slate-500">
+              <th className="px-2 py-1 border">Trabajador</th>
+              <th className="px-2 py-1 border">Desde</th>
+              <th className="px-2 py-1 border">Hasta</th>
+              <th className="px-2 py-1 border text-right">Horas/día</th>
+              <th className="border w-8" />
+            </tr>
+          </thead>
+          <tbody>
+            {lineas.map((i) => (
+              <tr key={i.id}>
+                <td className="px-2 py-1 border">{nombreDe(i.recurso)}</td>
+                <td className="px-2 py-1 border whitespace-nowrap">{fmtF(i.desde)}</td>
+                <td className="px-2 py-1 border whitespace-nowrap">{fmtF(i.hasta || i.desde)}</td>
+                <td className="px-2 py-1 border text-right">{h(i.horas) || i.horas} h</td>
+                <td className="border text-center">
+                  <button type="button" onClick={() => quitar(i.id)} className="text-red-500" title="Quitar">✕</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+/** Quién entra en el cuadro de horas. Se guarda con el resto de ajustes. */
+export function VentanaPlantilla({ ajustes, guardarAjustes, personas = [], defecto, onCerrar, embebida = false }) {
+  const [q, setQ] = useState("");
+  const inactivos = new Set(ajustes.inactivos || []);
+  const forzados = new Set(ajustes.activosForzados || []);
+  const esActivo = (id) => {
+    if (inactivos.has(id)) return false;
+    return forzados.has(id) || defecto?.has(id);
+  };
+  const texto = q.trim().toLowerCase();
+  const coincide = (p) => !texto || `${p.nombre} ${p.recurso} ${p.depto}`.toLowerCase().includes(texto);
+  const activos = personas.filter((p) => esActivo(p.recurso) && coincide(p));
+  const noActivos = personas.filter((p) => !esActivo(p.recurso) && coincide(p));
+
+  function guardar(listaInactivos, listaForzados) {
+    guardarAjustes({ ...ajustes, inactivos: listaInactivos, activosForzados: listaForzados });
+  }
+  function pasarANoActivo(id) {
+    guardar(
+      [...new Set([...(ajustes.inactivos || []), id])],
+      (ajustes.activosForzados || []).filter((x) => x !== id),
+    );
+  }
+  function pasarAActivo(id) {
+    const sinEste = (ajustes.inactivos || []).filter((x) => x !== id);
+    const forz = defecto?.has(id)
+      ? (ajustes.activosForzados || []).filter((x) => x !== id)
+      : [...new Set([...(ajustes.activosForzados || []), id])];
+    guardar(sinEste, forz);
+  }
+
+  const columna = (titulo, lista, activo) => (
+    <div className="flex flex-col min-w-0 border border-slate-200 rounded-lg overflow-hidden">
+      <div className={`px-3 py-2 text-sm font-semibold ${activo ? "bg-emerald-50 text-emerald-900" : "bg-slate-100 text-slate-700"}`}>
+        {titulo} · {lista.length}
+      </div>
+      <ul className="overflow-y-auto max-h-[55vh] divide-y divide-slate-100">
+        {lista.length === 0 && <li className="px-3 py-4 text-sm text-slate-400">Nadie con esta búsqueda.</li>}
+        {lista.map((p) => (
+          <li key={p.recurso} className="px-3 py-2 flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-slate-800 uppercase truncate">{p.nombre}</div>
+              <div className="text-xs text-slate-400 truncate">{p.depto} · {p.recurso}</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => (activo ? pasarANoActivo(p.recurso) : pasarAActivo(p.recurso))}
+              className={`shrink-0 text-xs px-2 py-1 rounded border ${activo ? "border-slate-300 text-slate-600 hover:bg-slate-50" : "border-emerald-300 text-emerald-800 hover:bg-emerald-50"}`}
+            >
+              {activo ? "No activo" : "Activo"}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+  const cuerpo = (
+    <div className={embebida ? "bg-white rounded-xl shadow-sm border border-slate-200 mt-3" : "bg-white rounded-xl shadow-xl w-full max-w-4xl"} onClick={(e) => e.stopPropagation()}>
+      <div className="px-4 py-3 border-b flex items-center gap-3">
+        <div className="font-semibold text-slate-800">Trabajadores activos y no activos</div>
+        <input
+          autoFocus
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Buscar por nombre, departamento o número…"
+          className="border rounded px-2 py-1 text-sm flex-1"
+        />
+        {onCerrar && <button type="button" onClick={onCerrar} className="text-slate-400 hover:text-slate-700 text-lg px-2">✕</button>}
+      </div>
+      <p className="px-4 pt-3 text-xs text-slate-500">
+        Los activos salen en el cuadro, también si un día no tienen horas. Los no activos no salen. Quien ha imputado en los últimos 21 días entra como activo hasta que lo pases al otro lado.
+      </p>
+      <div className="grid md:grid-cols-2 gap-3 p-4">
+        {columna("Activos", activos, true)}
+        {columna("No activos", noActivos, false)}
+      </div>
+    </div>
+  );
+  if (embebida) return cuerpo;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onCerrar}>
+      {cuerpo}
     </div>
   );
 }

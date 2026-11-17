@@ -299,6 +299,74 @@ export function cargarImagen(fuente) {
   });
 }
 
+const MAX_PDF = 3;
+const MAX_PDF_BYTES = 12 * 1024 * 1024;
+
+export function esPdf(file) {
+  if (!file) return false;
+  const tipo = String(file.type || "").toLowerCase();
+  const nombre = String(file.name || "").toLowerCase();
+  return tipo === "application/pdf" || nombre.endsWith(".pdf");
+}
+
+function parecePdfBase64(data) {
+  try {
+    const bin = atob(String(data || "").slice(0, 80));
+    return bin.includes("%PDF");
+  } catch {
+    return false;
+  }
+}
+
+export function cargarPdf(file) {
+  return new Promise((resolve, reject) => {
+    const nombre = file?.name || "documento.pdf";
+    if (!esPdf(file)) {
+      reject(new Error(`«${nombre}» no es un PDF.`));
+      return;
+    }
+    if (file.size > MAX_PDF_BYTES) {
+      reject(new Error(`«${nombre}» pesa más de 12 MB. Recórtalo o divídelo.`));
+      return;
+    }
+    const lector = new FileReader();
+    lector.onerror = () => reject(new Error(`No se pudo leer «${nombre}».`));
+    lector.onload = () => {
+      const dataUrl = String(lector.result || "");
+      const data = dataUrl.includes(",") ? dataUrl.split(",")[1] : "";
+      if (!parecePdfBase64(data)) {
+        reject(new Error(`«${nombre}» no es un PDF válido.`));
+        return;
+      }
+      resolve({ media_type: "application/pdf", data, nombre });
+    };
+    lector.readAsDataURL(file);
+  });
+}
+
+/** Imágenes y PDF del clip o del pegado. Avisa si el fichero no vale. */
+export async function leerAdjuntosChat(ficheros, { imagenesYa = 0, pdfsYa = 0 } = {}) {
+  const avisos = [];
+  const imagenes = [];
+  const pdfs = [];
+  let nImg = imagenesYa;
+  let nPdf = pdfsYa;
+  for (const f of [...(ficheros || [])].filter(Boolean)) {
+    if (/^image\//.test(f.type || "")) {
+      if (nImg >= 10) { avisos.push("Como máximo 10 imágenes por mensaje."); continue; }
+      try { imagenes.push(await cargarImagen(f)); nImg++; }
+      catch { avisos.push(`No se pudo leer la imagen «${f.name || ""}».`); }
+    } else if (esPdf(f)) {
+      if (nPdf >= MAX_PDF) { avisos.push("Como máximo 3 PDF por mensaje."); continue; }
+      try { pdfs.push(await cargarPdf(f)); nPdf++; }
+      catch (e) { avisos.push(e.message || String(e)); }
+    } else {
+      avisos.push(`«${f.name || "fichero"}» no es un PDF ni una imagen.`);
+    }
+  }
+  return { imagenes, pdfs, avisos: [...new Set(avisos)] };
+}
+
 const fmtValor = (v) => (v === null || v === undefined || v === "" ? "(vacío)" : typeof v === "object" ? JSON.stringify(v) : String(v));
 
 // Lee cómo ha quedado el registro en BC y el enlace para abrirlo (24/09/2026)
@@ -528,16 +596,20 @@ export default function ChatIA() {
   const fijarChatId = (id) => { chatIdRef.current = id || ""; setChatId(id || ""); if (empresa) guardarChatActual(empresa.id, id); };
   const [entrada, setEntrada] = useState("");
   const [imagenes, setImagenes] = useState([]); // imágenes pegadas/adjuntadas pendientes de enviar
+  const [pdfs, setPdfs] = useState([]);
+  const [avisoAdjunto, setAvisoAdjunto] = useState("");
   const inputImgRef = useRef(null);
-  const añadirImagenes = async (ficheros) => {
-    const lista = [...ficheros].filter((f) => f && /^image\//.test(f.type));
-    for (const f of lista.slice(0, 10)) {
-      try { const im = await cargarImagen(f); setImagenes((prev) => [...prev, im].slice(0, 10)); } catch {}
-    }
+  const añadirAdjuntos = async (ficheros) => {
+    const r = await leerAdjuntosChat(ficheros, { imagenesYa: imagenes.length, pdfsYa: pdfs.length });
+    if (r.imagenes.length) setImagenes((prev) => [...prev, ...r.imagenes].slice(0, 10));
+    if (r.pdfs.length) setPdfs((prev) => [...prev, ...r.pdfs].slice(0, 3));
+    setAvisoAdjunto(r.avisos.join(" "));
   };
   const onPegar = (e) => {
-    const fich = [...(e.clipboardData?.items || [])].filter((it) => it.kind === "file" && /^image\//.test(it.type)).map((it) => it.getAsFile());
-    if (fich.length) { e.preventDefault(); añadirImagenes(fich); }
+    const fich = [...(e.clipboardData?.items || [])].filter((it) => it.kind === "file").map((it) => it.getAsFile()).filter(Boolean);
+    const utiles = fich.filter((f) => /^image\//.test(f.type || "") || esPdf(f));
+    if (utiles.length) { e.preventDefault(); añadirAdjuntos(utiles); }
+    else if (fich.length) { e.preventDefault(); setAvisoAdjunto(`«${fich[0].name || "fichero"}» no es un PDF ni una imagen.`); }
   };
   const [ocupado, setOcupado] = useState(false);
   const [verCambios, setVerCambios] = useState(false);
@@ -606,9 +678,10 @@ export default function ChatIA() {
   }, [mensajes, historial]);
   useEffect(() => { finRef.current?.scrollIntoView({ block: "nearest" }); }, [mensajes, ocupado]);
 
-  const enviarTexto = async (texto, mostrar = true, imgs = []) => {
-    if ((!texto && !imgs.length) || ocupado || !empresa) return;
-    if (mostrar) setMensajes((m) => [...m, { rol: "yo", texto: texto || "(imágenes)", miniaturas: imgs.map((i) => i.miniatura) }]);
+  const enviarTexto = async (texto, mostrar = true, imgs = [], docs = []) => {
+    if ((!texto && !imgs.length && !docs.length) || ocupado || !empresa) return;
+    const textoVisible = texto || (docs.length ? docs.map((d) => d.nombre).join(", ") : "(imágenes)");
+    if (mostrar) setMensajes((m) => [...m, { rol: "yo", texto: textoVisible, miniaturas: imgs.map((i) => i.miniatura), pdfs: docs.map((d) => d.nombre) }]);
     setOcupado(true);
     try {
       const r = await fetch("/api/ia-bc/chat", {
@@ -619,6 +692,7 @@ export default function ChatIA() {
           historial,
           empresa: empresa.id,
           imagenes: imgs.map((i) => ({ media_type: i.media_type, data: i.data })),
+          documentos: docs.map((d) => ({ media_type: d.media_type, data: d.data, nombre: d.nombre })),
           contexto: { pantalla: "Asistente IA", texto: "", app: snapshotAppParaIA() },
         }),
       });
@@ -643,11 +717,14 @@ export default function ChatIA() {
 
   const enviar = () => {
     const t = entrada.trim();
-    if (!t && !imagenes.length) return;
+    if (!t && !imagenes.length && !pdfs.length) return;
     const imgs = imagenes;
+    const docs = pdfs;
     setEntrada("");
     setImagenes([]);
-    enviarTexto(t, true, imgs);
+    setPdfs([]);
+    setAvisoAdjunto("");
+    enviarTexto(t, true, imgs, docs);
   };
 
   // Tras aplicar un cambio, se le cuenta a la IA para que lo sepa en la conversación
@@ -778,6 +855,15 @@ export default function ChatIA() {
                     {m.miniaturas.map((src, k) => <img key={k} src={src} alt="" className="h-20 rounded border border-slate-200" />)}
                   </div>
                 )}
+                {(m.pdfs || []).length > 0 && (
+                  <div className="flex flex-wrap gap-1 justify-end">
+                    {m.pdfs.map((nombre, k) => (
+                      <span key={k} className="inline-flex items-center gap-1 max-w-full text-[11px] bg-white text-slate-700 border border-slate-200 rounded px-2 py-0.5">
+                        <Paperclip size={11} /> <span className="truncate">{nombre}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <div className={`text-[13px] rounded-lg px-3 py-2 ${m.rol === "yo" ? "bg-blue-600 text-white whitespace-pre-wrap" : m.error ? "bg-red-50 text-red-700 border border-red-200" : "bg-slate-100 text-slate-800"}`}>
                   {m.rol === "yo" ? m.texto : <MensajeConTablas texto={m.texto} empresaId={empresa?.id || empresaId} />}
                 </div>
@@ -817,9 +903,21 @@ export default function ChatIA() {
           ))}
         </div>
       )}
+      {pdfs.length > 0 && (
+        <div className="flex flex-wrap gap-2 mt-2">
+          {pdfs.map((d, k) => (
+            <div key={k} className="inline-flex items-center gap-1 text-[12px] bg-white border border-slate-300 rounded px-2 py-1 max-w-full">
+              <Paperclip size={12} className="text-slate-500" />
+              <span className="truncate max-w-[240px]">{d.nombre}</span>
+              <button onClick={() => setPdfs((p) => p.filter((_, j) => j !== k))} className="text-slate-400 hover:text-red-600" title="Quitar"><X size={12} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      {avisoAdjunto && <div className="mt-2 text-[12px] text-red-700">{avisoAdjunto}</div>}
       <div className="flex gap-2 items-end mt-3">
-        <input ref={inputImgRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => { añadirImagenes(e.target.files || []); e.target.value = ""; }} />
-        <button onClick={() => inputImgRef.current?.click()} disabled={ocupado} title="Adjuntar imágenes (también puedes pegarlas con Ctrl+V)" className="text-slate-500 border border-slate-300 bg-white hover:bg-slate-50 rounded-md p-2.5">
+        <input ref={inputImgRef} type="file" accept="image/*,application/pdf,.pdf" multiple className="hidden" onChange={(e) => { añadirAdjuntos(e.target.files || []); e.target.value = ""; }} />
+        <button onClick={() => inputImgRef.current?.click()} disabled={ocupado} title="Adjuntar imagen o PDF (también puedes pegarlos con Ctrl+V)" className="text-slate-500 border border-slate-300 bg-white hover:bg-slate-50 rounded-md p-2.5">
           <Paperclip size={15} />
         </button>
         <textarea
@@ -828,10 +926,10 @@ export default function ChatIA() {
           onChange={(e) => setEntrada(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } }}
           rows={3}
-          placeholder="Escribe aquí… Puedes pegar capturas con Ctrl+V (Enter para enviar, Mayús+Enter para salto de línea)"
+          placeholder="Escribe aquí… Puedes pegar capturas o adjuntar un PDF (Enter para enviar, Mayús+Enter para salto de línea)"
           className="flex-1 text-[13px] border border-slate-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white"
         />
-        <button onClick={enviar} disabled={ocupado || (!entrada.trim() && !imagenes.length) || !empresa} className="flex items-center gap-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-md px-4 py-2.5">
+        <button onClick={enviar} disabled={ocupado || (!entrada.trim() && !imagenes.length && !pdfs.length) || !empresa} className="flex items-center gap-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-md px-4 py-2.5">
           <Send size={15} /> Enviar
         </button>
       </div>

@@ -51,7 +51,7 @@ const DEPARTAMENTO = {
   SI: "Servicio de ingeniería",
 };
 
-function unidadDeGrupo(codigo) {
+export function unidadDeGrupo(codigo) {
   const c = String(codigo || "").trim().toUpperCase();
   if (!c || c === "Nº" || c === "NO") return "";
   if (GRUPO[c]) return GRUPO[c];
@@ -80,6 +80,17 @@ export function indiceRecursos(filas) {
     });
   }
   return { mapa, columna, cargada: mapa.size > 0 };
+}
+
+/** Departamentos a partir del mapa Nº recurso → grupo que devuelve /api/horas/grupos. */
+export function indiceDesdeGrupos(grupos) {
+  const mapa = new Map();
+  for (const [no, bruto] of Object.entries(grupos || {})) {
+    const clave = String(no || "").trim().toUpperCase();
+    if (!clave) continue;
+    mapa.set(clave, { nombre: "", unidad: unidadDeGrupo(bruto) });
+  }
+  return { mapa, columna: mapa.size ? "Resource_Group_No" : "", cargada: mapa.size > 0 };
 }
 
 function agrupar(filas, campo, vacio) {

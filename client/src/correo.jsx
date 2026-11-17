@@ -4,7 +4,7 @@
  * Bandeja del usuario logueado (email_empresa de AChuman), no un buzón fijo.
  */
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { RefreshCw, Search, Mail, Paperclip, ArrowLeft, ChevronLeft, ChevronRight, Sparkles, CheckSquare, X } from "lucide-react";
+import { RefreshCw, Search, Mail, Paperclip, ArrowLeft, ChevronLeft, ChevronRight, Sparkles, CheckSquare, X, Send } from "lucide-react";
 
 const EXTENSIONES_ADJUNTO = new Set(["pdf", "png", "jpg", "jpeg", "doc", "docx", "xls", "xlsx"]);
 const TOPE_FICHERO = 3 * 1024 * 1024;
@@ -131,6 +131,7 @@ const fmtFecha = (iso) => {
 
 export default function Correo({ onCrearTarea, usuario = null }) {
   const [carpeta, setCarpeta] = useState("inbox"); // inbox | enviados
+  const [filtroLeido, setFiltroLeido] = useState("todos"); // todos | no-llegits | llegits
   const [mensajes, setMensajes] = useState([]);
   const [buzon, setBuzon] = useState(usuario?.email_envio || usuario?.email_empresa || null);
   const [cargando, setCargando] = useState(false);
@@ -162,6 +163,11 @@ export default function Correo({ onCrearTarea, usuario = null }) {
   const [pistaCliente, setPistaCliente] = useState("");
   const [avisoImporte, setAvisoImporte] = useState("");
   const [importeOk, setImporteOk] = useState(false);
+  const [chatRec, setChatRec] = useState([]); // {rol:"ia"|"yo", texto}
+  const [chatRecTexto, setChatRecTexto] = useState("");
+  const [chatRecCargando, setChatRecCargando] = useState(false);
+  const [chatRecError, setChatRecError] = useState(null);
+  const chatRecFinRef = useRef(null);
 
   useEffect(() => {
     fetch("/api/correo/remitente")
@@ -336,6 +342,7 @@ export default function Correo({ onCrearTarea, usuario = null }) {
           tipo: accion.tipo,
           factura: accion.factura || "",
           cliente: accion.cliente || "",
+          empresa: accion.empresa || "",
           pista: pista || "",
         }),
       });
@@ -363,8 +370,13 @@ export default function Correo({ onCrearTarea, usuario = null }) {
   };
 
   useEffect(() => {
-    if (!abierto?.id) { setRecomendacion(null); setErrorRec(null); setRecDescartada(false); setErrorAccion(null); setAccionFallida(null); setPistaCliente(""); setAvisoImporte(""); setImporteOk(false); return; }
+    if (!abierto?.id) {
+      setRecomendacion(null); setErrorRec(null); setRecDescartada(false); setErrorAccion(null); setAccionFallida(null); setPistaCliente(""); setAvisoImporte(""); setImporteOk(false);
+      setChatRec([]); setChatRecTexto(""); setChatRecError(null); setChatRecCargando(false);
+      return;
+    }
     setErrorAccion(null); setAccionFallida(null); setPistaCliente(""); setAvisoImporte(""); setImporteOk(false);
+    setChatRec([]); setChatRecTexto(""); setChatRecError(null); setChatRecCargando(false);
     const guardada = leerRecomendacionLocal(abierto.id);
     if (guardada && typeof guardada.queHacer === "string") {
       setRecDescartada(false); setErrorRec(null); setCargandoRec(false); setRecomendacion(guardada);
@@ -392,6 +404,127 @@ export default function Correo({ onCrearTarea, usuario = null }) {
       .finally(() => { if (vivo) setCargandoRec(false); });
     return () => { vivo = false; };
   }, [abierto?.id]);
+
+  useEffect(() => {
+    chatRecFinRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [chatRec, chatRecCargando]);
+
+  const chipsChatRec = (() => {
+    const chips = [
+      { id: "millorar", texto: "Millorar el borrador" },
+      { id: "mes-curt", texto: "Fes-lo més curt" },
+      { id: "albaran", texto: "Preparar albarà de venda", accion: "albaran" },
+    ];
+    if (onCrearTarea) chips.push({ id: "tasca", texto: "Crear tasca", accion: "tasca" });
+    for (const a of recomendacion?.acciones || []) {
+      const clave = a.tipo + "|" + (a.factura || "") + "|" + (a.cliente || "") + "|" + (a.empresa || "");
+      const enEmp = a.empresa ? " a " + a.empresa : "";
+      chips.push({
+        id: "bc-" + clave,
+        texto: a.tipo === "abono"
+          ? "Obrir abonament" + enEmp + (a.factura ? " " + a.factura : "")
+          : "Obrir factura" + enEmp + (a.cliente ? " " + a.cliente : ""),
+        accion: "bc",
+        bc: { accion: a, clave },
+      });
+    }
+    chips.push({ id: "que-pots", texto: "Què més pots fer?" });
+    return chips;
+  })();
+
+  const enviarChatRec = async (textoLibre) => {
+    const texto = String(textoLibre || "").trim();
+    if (!texto || !abierto?.id || chatRecCargando) return;
+    const historial = [...chatRec, { rol: "yo", texto }];
+    setChatRec(historial);
+    setChatRecTexto("");
+    setChatRecCargando(true);
+    setChatRecError(null);
+    try {
+      const r = await fetch("/api/correo/chat-rec", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mensaje: texto,
+          historial: chatRec.slice(-8),
+          correo: {
+            id: abierto.id,
+            de: abierto.de,
+            deNombre: abierto.deNombre,
+            asunto: abierto.asunto,
+            cuerpo: abierto.cuerpo,
+            tipoCuerpo: abierto.tipoCuerpo,
+          },
+          recomendacion,
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setChatRecError(d.error || "No he pogut respondre.");
+        return;
+      }
+      const respuesta = String(d.respuesta || "").trim() || "D'acord.";
+      setChatRec((prev) => [...prev, { rol: "ia", texto: respuesta }]);
+      if (d.borrador || d.queHacer || Array.isArray(d.acciones) || Array.isArray(d.apoyos) || d.recomendacion) {
+        setRecomendacion((prev) => {
+          const next = {
+            ...(prev || {}),
+            ...(d.recomendacion ? { recomendacion: String(d.recomendacion) } : {}),
+            ...(d.queHacer != null ? { queHacer: String(d.queHacer) } : {}),
+            ...(d.borrador ? { borrador: String(d.borrador) } : {}),
+            ...(Array.isArray(d.apoyos) ? { apoyos: d.apoyos.map((x) => String(x)).slice(0, 8) } : {}),
+            ...(Array.isArray(d.acciones) ? {
+              acciones: d.acciones.map((a) => ({
+                tipo: a?.tipo === "factura" ? "factura" : a?.tipo === "abono" ? "abono" : "",
+                factura: String(a?.factura || "").trim().slice(0, 30),
+                cliente: String(a?.cliente || "").trim().slice(0, 120),
+                empresa: String(a?.empresa || "").trim().slice(0, 60),
+              })).filter((a) => a.tipo && (a.factura || a.cliente || a.empresa)).slice(0, 6),
+            } : {}),
+          };
+          if (abierto?.id) guardarRecomendacionLocal(abierto.id, next);
+          return next;
+        });
+      }
+    } catch {
+      setChatRecError("No he pogut connectar amb el servidor.");
+    } finally {
+      setChatRecCargando(false);
+    }
+  };
+
+  const clicChipChatRec = (chip) => {
+    if (!chip || chatRecCargando) return;
+    if (chip.accion === "albaran") {
+      setChatRec((prev) => [...prev, { rol: "yo", texto: chip.texto }, { rol: "ia", texto: "Obro el preparador de l'albarà de venda amb els adjunts d'aquest correu." }]);
+      proponerAlbaranVenta();
+      return;
+    }
+    if (chip.accion === "tasca" && onCrearTarea && abierto) {
+      setChatRec((prev) => [...prev, { rol: "yo", texto: chip.texto }, { rol: "ia", texto: "Obro la creació de tasca amb aquest correu." }]);
+      onCrearTarea({
+        titulo: abierto.asunto,
+        notas: "",
+        prioridad: "media",
+        _extId: "mail-" + abierto.id,
+        correo: {
+          de: abierto.de, deNombre: abierto.deNombre,
+          para: abierto.para, fecha: abierto.fecha,
+          asunto: abierto.asunto,
+          cuerpo: abierto.cuerpo || "",
+          tipoCuerpo: abierto.tipoCuerpo || "text",
+          id: abierto.id,
+        },
+      });
+      return;
+    }
+    if (chip.accion === "bc" && chip.bc) {
+      setChatRec((prev) => [...prev, { rol: "yo", texto: chip.texto }, { rol: "ia", texto: "Preparant el document a Business Central…" }]);
+      prepararDocumentBc(chip.bc.accion, chip.bc.clave);
+      return;
+    }
+    enviarChatRec(chip.texto);
+  };
 
   const redactarConClaude = async () => {
     setRedactando(true); setErrCompo(null);
@@ -431,6 +564,12 @@ export default function Correo({ onCrearTarea, usuario = null }) {
   }, [carpeta]);
 
   useEffect(() => { cargar(carpeta, ""); }, [carpeta, cargar]);
+
+  const mensajesVisibles = mensajes.filter((m) => {
+    if (filtroLeido === "no-llegits") return !m.leido;
+    if (filtroLeido === "llegits") return !!m.leido;
+    return true;
+  });
 
   const abrir = async (id) => {
     setCompo(null);
@@ -823,10 +962,11 @@ export default function Correo({ onCrearTarea, usuario = null }) {
                   <div className="text-[11px] font-bold text-amber-800 uppercase">Què has de fer</div>
                   <p className="text-[13px] text-slate-800 leading-relaxed">{recomendacion.queHacer}</p>
                   {(recomendacion.acciones || []).map((a, i) => {
-                    const clave = a.tipo + "|" + (a.factura || "") + "|" + (a.cliente || "");
+                    const clave = a.tipo + "|" + (a.factura || "") + "|" + (a.cliente || "") + "|" + (a.empresa || "");
+                    const enEmp = a.empresa ? " a " + a.empresa : "";
                     const texto = a.tipo === "abono"
-                      ? "Vols obrir a BC l'abonament de venda" + (a.factura ? " " + a.factura : "") + "?"
-                      : "Vols obrir a BC la factura de venda" + (a.cliente ? " per a " + a.cliente : "") + "?";
+                      ? "Vols obrir a BC" + enEmp + " l'abonament de venda" + (a.factura ? " " + a.factura : "") + "?"
+                      : "Vols obrir a BC" + enEmp + " la factura de venda" + (a.cliente ? " per a " + a.cliente : "") + "?";
                     return (
                       <button
                         key={clave + i}
@@ -909,6 +1049,69 @@ export default function Correo({ onCrearTarea, usuario = null }) {
               </div>
             </div>
           )}
+          {!cargandoRec && (
+            <div className={`border-t border-slate-100 pt-3 space-y-2 ${recomendacion || errorRec ? "mt-4" : "mt-3"}`}>
+              <div className="text-[11px] font-bold text-slate-500 uppercase">Chat · què puc fer</div>
+              <div className="bg-slate-50 border border-slate-200 rounded-md p-2 max-h-64 overflow-y-auto space-y-2">
+                <div className="text-[12px] text-slate-700 bg-white border border-slate-200 rounded-md px-2.5 py-2 leading-relaxed">
+                  Amb aquest correu puc ajudar-te a respondre, millorar el borrador, preparar un albarà de venda, crear una tasca
+                  {(recomendacion?.acciones || []).length ? " o obrir abonaments i factures a Business Central" : ""}
+                  . Digues-me què vols o tria una opció.
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {chipsChatRec.map((chip) => (
+                    <button
+                      key={chip.id}
+                      type="button"
+                      disabled={chatRecCargando}
+                      onClick={() => clicChipChatRec(chip)}
+                      className="text-[11px] font-semibold text-blue-700 bg-white border border-blue-200 hover:bg-blue-50 disabled:opacity-50 rounded-full px-2.5 py-1"
+                    >
+                      {chip.texto}
+                    </button>
+                  ))}
+                </div>
+                {chatRec.map((m, i) => (
+                  <div
+                    key={i}
+                    className={`text-[12px] leading-relaxed rounded-md px-2.5 py-2 whitespace-pre-wrap ${
+                      m.rol === "yo"
+                        ? "bg-blue-600 text-white ml-6"
+                        : "bg-white border border-slate-200 text-slate-700 mr-4"
+                    }`}
+                  >
+                    {m.texto}
+                  </div>
+                ))}
+                {chatRecCargando && <div className="text-[12px] text-slate-400">Pensant…</div>}
+                {chatRecError && <div className="text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1">{chatRecError}</div>}
+                <div ref={chatRecFinRef} />
+              </div>
+              <form
+                className="flex gap-1.5"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  enviarChatRec(chatRecTexto);
+                }}
+              >
+                <input
+                  value={chatRecTexto}
+                  onChange={(e) => setChatRecTexto(e.target.value)}
+                  placeholder="Ex.: fes el borrador més formal…"
+                  disabled={chatRecCargando}
+                  className="flex-1 min-w-0 text-[12px] border border-slate-300 rounded-md px-2.5 py-1.5 disabled:opacity-60"
+                />
+                <button
+                  type="submit"
+                  disabled={chatRecCargando || !chatRecTexto.trim()}
+                  className="shrink-0 text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-md px-2.5 py-1.5"
+                  title="Enviar"
+                >
+                  <Send size={14} />
+                </button>
+              </form>
+            </div>
+          )}
         </aside>
         )}
         </div>
@@ -927,7 +1130,7 @@ export default function Correo({ onCrearTarea, usuario = null }) {
           <p className="text-slate-500 text-sm mt-1">
             Safata de {carpeta === "inbox" ? "entrada" : "enviats"}
             {buzon ? <> · <span className="font-medium text-slate-700">{buzon}</span></> : " · resolviendo buzón…"}
-            {!cargando && <> · {mensajes.length} correus des del 09/10/2025</>}
+            {!cargando && <> · {mensajesVisibles.length}{filtroLeido !== "todos" && mensajesVisibles.length !== mensajes.length ? ` de ${mensajes.length}` : ""} correus des del 09/10/2025</>}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -940,10 +1143,15 @@ export default function Correo({ onCrearTarea, usuario = null }) {
         </div>
       </div>
 
-      <div className="flex items-center gap-2 mt-4 text-[13px]">
+      <div className="flex items-center gap-2 mt-4 text-[13px] flex-wrap">
         <div className="inline-flex rounded-md border border-slate-300 overflow-hidden">
           <button onClick={() => setCarpeta("inbox")} className={`px-3 py-1.5 ${carpeta === "inbox" ? "bg-blue-600 text-white" : "bg-white text-slate-600"}`}>Rebuts</button>
           <button onClick={() => setCarpeta("enviados")} className={`px-3 py-1.5 ${carpeta === "enviados" ? "bg-blue-600 text-white" : "bg-white text-slate-600"}`}>Enviats</button>
+        </div>
+        <div className="inline-flex rounded-md border border-slate-300 overflow-hidden">
+          <button type="button" onClick={() => setFiltroLeido("todos")} className={`px-3 py-1.5 ${filtroLeido === "todos" ? "bg-slate-700 text-white" : "bg-white text-slate-600"}`}>Tots</button>
+          <button type="button" onClick={() => setFiltroLeido("no-llegits")} className={`px-3 py-1.5 ${filtroLeido === "no-llegits" ? "bg-slate-700 text-white" : "bg-white text-slate-600"}`}>No llegits</button>
+          <button type="button" onClick={() => setFiltroLeido("llegits")} className={`px-3 py-1.5 ${filtroLeido === "llegits" ? "bg-slate-700 text-white" : "bg-white text-slate-600"}`}>Llegits</button>
         </div>
         <div className="relative flex-1 max-w-sm">
           <Search size={13} className="absolute left-2 top-2.5 text-slate-400" />
@@ -969,7 +1177,12 @@ export default function Correo({ onCrearTarea, usuario = null }) {
         {!cargando && mensajes.length === 0 && !error && (
           <div className="px-4 py-6 text-center text-slate-400 text-sm">No hi ha correus.</div>
         )}
-        {mensajes.map((m) => (
+        {!cargando && mensajes.length > 0 && mensajesVisibles.length === 0 && !error && (
+          <div className="px-4 py-6 text-center text-slate-400 text-sm">
+            {filtroLeido === "no-llegits" ? "No hi ha correus no llegits." : "No hi ha correus llegits."}
+          </div>
+        )}
+        {mensajesVisibles.map((m) => (
           <button
             key={m.id}
             onClick={() => abrir(m.id)}

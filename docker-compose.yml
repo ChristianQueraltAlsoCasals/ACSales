@@ -40,6 +40,8 @@ services:
       - 'host.docker.internal:host-gateway'
     ports:
       - '${APP_PORT:-8102}:8102'
+    volumes:
+      - facturas_pdf:/app/data/facturas_pdf
 
   backup:
     image: postgres:16-alpine
@@ -56,3 +58,4 @@ services:
 
 volumes:
   pgdata:
+  facturas_pdf:

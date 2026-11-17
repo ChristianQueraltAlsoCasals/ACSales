@@ -154,6 +154,7 @@ function FeinaCorreu({ correo, onRec }) {
           tipo: accion.tipo,
           factura: accion.factura || "",
           cliente: accion.cliente || "",
+          empresa: accion.empresa || "",
           pista: pistaTexto || "",
         }),
       });
@@ -187,10 +188,11 @@ function FeinaCorreu({ correo, onRec }) {
       <div className="text-[11px] font-bold text-amber-800 uppercase">Què has de fer</div>
       {rec?.queHacer && <p className="text-[13px] text-slate-800 leading-relaxed">{rec.queHacer}</p>}
       {(rec?.acciones || []).map((a, i) => {
-        const clave = a.tipo + "|" + (a.factura || "") + "|" + (a.cliente || "");
+        const clave = a.tipo + "|" + (a.factura || "") + "|" + (a.cliente || "") + "|" + (a.empresa || "");
+        const enEmp = a.empresa ? " a " + a.empresa : "";
         const texto = a.tipo === "abono"
-          ? "Vols obrir a BC l'abonament de venda" + (a.factura ? " " + a.factura : "") + "?"
-          : "Vols obrir a BC la factura de venda" + (a.cliente ? " per a " + a.cliente : "") + "?";
+          ? "Vols obrir a BC" + enEmp + " l'abonament de venda" + (a.factura ? " " + a.factura : "") + "?"
+          : "Vols obrir a BC" + enEmp + " la factura de venda" + (a.cliente ? " per a " + a.cliente : "") + "?";
         return (
           <button
             key={clave + i}

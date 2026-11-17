@@ -87,6 +87,22 @@ export function listasCorreoDepartamento(codigo) {
   return { para: [...EMAILS_ADMINISTRACION], cc: [] };
 }
 
+/** Para = todos los responsables de la empresa, sin repetir correos.
+ *  Copia = Administración. */
+export function listasCorreoTodosResponsables() {
+  const vistos = new Set();
+  const para = [];
+  for (const lista of Object.values(EMAILS_DEPARTAMENTO)) {
+    for (const e of lista) {
+      const k = String(e || "").trim().toLowerCase();
+      if (!k || vistos.has(k)) continue;
+      vistos.add(k);
+      para.push(String(e).trim());
+    }
+  }
+  return { para, cc: [...EMAILS_ADMINISTRACION] };
+}
+
 /** Quita a quien envía de la copia. Si el Para es solo Administración
  *  (no había equipo de departamento), también lo quita de ahí. */
 export function aplicarRemitente(para, cc, emailRemitente) {

@@ -4,6 +4,8 @@
  * Carga desde BC los MOVIMIENTOS DE PROYECTO (página 92 «Movs. proyecto»,
  * publicada como servicio web OData) de tipo Recurso y los guarda en
  * Postgres (claveEmpresa horas / horas_ferros…). Solo LECTURA de BC.
+ * El cliente de cada OT NO se pide a Job_List: se reutiliza Memoria histórica
+ * (otFiles / fichas en estado).
  *
  *   GET  /api/horas/estado          → horas guardadas + tipos de trabajo + ajustes
  *   POST /api/horas/cargar          {desde, hasta} → lee BC y guarda
@@ -12,7 +14,25 @@
  *
  * Servicio web: «JobLedgerEntries» (publicado en BC), o BC_WS_MOVSPROYECTO en
  * .env, o se busca en el catálogo (nombres tipo «Movs_proyecto»…).
+ *
+ * Un trabajador en activo (con alguna imputación en los 21 días anteriores al
+ * periodo) entra en el cuadro aunque el periodo elegido no tenga ninguna línea
+ * suya: ese día laborable sale como sin imputar.
  */
+const DIAS_ACTIVO = 21;
+
+function fechaMenos(iso, dias) {
+  const [y, m, d] = String(iso).split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - dias);
+  return dt.toISOString().slice(0, 10);
+}
+
+function altaRecurso(fila, campo) {
+  const emp = String(campo(fila, ["Employment_Date", "Fecha_empleo", "EmploymentDate"]) || "").slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(emp) && emp > "1900-01-01" ? emp : "";
+}
+
 module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa }) {
   const fs = require("fs");
   const path = require("path");
@@ -117,6 +137,94 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
     return "";
   };
 
+  /**
+   * Cliente (y línea de negocio) de cada OT desde Memoria histórica — sin bajar Job_List.
+   * Fuentes: otFiles (listado «Desde BC» / CSV) y fichas construidas. Opcional: clientes
+   * de la carga anterior de horas para OTs que aún no estén en la memoria.
+   */
+  async function otsDesdeMemoriaHistorica(otsUsadas, clientesPrevios = null) {
+    const mapa = {}; // ot → { cliente, dimension }
+    if (!otsUsadas?.size) return { mapa, cubiertas: 0 };
+    const pref = claveEmpresa("estado");
+    const poner = (ot, cliente, dimension) => {
+      const no = String(ot || "").trim();
+      if (!no || !otsUsadas.has(no)) return;
+      const prev = mapa[no] || { cliente: "", dimension: "" };
+      const cli = String(cliente || "").trim();
+      const dim = String(dimension || "").trim();
+      if (cli && !prev.cliente) prev.cliente = cli;
+      if (dim && !prev.dimension) prev.dimension = dim;
+      mapa[no] = prev;
+    };
+    try {
+      const otFiles = await db.getDoc(`${pref}.otFiles`, []);
+      if (Array.isArray(otFiles)) {
+        for (const archivo of otFiles) {
+          for (const fila of archivo?.data || []) {
+            poner(
+              fila.OT || fila.ot,
+              fila.Client || fila.Cliente || fila.cliente,
+              fila["Línia negoci"] || fila["Linea negoci"] || fila.lineaNegocio
+            );
+          }
+        }
+      }
+    } catch { /* sin otFiles */ }
+    try {
+      const raw = await db.getDoc(`${pref}.fichas`, []);
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          const f = Array.isArray(entry) ? entry[1] : entry;
+          if (!f) continue;
+          const cli = f.general?.cliente;
+          const dim = f.general?.segmento || f.general?.unidadNegocio || "";
+          for (const ot of [
+            f.numeroOTOrigenes?.listado,
+            f.numeroOTOrigenes?.listadoOTs,
+            f.numeroOT,
+          ]) poner(ot, cli, dim);
+        }
+      }
+    } catch { /* sin fichas */ }
+    if (clientesPrevios && typeof clientesPrevios === "object") {
+      for (const ot of otsUsadas) {
+        if (mapa[ot]?.cliente) continue;
+        const cli = String(clientesPrevios[ot] || "").trim();
+        if (cli) poner(ot, cli, "");
+      }
+    }
+    return { mapa, cubiertas: Object.values(mapa).filter((x) => x.cliente).length };
+  }
+
+  /** Nº de recurso → grupo (MOINS01, MOMA02…). La ficha de recurso de BC. */
+  async function leerGruposRecurso(token, cat) {
+    const servRec = elegir(cat, [process.env.BC_WS_RECURSOS, "Ficha_recurso_Excel", "Recursos", "Resource_List", "Lista_recursos", "Resources"], [/recurs|resource/i]);
+    if (!servRec) return { grupos: {}, nombres: {}, tipoRecurso: {}, alta: {}, servicio: null };
+    const sel = servRec === "Ficha_recurso_Excel" ? "?$select=No,Name,Type,Resource_Group_No,Employment_Date" : "";
+    const grupos = {};
+    const nombres = {};
+    const tipoRecurso = {};
+    const alta = {};
+    let filasRec;
+    try {
+      filasRec = await leerTodo(`${raiz()}/${encodeURIComponent(servRec)}${sel}`, token, 20000);
+    } catch (e) {
+      if (!sel || (e.status !== 400 && e.status !== 404)) throw e;
+      filasRec = await leerTodo(`${raiz()}/${encodeURIComponent(servRec)}`, token, 20000);
+    }
+    for (const r of filasRec) {
+      const no = String(campo(r, ["No", "No_", "Nº"]));
+      if (!no) continue;
+      nombres[no] = String(campo(r, ["Name", "Nombre"]) || no);
+      tipoRecurso[no] = String(campo(r, ["Type", "Tipo"]) || "");
+      const g = String(campo(r, ["Resource_Group_No", "Grupo_recurso", "ResourceGroupNo"]) || "").trim();
+      if (g) grupos[no] = g;
+      const altaDia = altaRecurso(r, campo);
+      if (altaDia) alta[no] = altaDia;
+    }
+    return { grupos, nombres, tipoRecurso, alta, servicio: servRec };
+  }
+
   async function leerTodo(url, token, max = 200000) {
     const filas = [];
     while (url && filas.length < max) {
@@ -144,11 +252,33 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
     });
   });
 
+  // Grupos de recurso (departamento) sin exigir la tabla Recursos de Cargar datos.
+  app.get("/api/horas/grupos", async (req, res) => {
+    try {
+      const prev = await leerJSON("horas", null);
+      if (prev?.grupos && Object.keys(prev.grupos).length) {
+        return res.json({ grupos: prev.grupos, origen: "guardado" });
+      }
+      const token = await obtenerTokenBC();
+      const cat = await catalogo(token);
+      const leido = await leerGruposRecurso(token, cat);
+      if (!Object.keys(leido.grupos).length) {
+        return res.status(404).json({ error: "La ficha de recurso no trae el grupo.", servicio: leido.servicio });
+      }
+      if (prev) await escribirJSON("horas", { ...prev, grupos: leido.grupos });
+      res.json({ grupos: leido.grupos, servicio: leido.servicio });
+    } catch (e) {
+      console.error("Error /api/horas/grupos:", e);
+      res.status(500).json({ error: "No se pudieron leer los departamentos.", detalle: String(e.message || e) });
+    }
+  });
+
   app.post("/api/horas/ajustes", async (req, res) => {
     try {
       const a = req.body || {};
       const fecha = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ""));
       const txt = (v, n = 200) => String(v ?? "").slice(0, n);
+      const prev = await leerJSON("horas_ajustes", {});
       const limpio = {
         tipos: typeof a.tipos === "object" && a.tipos ? a.tipos : {},
         jornada: Number(a.jornada) > 0 ? Number(a.jornada) : 8,
@@ -164,6 +294,26 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
           horas: Number(i.horas) || 0, codigo: txt(i.codigo, 40), motivo: txt(i.motivo, 300),
         })).filter((i) => i.recurso && i.tipo) : [],
       };
+      // Un formulario que aún no ha cargado lo guardado manda listas vacías.
+      // En ese caso se conservan festivos, jornada por trabajador y tipos.
+      const sinListas = !Array.isArray(a.festivosLista) && !Array.isArray(a.incidencias)
+        && (!Array.isArray(a.festivos) || a.festivos.length === 0)
+        && (!a.tipos || !Object.keys(a.tipos).length);
+      const prevTiene = (Array.isArray(prev.festivosLista) && prev.festivosLista.length)
+        || (Array.isArray(prev.incidencias) && prev.incidencias.length)
+        || (Array.isArray(prev.festivos) && prev.festivos.length)
+        || (prev.tipos && Object.keys(prev.tipos).length);
+      if (sinListas && prevTiene) {
+        limpio.tipos = prev.tipos || {};
+        limpio.festivos = prev.festivos || [];
+        limpio.festivosLista = prev.festivosLista;
+        limpio.poblaciones = prev.poblaciones || [];
+        limpio.asignacion = prev.asignacion || {};
+        limpio.incidencias = prev.incidencias || [];
+      }
+      const idsRecurso = (v) => (Array.isArray(v) ? [...new Set(v.map((x) => txt(x, 40)).filter(Boolean))] : null);
+      limpio.inactivos = idsRecurso(a.inactivos) || (Array.isArray(prev.inactivos) ? prev.inactivos : []);
+      limpio.activosForzados = idsRecurso(a.activosForzados) || (Array.isArray(prev.activosForzados) ? prev.activosForzados : []);
       await escribirJSON("horas_ajustes", limpio);
       res.json({ ajustes: limpio });
     } catch (e) { res.status(500).json({ error: "No se pudieron guardar los ajustes.", detalle: String(e.message || e) }); }
@@ -247,13 +397,16 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
       ].filter(Boolean))];
       const probados = [];
       let servicio = null, brutas = null, avisoFiltro = "";
+      // 21 días antes del periodo: solo para saber quién está en activo.
+      // Esas líneas no se pintan; si el periodo no tiene ninguna, el día sale en rojo.
+      const desdeActivo = fechaMenos(desde, DIAS_ACTIVO);
       for (const nombre of candidatos) {
         const base = `${raiz()}/${encodeURIComponent(nombre)}`;
         try {
           // Filtro de fechas en BC; si el campo se llama distinto, se filtra aquí
           try {
             const sel = nombre === "Movs_proyecto_Excel" ? "&$select=Entry_No,Posting_Date,Entry_Type,Document_No,Job_No,Job_Task_No,Type,No,Description,Work_Type_Code,Unit_of_Measure_Code,Quantity,Total_Cost_LCY" : "";
-            brutas = await leerTodo(`${base}?$filter=${encodeURIComponent(`Posting_Date ge ${desde} and Posting_Date le ${hasta}`)}${sel}`, token);
+            brutas = await leerTodo(`${base}?$filter=${encodeURIComponent(`Posting_Date ge ${desdeActivo} and Posting_Date le ${hasta}`)}${sel}`, token);
           } catch (e) {
             if (e.status !== 400) throw e;
             avisoFiltro = "El servicio no admite filtrar por Posting_Date: se ha leído completo y filtrado aquí (más lento).";
@@ -281,13 +434,21 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
       }
       const fechaDe = (f) => String(campo(f, ["Posting_Date", "Fecha_registro", "PostingDate"])).slice(0, 10);
       const filas = [];
+      const activos = new Set();
+      const descActivo = {};
       for (const f of brutas) {
         const fecha = fechaDe(f);
-        if (!fecha || fecha < desde || fecha > hasta) continue;
+        if (!fecha || fecha < desdeActivo || fecha > hasta) continue;
         const tipo = String(campo(f, ["Type", "Tipo"]));
         if (tipo && !/resour|recurs/i.test(tipo)) continue; // solo recursos (personas/máquinas)
         const tipoMov = String(campo(f, ["Entry_Type", "Tipo_movimiento", "EntryType"]));
         if (tipoMov && !/usage|uso|consumo/i.test(tipoMov)) continue; // SOLO tipo de movimiento «Uso» (Entry_Type = Usage)
+        const recurso = String(campo(f, ["No", "No_", "Nº"]));
+        if (recurso) {
+          activos.add(recurso);
+          if (!descActivo[recurso]) descActivo[recurso] = String(campo(f, ["Description", "Descripción", "Descripcion"]));
+        }
+        if (fecha < desde || fecha > hasta) continue;
         filas.push({
           n: campo(f, ["Entry_No", "No_mov", "EntryNo"]),
           fecha,
@@ -302,42 +463,38 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
           doc: String(campo(f, ["Document_No", "No_documento", "DocumentNo"])),
         });
       }
-      // Nombres de los recursos (página 77 «Recursos» si está publicada)
-      // Nombres y tipo (Persona/Máquina) de los recursos: página 76 «Ficha recurso» (Ficha_recurso_Excel).
-      // Solo se piden Nº, Nombre y Tipo (la ficha tiene datos personales que no hacen falta).
-      const nombres = {}, tipoRecurso = {};
-      const servRec = elegir(cat, [process.env.BC_WS_RECURSOS, "Ficha_recurso_Excel", "Recursos", "Resource_List", "Lista_recursos", "Resources"], [/recurs|resource/i]);
-      if (servRec) {
-        try {
-          const sel = servRec === "Ficha_recurso_Excel" ? "?$select=No,Name,Type" : "";
-          for (const r of await leerTodo(`${raiz()}/${encodeURIComponent(servRec)}${sel}`, token, 20000)) {
-            const no = String(campo(r, ["No", "No_", "Nº"]));
-            if (!no) continue;
-            nombres[no] = String(campo(r, ["Name", "Nombre"]) || no);
-            tipoRecurso[no] = String(campo(r, ["Type", "Tipo"]) || "");
-          }
-        } catch { /* sin nombres: se usa la descripción del movimiento */ }
-      }
+      // Nombres, tipo y grupo de recurso (departamento) desde la ficha de recurso.
+      let nombres = {}, tipoRecurso = {}, grupos = {}, alta = {}, servRec = null;
+      try {
+        const leido = await leerGruposRecurso(token, cat);
+        nombres = leido.nombres;
+        tipoRecurso = leido.tipoRecurso;
+        grupos = leido.grupos;
+        alta = leido.alta || {};
+        servRec = leido.servicio;
+      } catch { /* sin ficha: se usa la descripción del movimiento */ }
+      for (const rec of activos) if (!nombres[rec] && descActivo[rec]) nombres[rec] = descActivo[rec];
       for (const f of filas) if (!nombres[f.recurso] && f.desc) nombres[f.recurso] = f.desc;
-      // Cliente de cada OT (Job_List: Bill_to_Name) para el detalle del día
-      const clientes = {};
-      const servOT = elegir(cat, [process.env.BC_WS_JOBLIST, "Job_List"], [/job|proyect/i, /list|lista/i]);
+      // Cliente de cada OT: Memoria histórica (otFiles / fichas), no Job_List de BC
       const otsUsadas = new Set(filas.map((f) => f.ot).filter(Boolean));
-      if (servOT && otsUsadas.size) {
-        try {
-          for (const j of await leerTodo(`${raiz()}/${encodeURIComponent(servOT)}?$select=No,Description,Bill_to_Name`, token, 100000)) {
-            const no = String(j.No || "");
-            if (otsUsadas.has(no)) clientes[no] = String(j.Bill_to_Name || j.Description || "");
-          }
-        } catch { /* sin clientes: el detalle sale sin esa columna rellenada */ }
+      const prevHoras = await leerJSON("horas", null);
+      const { mapa: otsMem, cubiertas } = await otsDesdeMemoriaHistorica(otsUsadas, prevHoras?.clientes || null);
+      const clientes = {};
+      for (const [ot, v] of Object.entries(otsMem)) if (v.cliente) clientes[ot] = v.cliente;
+      let avisoClientes = "";
+      if (otsUsadas.size && !cubiertas) {
+        avisoClientes = "Sin cliente de OT: carga el listado en Memoria histórica («Desde BC») o construye la memoria.";
+      } else if (otsUsadas.size && cubiertas < otsUsadas.size) {
+        avisoClientes = `Cliente de OT desde memoria histórica (${cubiertas}/${otsUsadas.size}); el resto sin cliente en el listado.`;
       }
+      const aviso = [avisoFiltro, avisoClientes].filter(Boolean).join(" ");
       const datos = {
         empresa: EMPRESA_NOMBRE(), desde, hasta, servicio, servicioRecursos: servRec || null,
-        cargado: new Date().toISOString(), leidas: brutas.length, filas, nombres, tipoRecurso, clientes, aviso: avisoFiltro,
+        cargado: new Date().toISOString(), leidas: brutas.length, filas, nombres, tipoRecurso, grupos, alta, activos: [...activos], clientes, aviso,
         camposEjemplo: brutas[0] ? Object.keys(brutas[0]).filter((k) => !k.startsWith("@")) : [],
       };
       await escribirJSON("horas", datos);
-      console.log(`[horas] ${datos.empresa} ${desde}→${hasta}: ${brutas.length} movimientos leídos de ${servicio}, ${filas.length} de recursos`);
+      console.log(`[horas] ${datos.empresa} ${desde}→${hasta}: ${brutas.length} movimientos leídos de ${servicio}, ${filas.length} de recursos · clientes memoria ${cubiertas}/${otsUsadas.size}`);
       res.json({ datos });
     } catch (e) {
       console.error("Error /api/horas/cargar:", e);
@@ -413,33 +570,11 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
         }
       }
 
-      const ots = {};
-      let avisoOt = "";
-      const servOT = elegir(cat, [process.env.BC_WS_JOBLIST, "Job_List"], [/job|proyect/i, /list|lista/i]);
       const otsUsadas = new Set(filas.map((f) => f.ot).filter(Boolean));
-      if (servOT && otsUsadas.size) {
-        try {
-          let trabajos = null;
-          try {
-            trabajos = await leerTodo(`${raiz()}/${encodeURIComponent(servOT)}?$select=No,Bill_to_Name,Global_Dimension_1_Code`, token, 100000);
-          } catch (e) {
-            if (e.status !== 400) throw e;
-            trabajos = await leerTodo(`${raiz()}/${encodeURIComponent(servOT)}?$select=No,Bill_to_Name`, token, 100000);
-          }
-          for (const j of trabajos) {
-            const no = String(j.No || "");
-            if (!otsUsadas.has(no)) continue;
-            ots[no] = {
-              cliente: String(j.Bill_to_Name || ""),
-              dimension: String(j.Global_Dimension_1_Code || ""),
-            };
-          }
-        } catch (e) {
-          avisoOt = "No se ha podido leer el cliente ni la dimensión de la OT.";
-          console.warn("[horas/mano-obra] Job_List:", e.message);
-        }
-      } else if (!servOT) {
-        avisoOt = "No encuentro publicada la lista de obras (Job_List).";
+      const { mapa: ots, cubiertas } = await otsDesdeMemoriaHistorica(otsUsadas);
+      let avisoOt = "";
+      if (otsUsadas.size && !cubiertas) {
+        avisoOt = "Sin cliente/dimensión de OT en Memoria histórica (carga el listado «Desde BC» o construye la memoria).";
       }
 
       const grupos = new Map();

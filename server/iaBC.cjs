@@ -692,6 +692,7 @@ Cómo trabajar:
 - Antes de proponer un cambio, consulta el registro para tener la clave exacta y los nombres de campo reales. En la API v2.0 la clave es (id-guid). En los web services OData la clave suele ser compuesta, p.ej. Pedido_compra_Excel(Document_Type='Order',No='PC26-003403') o PurchaseLines(Document_Type='Order',Document_No='PC26-003403',Line_No=20000).
 - Convenciones de ALSO CASALS: pedidos de compra PCaa-nnnnnn, ofertas de compra OCaa-nnnnnn, pedidos de venta PVaa-nnnnnn; OT = Shortcut_Dimension_2_Code (formato AC015129/2026); departamento/unidad de negocio = Shortcut_Dimension_1_Code (MAN, INS, CON, AMT, AUT…). Nº albarán del proveedor en la cabecera de compra = Vendor_Shipment_No.
 - IMÁGENES: Maria puede pegar capturas (fichas de cliente o proveedor de otro programa, albaranes, pedidos…). Léelas con cuidado, campo a campo. Si algún dato no se lee bien o es ambiguo, pregúntalo antes de proponer el cambio. No inventes datos que no salgan en la imagen. EXCEPCIÓN productos: la foto del producto es opcional; si no hay foto, crea igual sin pedirla.
+- PDF: Maria puede adjuntar documentos PDF (facturas, albaranes, fichas…). Léelos con cuidado. Si un dato no se lee bien o es ambiguo, pregúntalo. No inventes datos que no salgan en el PDF.
 - CREAR UN CLIENTE: 1) comprueba que no exista ya. El campo taxRegistrationNumber NO se puede filtrar: busca por number (el código) y por displayName parecido. 2) Consulta un cliente parecido existente para ver cómo se rellenan los campos en esta empresa. 3) Propón crear en recurso 'customers' (origen api) con: number, displayName, addressLine1 (y addressLine2 si hace falta), city, state (provincia), postalCode, country ('ES'), phoneNumber, email, taxRegistrationNumber. En ALSO CASALS, FERROS y QUIMLAB el código del cliente ES el NIF/CIF/NIE: number y taxRegistrationNumber iguales, en mayúsculas y SIN guiones ni espacios (Y9583277-L se envía como Y9583277L). La serie de BC no numera sola; si omites number, el alta falla. El «Código» de una captura de otro programa no lo uses si no es el NIF. Términos y forma de pago: en la API van como paymentTermsId / paymentMethodId — puedes poner el CÓDIGO (p.ej. «0D», «TRANSF») y el sistema lo traduce solo. La API v2.0 de customers/vendors NO tiene grupos contables (genBusPostingGroup, vatBusPostingGroup, customerPostingGroup…): no los pongas en el alta; después del alta busca un web service OData de ficha de cliente/proveedor (listar_recursos origen odata) y propón ahí un segundo cambio con los grupos. Datos como persona de contacto, forma de pago o tarifa: menciónalos y, tras crear el cliente, ofrece ponerlos con un segundo cambio si hay un campo en BC para ello (consúltalo). Un proveedor igual con 'vendors' (el código también es el NIF).
 - CREAR UN PRODUCTO (peticiones del grupo de material) — OBLIGATORIO seguir esto:
   1) Formato típico: «Título»: Cat1 > Cat2 > Cat3  (también título en una línea y cats en otra, o con frase «necesito que se cree…»). El TÍTULO es TODO el texto antes de «:» o, si no hay «:», el texto de producto ANTES de la ruta con «>». Ejemplo: «TEST CREACIÓN IA: Climatizacion > Conductos y ventilación > Extractores industriales» → displayName = «TEST CREACIÓN IA», cats = esas tres. No preguntes si el título es literal: ÚSALO TAL CUAL.
@@ -702,6 +703,24 @@ Cómo trabajar:
 - Si una consulta devuelve demasiado, acota con filtro/select/top. Si algo falla, explica el error de BC en palabras sencillas y propone alternativa.
 - Resume los resultados en tablas o listas cortas; no vuelques JSON en bruto.`;
   };
+  function leerPdfsChat(lista) {
+    const arr = Array.isArray(lista) ? lista : [];
+    if (arr.length > 3) return { error: "Como máximo 3 PDF por mensaje.", documentos: [] };
+    const documentos = [];
+    for (const d of arr) {
+      const nombreBruto = String(d?.nombre || "documento.pdf").slice(0, 180);
+      const nombre = nombreBruto.replace(/[^\w.\- ()áéíóúüñÁÉÍÓÚÜÑ]+/g, "_").slice(0, 120) || "documento.pdf";
+      const data = typeof d?.data === "string" ? d.data.replace(/\s/g, "") : "";
+      if ((d?.media_type || "application/pdf") !== "application/pdf") return { error: `«${nombreBruto}» no es un PDF.`, documentos: [] };
+      if (!data || data.length > 17 * 1024 * 1024) return { error: `«${nombreBruto}» pesa más de 12 MB.`, documentos: [] };
+      let cabeza = "";
+      try { cabeza = Buffer.from(data.slice(0, 80), "base64").toString("latin1"); } catch { cabeza = ""; }
+      if (!cabeza.includes("%PDF")) return { error: `«${nombreBruto}» no es un PDF válido.`, documentos: [] };
+      documentos.push({ media_type: "application/pdf", data, nombre });
+    }
+    return { documentos };
+  }
+
   app.post("/api/ia-bc/chat", async (req, res) => {
     if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: "Falta ANTHROPIC_API_KEY en backend/.env." });
     const historial = Array.isArray(req.body?.historial) ? req.body.historial : [];
@@ -710,7 +729,10 @@ Cómo trabajar:
     const imagenes = (Array.isArray(req.body?.imagenes) ? req.body.imagenes : [])
       .filter((im) => im && typeof im.data === "string" && /^image\/(png|jpeg|gif|webp)$/.test(im.media_type || ""))
       .slice(0, 10);
-    if (!mensaje && !imagenes.length) return res.status(400).json({ error: "Falta el mensaje." });
+    const pdfLeido = leerPdfsChat(req.body?.documentos);
+    if (pdfLeido.error) return res.status(400).json({ error: pdfLeido.error });
+    const documentos = pdfLeido.documentos;
+    if (!mensaje && !imagenes.length && !documentos.length) return res.status(400).json({ error: "Falta el mensaje." });
     let empresaFija = null;
     try {
       if (!req.body?.empresa) return res.status(400).json({ error: "Falta elegir la empresa (botones de abajo)." });
@@ -720,13 +742,20 @@ Cómo trabajar:
     }
     // Turnos anteriores: sin imágenes (pesan mucho; la IA ya las leyó) y con
     // los resultados de consultas recortados (la IA puede volver a consultar).
-    const sinImagenes = (m) =>
+    const sinPesados = (m) =>
       Array.isArray(m.content)
-        ? { ...m, content: m.content.map((b) => (b.type === "image" ? { type: "text", text: "[imagen enviada por Maria en este mensaje]" } : b)) }
+        ? {
+            ...m,
+            content: m.content.map((b) => {
+              if (b.type === "image") return { type: "text", text: "[imagen enviada por Maria en este mensaje]" };
+              if (b.type === "document") return { type: "text", text: `[PDF enviado por Maria${b.title ? `: ${String(b.title).slice(0, 180)}` : ""}]` };
+              return b;
+            }),
+          }
         : m;
     const previo = historial.map((m) =>
       Array.isArray(m.content)
-        ? sinImagenes({ ...m, content: m.content.map((b) => (b.type === "tool_result" && typeof b.content === "string" && b.content.length > 1500 ? { ...b, content: b.content.slice(0, 1500) + "… [recortado]" } : b)) })
+        ? sinPesados({ ...m, content: m.content.map((b) => (b.type === "tool_result" && typeof b.content === "string" && b.content.length > 1500 ? { ...b, content: b.content.slice(0, 1500) + "… [recortado]" } : b)) })
         : m
     );
     // Contexto de la pantalla desde la que se pregunta (botón flotante 🤖) — 24/09/2026
@@ -735,11 +764,21 @@ Cómo trabajar:
     const textoCtx = ctx && ctx.pantalla
       ? `[Contexto automático: Maria te escribe desde la pantalla «${String(ctx.pantalla).slice(0, 80)}» del Agente de Ventas.${bloqueApp}Esto es lo que tiene en pantalla ahora mismo (texto, puede estar recortado):\n"""\n${String(ctx.texto || "").slice(0, 9000)}\n"""\nÚsalo para entender a qué se refiere ("este pedido", "esta OT", "estos datos"…). Si pide crear tareas/eventos o abrir pantallas, USA las herramientas de la app. Si necesitas más datos de BC, consulta BC.]\n\n`
       : (bloqueApp ? `[Contexto app ACSales]\n${bloqueApp}\n` : "");
-    const contenidoUsuario = imagenes.length
-      ? [
-          ...imagenes.map((im) => ({ type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } })),
-          { type: "text", text: textoCtx + (mensaje || "Mira estas imágenes.") },
-        ]
+    const pistaAdjunto = documentos.length && imagenes.length
+      ? "Lee estos PDF y estas imágenes."
+      : documentos.length
+        ? "Lee estos PDF."
+        : "Mira estas imágenes.";
+    const bloquesAdjunto = [
+      ...documentos.map((d) => ({
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: d.data },
+      })),
+      ...imagenes.map((im) => ({ type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } })),
+    ];
+    const notaPdf = documentos.length ? `[PDF adjuntos: ${documentos.map((d) => d.nombre).join(", ")}]\n` : "";
+    const contenidoUsuario = bloquesAdjunto.length
+      ? [...bloquesAdjunto, { type: "text", text: textoCtx + notaPdf + (mensaje || pistaAdjunto) }]
       : textoCtx + mensaje;
     const msgs = [...previo, { role: "user", content: contenidoUsuario }];
     const propuestos = [];
@@ -794,7 +833,7 @@ Cómo trabajar:
       }
       const ultimo = msgs[msgs.length - 1];
       const texto = ultimo.role === "assistant" ? (ultimo.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim() : "";
-      res.json({ texto, cambios: propuestos, accionesApp, pasos, historial: msgs.map(sinImagenes) });
+      res.json({ texto, cambios: propuestos, accionesApp, pasos, historial: msgs.map(sinPesados) });
     } catch (err) {
       console.error("Error /api/ia-bc/chat:", err);
       res.status(500).json({ error: "Error hablando con la IA.", detalle: String(err.message || err) });
