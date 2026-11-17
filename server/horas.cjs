@@ -8,6 +8,7 @@
  *   GET  /api/horas/estado          → horas guardadas + tipos de trabajo + ajustes
  *   POST /api/horas/cargar          {desde, hasta} → lee BC y guarda
  *   POST /api/horas/ajustes         {tipos, jornada, festivos} → guarda la clasificación
+ *   GET  /api/horas/ausencias-app   ?desde&hasta → vacaciones/bajas/permisos ALSOAPP
  *   GET  /api/horas/servicios       → qué servicios web hay publicados (ayuda)
  *
  * Servicio web: «JobLedgerEntries» (publicado en BC), o BC_WS_MOVSPROYECTO en
@@ -188,6 +189,157 @@ module.exports = function montarHoras({ app, obtenerTokenBC, fetchConReintento, 
       await escribirJSON("horas_tarifas", tarifas);
       res.json({ tarifas });
     } catch (e) { res.status(500).json({ error: "No se pudo guardar la tabla de tarifas.", detalle: String(e.message || e) }); }
+  });
+
+  /** BC company name → código empresa ALSOAPP (0001/0002/0003). */
+  function empresaAppDesdeBC(nombreEmpresa) {
+    const n = String(nombreEmpresa || "").toLowerCase();
+    if (n.includes("ferro")) return "0002";
+    if (n.includes("quim")) return "0003";
+    return process.env.ERP_EMPRESA_DEFECTE || "0001";
+  }
+
+  const TIPUS_AUSENCIA_APP = {
+    0: "vacaciones",
+    1: "vacaciones",
+    2: "media_jornada",
+    3: "baja",
+    4: "permiso",
+  };
+  const ESTAT_AUSENCIA_APP = { 0: "pendiente", 1: "aceptada" };
+
+  function normalizarEstatVac(estat) {
+    if (estat == null || estat === "") return null;
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(estat)) return estat.length ? estat[0] : null;
+    if (typeof estat === "object" && estat.value != null) return normalizarEstatVac(estat.value);
+    const n = Number(estat);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function padCodigoTrab(c) {
+    const s = String(c ?? "").trim();
+    return /^\d+$/.test(s) ? s.padStart(4, "0") : s;
+  }
+
+  // Vacaciones / bajas / permisos desde ALSOAPP (tr_vacances + tr_vacances_dies.okBC).
+  // Solo lectura. Aceptadas y pendientes (rechazadas y regularización fuera).
+  app.get("/api/horas/ausencias-app", async (req, res) => {
+    const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.desde) ? req.query.desde : null;
+    const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query?.hasta) ? req.query.hasta : null;
+    if (!desde || !hasta) return res.status(400).json({ error: "Indica desde y hasta (AAAA-MM-DD)." });
+    if (!erpConfigurado()) {
+      return res.status(503).json({ error: "SQL del ERP (ALSOAPP) no configurado. Revisa ERP_MSSQL_* en .env y Tailscale." });
+    }
+    const empresaApp = empresaAppDesdeBC(EMPRESA_NOMBRE ? EMPRESA_NOMBRE() : "");
+    try {
+      const pool = await getPool();
+      const rSol = await pool.request()
+        .input("emp", sql.VarChar(12), empresaApp)
+        .input("desde", sql.VarChar(10), desde)
+        .input("hasta", sql.VarChar(10), hasta)
+        .query(`
+          SELECT
+            v.id,
+            LTRIM(RTRIM(CAST(v.treballador AS VARCHAR(50)))) AS treballador,
+            CAST(t.Nombre AS NVARCHAR(200)) AS nombre,
+            v.tipus,
+            v.estat,
+            v.ndies,
+            v.quantitat,
+            CONVERT(varchar(10), v.data1, 23) AS fecha_inicio,
+            CONVERT(varchar(10), v.data2, 23) AS fecha_fin
+          FROM dbo.tr_vacances v
+          LEFT JOIN dbo.Trabajadores t
+            ON LTRIM(RTRIM(CAST(t.Codigo AS VARCHAR(50))))
+             = LTRIM(RTRIM(CAST(v.treballador AS VARCHAR(50))))
+           AND LTRIM(RTRIM(CAST(t.empresa AS VARCHAR(12)))) = @emp
+          WHERE LTRIM(RTRIM(CAST(v.empresa AS VARCHAR(12)))) IN (@emp, RIGHT(@emp, 1))
+            AND v.estat IN (0, 1)
+            AND v.tipus IN (0, 1, 2, 3, 4)
+            AND CAST(v.data1 AS date) <= CONVERT(date, @hasta, 23)
+            AND CAST(v.data2 AS date) >= CONVERT(date, @desde, 23)
+          ORDER BY v.data1, v.treballador
+        `);
+
+      const solicitudes = (rSol.recordset || []).map((x) => {
+        const estatN = normalizarEstatVac(x.estat);
+        const tipusN = Number(x.tipus);
+        return {
+          id: Number(x.id),
+          recurso: padCodigoTrab(x.treballador),
+          nombre: String(x.nombre || "").trim() || null,
+          tipus: Number.isFinite(tipusN) ? tipusN : null,
+          tipo: TIPUS_AUSENCIA_APP[tipusN] || null,
+          estat: estatN,
+          estado: ESTAT_AUSENCIA_APP[estatN] || null,
+          ndies: x.ndies != null ? Number(x.ndies) : null,
+          quantitat: x.quantitat != null ? Number(x.quantitat) : null,
+          fecha_inicio: x.fecha_inicio,
+          fecha_fin: x.fecha_fin,
+        };
+      }).filter((s) => s.recurso && s.tipo && s.estado && s.fecha_inicio && s.fecha_fin);
+
+      const idsAceptadas = solicitudes.filter((s) => s.estado === "aceptada").map((s) => s.id);
+      let dies = [];
+      if (idsAceptadas.length) {
+        // lotes por si hay muchas solicitudes en el periodo
+        const lote = 400;
+        for (let i = 0; i < idsAceptadas.length; i += lote) {
+          const chunk = idsAceptadas.slice(i, i + lote);
+          const reqD = pool.request()
+            .input("desde", sql.VarChar(10), desde)
+            .input("hasta", sql.VarChar(10), hasta);
+          chunk.forEach((id, idx) => reqD.input(`id${idx}`, sql.Int, id));
+          const inList = chunk.map((_, idx) => `@id${idx}`).join(", ");
+          const rDies = await reqD.query(`
+            SELECT
+              d.id AS id_vac,
+              LTRIM(RTRIM(CAST(d.treballador AS VARCHAR(50)))) AS treballador,
+              d.tipus,
+              d.ndies,
+              d.okBC,
+              CONVERT(varchar(10), d.data1, 23) AS fecha
+            FROM dbo.tr_vacances_dies d
+            WHERE d.id IN (${inList})
+              AND d.ndies > 0
+              AND CAST(d.data1 AS date) >= CONVERT(date, @desde, 23)
+              AND CAST(d.data1 AS date) <= CONVERT(date, @hasta, 23)
+            ORDER BY d.data1, d.treballador
+          `);
+          for (const x of rDies.recordset || []) {
+            const tipusN = Number(x.tipus);
+            const okRaw = x.okBC;
+            const okBC = okRaw === true || okRaw === 1 || okRaw === "1"
+              || (typeof Buffer !== "undefined" && Buffer.isBuffer(okRaw) && okRaw[0] === 1);
+            dies.push({
+              id: Number(x.id_vac),
+              recurso: padCodigoTrab(x.treballador),
+              fecha: x.fecha,
+              tipus: Number.isFinite(tipusN) ? tipusN : null,
+              tipo: TIPUS_AUSENCIA_APP[tipusN] || null,
+              ndies: x.ndies != null ? Number(x.ndies) : 1,
+              okBC: !!okBC,
+              estado: "aceptada",
+            });
+          }
+        }
+      }
+
+      res.json({
+        desde,
+        hasta,
+        empresaApp,
+        empresaBC: EMPRESA_NOMBRE ? EMPRESA_NOMBRE() : null,
+        solicitudes,
+        dies,
+      });
+    } catch (e) {
+      console.error("Error /api/horas/ausencias-app:", e);
+      const msg = esErrorConectividadErp(e)
+        ? "No se pudo conectar al SQL de producción (¿Tailscale activo?)."
+        : "No se pudieron leer las ausencias de la app.";
+      res.status(esErrorConectividadErp(e) ? 503 : 500).json({ error: msg, detalle: String(e.message || e) });
+    }
   });
 
   // Partes con amianto (ALSOAPP.dbo.Parte, esAmiant=1) para el plus diario en Control de horas.

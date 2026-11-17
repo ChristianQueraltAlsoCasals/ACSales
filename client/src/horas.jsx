@@ -6,6 +6,9 @@
  *    sin imputar, por debajo de jornada, completa, con exceso, ausencia.
  *  · Extras y ausencias por trabajador (según el TIPO DE TRABAJO de BC y el
  *    exceso sobre la jornada teórica).
+ *  · Cruce con ALSOAPP (tr_vacances / tr_vacances_dies): vacaciones, bajas y
+ *    permisos aceptados cubren el día; pendientes se ven diferenciados;
+ *    okBC=0 marca «App OK · BC pendent».
  *  · Detalle de movimientos y clasificación de los tipos de trabajo
  *    (qué código es extra, vacaciones, baja…), jornada y festivos.
  *  · Aviso por correo al responsable del departamento (días incompletos,
@@ -20,14 +23,85 @@ import { codigoDepartamentoDesdeUnidad, listasCorreoDepartamento, aplicarRemiten
 const CATS = {
   normal: { txt: "Normal", color: "" },
   extra: { txt: "Hora extra", color: "text-purple-700" },
-  vacaciones: { txt: "Vacaciones", color: "text-sky-700" },
-  baja: { txt: "Baja", color: "text-rose-700" },
-  festivo: { txt: "Festivo", color: "text-teal-700" },
-  permiso: { txt: "Permiso / ausencia", color: "text-amber-700" },
-  noHoras: { txt: "No son horas (km, uds…)", color: "text-slate-400" },
+  vacaciones: { txt: "Vacances", color: "text-sky-700" },
+  baja: { txt: "Baixa", color: "text-rose-700" },
+  festivo: { txt: "Festiu", color: "text-teal-700" },
+  permiso: { txt: "Permís / absència", color: "text-amber-700" },
+  noHoras: { txt: "No són hores (km, uds…)", color: "text-slate-400" },
 };
 const AUSENCIAS = ["vacaciones", "baja", "festivo", "permiso"];
-const LETRA = { vacaciones: "V", baja: "B", festivo: "F", permiso: "P" };
+const LETRA = { vacaciones: "V", baja: "B", festivo: "F", permiso: "P", media_jornada: "½" };
+
+/** Tipo ALSOAPP → categoría de ausencia del cuadro (media jornada cuenta como vacances). */
+function catDesdeTipoApp(tipo) {
+  if (tipo === "baja") return "baja";
+  if (tipo === "permiso") return "permiso";
+  return "vacaciones";
+}
+
+/** Fracción de jornada cubierta por una línea de la app (mitja jornada / hores parcials). */
+function fraccionApp(tipo, ndies) {
+  if (tipo === "media_jornada") return 0.5;
+  const n = Number(ndies);
+  if (Number.isFinite(n) && n > 0 && n < 1) return n;
+  return 1;
+}
+
+/**
+ * Índice recurso→fecha→ausencia app (aceptada o pendiente).
+ * Prioridad el mismo día: aceptada gana a pendiente; si hay dies, se usa okBC.
+ */
+function indiceAusenciasApp(payload) {
+  const porRec = new Map();
+  const put = (recurso, fecha, info) => {
+    const k = normNum(recurso);
+    if (!k || !fecha) return;
+    if (!porRec.has(k)) porRec.set(k, new Map());
+    const m = porRec.get(k);
+    const prev = m.get(fecha);
+    if (prev && prev.estado === "aceptada" && info.estado !== "aceptada") return;
+    if (prev && prev.estado === info.estado && prev.okBC === true && info.okBC !== true) return;
+    m.set(fecha, info);
+  };
+
+  for (const d of payload?.dies || []) {
+    if (!d?.fecha || !d.recurso || !d.tipo) continue;
+    put(d.recurso, d.fecha, {
+      tipo: d.tipo,
+      cat: catDesdeTipoApp(d.tipo),
+      estado: "aceptada",
+      okBC: !!d.okBC,
+      fraccion: fraccionApp(d.tipo, d.ndies),
+      id: d.id,
+      origen: "dies",
+    });
+  }
+
+  for (const s of payload?.solicitudes || []) {
+    if (!s?.recurso || !s.tipo || !s.estado || !s.fecha_inicio || !s.fecha_fin) continue;
+    const diasSol = diasEntre(s.fecha_inicio, s.fecha_fin);
+    const frac = fraccionApp(s.tipo, s.ndies);
+    for (const fecha of diasSol) {
+      // Las aceptadas con detalle en dies ya están; aquí cubrimos pendientes
+      // y aceptadas sin línea diaria (fallback por rango).
+      if (s.estado === "aceptada") {
+        const k = normNum(s.recurso);
+        if (porRec.get(k)?.has(fecha)) continue;
+      }
+      put(s.recurso, fecha, {
+        tipo: s.tipo,
+        cat: catDesdeTipoApp(s.tipo),
+        estado: s.estado,
+        okBC: s.estado === "aceptada" ? false : null,
+        fraccion: frac,
+        id: s.id,
+        origen: "solicitud",
+        nombre: s.nombre || null,
+      });
+    }
+  }
+  return porRec;
+}
 
 // Clasificación por defecto según el código de tipo de trabajo
 function adivinar(cod) {
@@ -66,6 +140,8 @@ function emailsDeCampo(texto) {
 function revisarAnomalias(r, dias, hastaReal, jornadaDiaFn, incidenciasRec) {
   const sinImputar = [];
   const incompletos = [];
+  const pendientesApp = [];
+  const bcPendientes = [];
   for (const dia of dias) {
     if (dia > hastaReal) continue;
     const j = jornadaDiaFn(dia, r.recurso);
@@ -74,6 +150,9 @@ function revisarAnomalias(r, dias, hastaReal, jornadaDiaFn, incidenciasRec) {
     const trab = d ? d.trabajo : 0;
     const aus = d ? Object.values(d.aus).reduce((a, b) => a + b, 0) : 0;
     const total = trab + aus;
+    const app = d?.appAus;
+    if (app?.estado === "pendiente") pendientesApp.push({ dia, tipo: app.tipo });
+    if (app?.estado === "aceptada" && app.okBC === false && !(d?.ausBc)) bcPendientes.push({ dia, tipo: app.tipo });
     if (!d || total === 0) sinImputar.push(dia);
     else if (total < j - 0.01) incompletos.push({ dia, horas: total, jornada: j });
   }
@@ -83,7 +162,7 @@ function revisarAnomalias(r, dias, hastaReal, jornadaDiaFn, incidenciasRec) {
     const iHasta = i.hasta || i.desde;
     return i.desde && iHasta && i.desde <= hasta && iHasta >= desde;
   });
-  return { sinImputar, incompletos, incidencias };
+  return { sinImputar, incompletos, incidencias, pendientesApp, bcPendientes };
 }
 
 function escHtml(s) {
@@ -371,6 +450,7 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
   const [diaDetalle, setDiaDetalle] = useState(null); // { r, dias: [..], titulo }
   const [amianto, setAmianto] = useState(null); // { partes, precioDefecto, error? }
   const [verAmianto, setVerAmianto] = useState(false); // popup con lo que ha traído la API
+  const [ausenciasApp, setAusenciasApp] = useState(null); // { solicitudes, dies, error?, cargando? }
   const [avisoHoras, setAvisoHoras] = useState(null); // borrador del correo al responsable
   const [elegirDeptoAviso, setElegirDeptoAviso] = useState(null); // { opciones: [{nombre, n}] } si hay varios dptos
   // Paso 2: elegir trabajadores → { deptoNombre, filas, seleccionados: { [recurso]: true } }
@@ -415,8 +495,32 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     return () => { cancel = true; };
   }, [datos?.desde, datos?.hasta]);
 
+  // Vacaciones / bajas / permisos ALSOAPP (aceptadas + pendientes) del mismo periodo
+  useEffect(() => {
+    if (!datos?.desde || !datos?.hasta) return;
+    let cancel = false;
+    setAusenciasApp((a) => (a ? { ...a, cargando: true } : { solicitudes: [], dies: [], cargando: true }));
+    fetch(`/api/horas/ausencias-app?desde=${encodeURIComponent(datos.desde)}&hasta=${encodeURIComponent(datos.hasta)}`)
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
+        if (!cancel) {
+          setAusenciasApp({
+            solicitudes: j.solicitudes || [],
+            dies: j.dies || [],
+            empresaApp: j.empresaApp || null,
+          });
+        }
+      })
+      .catch((e) => {
+        if (!cancel) setAusenciasApp({ solicitudes: [], dies: [], error: String(e.message || e) });
+      });
+    return () => { cancel = true; };
+  }, [datos?.desde, datos?.hasta]);
+
   const amiantoMap = useMemo(() => agruparAmiantoPorDia(amianto?.partes), [amianto]);
   const diasAmiantoDe = (recurso) => amiantoMap.get(normNum(recurso))?.dias?.length || 0;
+  const mapaAusApp = useMemo(() => indiceAusenciasApp(ausenciasApp), [ausenciasApp]);
 
   async function cargar() {
     setCargando(true); setError(null);
@@ -479,6 +583,7 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     const dias = diasEntre(datos.desde, datos.hasta);
     const hastaReal = datos.hasta > hoyISO() ? hoyISO() : datos.hasta; // no marcar como «sin imputar» los días futuros
     const porRec = {};
+    const claveRec = {}; // normNum → código recurso canónico (el de BC si existe)
     let noHoras = 0;
     for (const f0 of datos.filas) {
       if (soloPersonas && /machin|m[aá]quina/i.test(datos.tipoRecurso?.[f0.recurso] || "")) continue;
@@ -488,15 +593,80 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
       const cat = catDe(f);
       if (cat === "noHoras") { noHoras++; continue; }
       const r = (porRec[f.recurso] ||= { recurso: f.recurso, nombre: datos.nombres?.[f.recurso] || f.recurso, dias: {}, movs: [] });
-      const d = (r.dias[f.fecha] ||= { trabajo: 0, extra: 0, aus: {}, total: 0 });
+      claveRec[normNum(f.recurso)] = f.recurso;
+      const d = (r.dias[f.fecha] ||= { trabajo: 0, extra: 0, aus: {}, ausBc: false, total: 0, appAus: null });
       if (cat === "normal") d.trabajo += f.horas;
       else if (cat === "extra") { d.trabajo += f.horas; d.extra += f.horas; }
-      else d.aus[cat] = (d.aus[cat] || 0) + f.horas;
+      else {
+        d.aus[cat] = (d.aus[cat] || 0) + f.horas;
+        d.ausBc = true;
+      }
       d.total += f.horas;
       r.movs.push({ ...f, cat });
     }
+
+    // Cruce ALSOAPP: aceptadas cubren jornada; pendientes solo se anotan.
+    // También crea filas de trabajadores que solo tienen ausencia en app (sin movs BC).
+    for (const [kRec, porDia] of mapaAusApp.entries()) {
+      let recurso = claveRec[kRec];
+      let r = recurso ? porRec[recurso] : null;
+      if (!r) {
+        // Buscar nombre en solicitudes o en ficha BC
+        let nombre = null;
+        let codApp = kRec;
+        for (const s of ausenciasApp?.solicitudes || []) {
+          if (normNum(s.recurso) === kRec) {
+            nombre = s.nombre;
+            codApp = s.recurso;
+            break;
+          }
+        }
+        const hitBc = Object.keys(datos.nombres || {}).find((c) => normNum(c) === kRec);
+        recurso = hitBc || codApp;
+        if (soloPersonas && hitBc && /machin|m[aá]quina/i.test(datos.tipoRecurso?.[hitBc] || "")) continue;
+        r = porRec[recurso] ||= {
+          recurso,
+          nombre: (hitBc && datos.nombres?.[hitBc]) || nombre || recurso,
+          dias: {},
+          movs: [],
+        };
+        claveRec[kRec] = recurso;
+      }
+      for (const [fecha, app] of porDia.entries()) {
+        if (fecha < datos.desde || fecha > datos.hasta) continue;
+        const j = jornadaDia(fecha, r.recurso);
+        if (!(j > 0) && app.estado !== "aceptada") continue;
+        const d = (r.dias[fecha] ||= { trabajo: 0, extra: 0, aus: {}, ausBc: false, total: 0, appAus: null });
+        d.appAus = app;
+        if (app.estado === "aceptada") {
+          const horasApp = Math.round(j * (app.fraccion || 1) * 100) / 100;
+          const yaCubierto = Object.values(d.aus).reduce((a, b) => a + b, 0);
+          const falta = Math.max(0, horasApp - yaCubierto);
+          if (falta > 0.01) {
+            d.aus[app.cat] = (d.aus[app.cat] || 0) + falta;
+            d.total += falta;
+            r.movs.push({
+              fecha,
+              recurso: r.recurso,
+              tipoTrabajo: `APP:${app.tipo}`,
+              unidad: "h",
+              horas: falta,
+              cat: app.cat,
+              origenApp: true,
+              estadoApp: app.estado,
+              okBC: app.okBC,
+            });
+          }
+        }
+      }
+    }
+
     const lista = Object.values(porRec).map((r) => {
-      const t = { trabajadas: 0, extras: 0, exceso: 0, ausencias: 0, teoricas: 0, sinImputar: 0, faltan: 0, porAus: {} };
+      const t = {
+        trabajadas: 0, extras: 0, exceso: 0, ausencias: 0, teoricas: 0,
+        sinImputar: 0, faltan: 0, porAus: {},
+        appPendientes: 0, appBcPendientes: 0,
+      };
       for (const dia of dias) {
         const j = jornadaDia(dia, r.recurso);
         const d = r.dias[dia];
@@ -507,6 +677,8 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
         t.extras += d ? d.extra : 0;
         t.ausencias += aus;
         if (d) for (const [c, v] of Object.entries(d.aus)) t.porAus[c] = (t.porAus[c] || 0) + v;
+        if (d?.appAus?.estado === "pendiente" && dia <= hastaReal && j > 0) t.appPendientes++;
+        if (d?.appAus?.estado === "aceptada" && d.appAus.okBC === false && !d.ausBc && dia <= hastaReal && j > 0) t.appBcPendientes++;
         const normales = trab - (d ? d.extra : 0);
         if (j > 0) {
           if (normales > j) t.exceso += normales - j; // horas por encima de la jornada no marcadas como extra
@@ -518,7 +690,13 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
       }
       t.diferencia = t.trabajadas + t.ausencias - t.teoricas;
       const codigos = [...new Set(r.movs.map((m) => m.tipoTrabajo).filter(Boolean))].sort();
-      return { ...r, codigos, t, incidencias: t.sinImputar > 0 || t.faltan > 0.01 || t.exceso > 0.01 || t.extras > 0 };
+      return {
+        ...r,
+        codigos,
+        t,
+        incidencias: t.sinImputar > 0 || t.faltan > 0.01 || t.exceso > 0.01 || t.extras > 0
+          || t.appPendientes > 0 || t.appBcPendientes > 0,
+      };
     }).sort((a, b) => a.nombre.localeCompare(b.nombre));
     const tipos = {};
     for (const f of datos.filas) {
@@ -527,7 +705,7 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
       tipos[k].horas += f.horas; tipos[k].movs++; tipos[k].unidades.add(f.unidad || "—");
     }
     return { dias, lista, noHoras, tipos: Object.values(tipos).sort((a, b) => b.horas - a.horas), hastaReal };
-  }, [datos, ajustes, soloPersonas]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [datos, ajustes, soloPersonas, mapaAusApp, ausenciasApp]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Departamento = grupo de recurso de la tabla Recursos (misma lectura que mano de obra).
   const ficha = useMemo(() => indiceRecursos(recursos), [recursos]);
@@ -644,25 +822,61 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     const diasCol = porSemanas ? calc.dias.filter((d) => lunesDe(d) === col) : [col];
     let trab = 0, aus = 0, j = 0;
     let futuro = true;
+    let appPend = null;
+    let appAcept = null;
+    let appBcPend = false;
     for (const d of diasCol) {
       const x = r.dias[d];
       if (d <= calc.hastaReal) { j += jornadaDia(d, r.recurso); futuro = false; }
-      if (x) { trab += x.trabajo; aus += Object.values(x.aus).reduce((a, b) => a + b, 0); }
+      if (x) {
+        trab += x.trabajo;
+        aus += Object.values(x.aus).reduce((a, b) => a + b, 0);
+        if (x.appAus?.estado === "pendiente") appPend = x.appAus;
+        if (x.appAus?.estado === "aceptada") {
+          appAcept = x.appAus;
+          if (x.appAus.okBC === false && !x.ausBc) appBcPend = true;
+        }
+      }
     }
     const total = trab + aus;
+    const letra = LETRA[(appAcept || appPend)?.tipo] || LETRA[(appAcept || appPend)?.cat] || "";
     let cls;
-    if (total > 0) {
+    let contenido = total ? h(total) : "";
+    if (appPend && !appAcept && total === 0 && !futuro && j > 0) {
+      // Solicitud pendiente en app: se ve, pero no cubre la falta
+      cls = "bg-orange-100 text-orange-800 font-semibold ring-1 ring-inset ring-orange-300";
+      contenido = letra ? `${letra}?` : "?";
+    } else if (appAcept && appBcPend && trab === 0) {
+      // Aceptada en app, aún no en BC
+      cls = "bg-sky-200 text-sky-900 font-bold ring-1 ring-inset ring-sky-400";
+      contenido = letra || h(total) || "A";
+    } else if (total > 0) {
       if (j === 0) cls = "bg-violet-500 text-white font-bold";          // trabajo en fin de semana / festivo
       else if (total < j - 0.01) cls = "bg-amber-400 text-white font-bold"; // faltan horas
+      else if (aus > 0 && trab === 0) cls = "bg-sky-500 text-white font-bold"; // solo ausencia
       else cls = "bg-emerald-500 text-white font-bold";                 // jornada completa (o más)
+      if (letra && aus > 0 && trab === 0) contenido = `${letra} ${h(total)}`;
     } else if (!futuro && j > 0) cls = "bg-red-100";                      // laborable sin imputar
     else cls = "bg-[#dce6f2]";                                            // fin de semana / festivo / futuro
-    const abrir = () => total && setDiaDetalle({ r, dias: diasCol, titulo: porSemanas ? `semana del ${fmtF(diasCol[0])}` : fmtF(col) });
+
+    const tips = [
+      porSemanas ? `Setmana del ${fmtF(col)}` : fmtF(col),
+      `${h(total) || 0} h imputades · jornada ${h(j) || 0} h`,
+    ];
+    if (appPend) tips.push(`App pendent: ${CATS[appPend.cat]?.txt || appPend.tipo}`);
+    if (appAcept) {
+      tips.push(`App acceptada: ${CATS[appAcept.cat]?.txt || appAcept.tipo}`);
+      if (appBcPend) tips.push("App OK · BC pendent d'importar");
+      else if (appAcept.okBC) tips.push("Ja processat a BC (okBC)");
+    }
+    const abrir = () => (total || appPend || appAcept) && setDiaDetalle({
+      r, dias: diasCol, titulo: porSemanas ? `setmana del ${fmtF(diasCol[0])}` : fmtF(col),
+    });
     return (
       <td key={col} onClick={abrir}
-        className={`min-w-[58px] px-1 py-2 text-center text-[13px] border border-white ${total ? "cursor-pointer hover:brightness-110" : ""} ${cls}`}
-        title={`${porSemanas ? `Semana del ${fmtF(col)}` : fmtF(col)} · ${h(total) || 0} h imputadas · jornada ${h(j) || 0} h`}>
-        {total ? h(total) : ""}
+        className={`min-w-[58px] px-1 py-2 text-center text-[13px] border border-white ${(total || appPend || appAcept) ? "cursor-pointer hover:brightness-110" : ""} ${cls}`}
+        title={tips.join(" · ")}>
+        {contenido}
       </td>
     );
   }
@@ -681,9 +895,9 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
   const input = "border rounded px-2 py-1 text-sm";
   return (
     <div className="w-full">
-      <h1 className="text-2xl font-bold text-slate-800">⏱️ Control de horas</h1>
+      <h1 className="text-2xl font-bold text-slate-800">⏱️ Control de hores</h1>
       <p className="text-slate-500 text-sm mt-1 max-w-3xl">
-        Horas de los trabajadores desde los <b>Movs. proyecto</b> de Business Central{datos?.empresa ? ` (${datos.empresa})` : ""}: lo imputado cada día comparado con la jornada, horas extra y ausencias según el tipo de trabajo.
+        Hores des dels <b>Movs. projecte</b> de Business Central{datos?.empresa ? ` (${datos.empresa})` : ""} creuades amb vacances, baixes i permisos de l’app (ALSOAPP): les acceptades cobreixen el dia; les pendents es veuen diferenciades.
       </p>
 
       <div className="flex flex-wrap items-end gap-3 mt-4">
@@ -692,12 +906,23 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
         <button onClick={cargar} disabled={cargando} className="px-4 py-2 rounded bg-blue-700 text-white text-sm disabled:opacity-50">{cargando ? "Cargando de BC…" : "↻ Cargar desde BC"}</button>
         {datos && (
           <span className="text-xs text-slate-400">
-            Cargado {new Date(datos.cargado).toLocaleString("es-ES")} · {fmtF(datos.desde)}–{fmtF(datos.hasta)} · {datos.filas.length.toLocaleString("es-ES")} movimientos de recursos · servicio «{datos.servicio}»
-            {!datos.servicioRecursos && " · (sin ficha de recursos: nombres desde la descripción)"}
+            Carregat {new Date(datos.cargado).toLocaleString("es-ES")} · {fmtF(datos.desde)}–{fmtF(datos.hasta)} · {datos.filas.length.toLocaleString("es-ES")} moviments · servei «{datos.servicio}»
+            {!datos.servicioRecursos && " · (sense fitxa de recursos: noms des de la descripció)"}
+          </span>
+        )}
+        {ausenciasApp?.cargando && <span className="text-xs text-slate-400">Carregant absències app…</span>}
+        {ausenciasApp && !ausenciasApp.cargando && !ausenciasApp.error && (
+          <span className="text-xs text-slate-500">
+            App: {(ausenciasApp.solicitudes || []).length} sol·licituds · {(ausenciasApp.dies || []).length} dies detall
           </span>
         )}
       </div>
       {datos?.aviso && <p className="mt-2 text-xs text-amber-700">{datos.aviso}</p>}
+      {ausenciasApp?.error && (
+        <p className="mt-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+          Absències app: {ausenciasApp.error}
+        </p>
+      )}
       {error && (
         <div className="mt-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3">
           <div className="font-medium">{error.error}</div>
@@ -775,7 +1000,16 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
           {pestana === "cuadro" && (
             <>
               <div className="flex flex-wrap gap-3 mt-2 text-[11px] text-slate-600">
-                {[["bg-emerald-500", "Jornada completa"], ["bg-amber-400", "Faltan horas"], ["bg-red-100", "Sin imputar"], ["bg-violet-500", "Fin de semana / festivo trabajado"], ["bg-[#dce6f2]", "Fin de semana / festivo"]].map(([c, t]) => (
+                {[
+                  ["bg-emerald-500", "Jornada completa"],
+                  ["bg-sky-500", "Absència (BC o app acceptada)"],
+                  ["bg-sky-200 ring-1 ring-sky-400", "App OK · BC pendent"],
+                  ["bg-orange-100 ring-1 ring-orange-300", "App pendent (?)"],
+                  ["bg-amber-400", "Falten hores"],
+                  ["bg-red-100", "Sense imputar"],
+                  ["bg-violet-500", "Cap de setmana / festiu treballat"],
+                  ["bg-[#dce6f2]", "Cap de setmana / festiu"],
+                ].map(([c, t]) => (
                   <span key={t} className="flex items-center gap-1"><span className={`inline-block w-3 h-3 rounded-sm ${c}`} />{t}</span>
                 ))}
               </div>
@@ -834,33 +1068,68 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
               {diaDetalle && (() => {
                 const movs = diaDetalle.r.movs.filter((m) => diaDetalle.dias.includes(m.fecha)).sort((a, b) => (a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0));
                 const varios = diaDetalle.dias.length > 1;
+                const appsDia = diaDetalle.dias
+                  .map((d) => ({ fecha: d, app: diaDetalle.r.dias[d]?.appAus }))
+                  .filter((x) => x.app);
                 return (
                   <div className="fixed inset-0 z-40 bg-black/30 flex items-center justify-center p-4" onClick={() => setDiaDetalle(null)}>
                     <div className="bg-white rounded-xl shadow-2xl p-6 max-w-3xl w-full max-h-[80vh] overflow-y-auto relative" onClick={(e) => e.stopPropagation()}>
                       <button onClick={() => setDiaDetalle(null)} className="absolute top-3 right-4 text-slate-400 hover:text-slate-600 text-lg">✕</button>
                       <h2 className="text-lg font-bold text-slate-800 pr-6">{diaDetalle.r.nombre}{deptoDe(diaDetalle.r.recurso) ? ` · ${deptoDe(diaDetalle.r.recurso)}` : ""} — {diaDetalle.titulo}</h2>
+                      {appsDia.length > 0 && (
+                        <div className="mt-3 space-y-1">
+                          {appsDia.map(({ fecha, app }) => (
+                            <div key={`${fecha}-${app.id}-${app.estado}`} className={`text-xs rounded px-2 py-1.5 border ${
+                              app.estado === "pendiente"
+                                ? "bg-orange-50 border-orange-200 text-orange-900"
+                                : app.okBC === false
+                                  ? "bg-sky-50 border-sky-300 text-sky-900"
+                                  : "bg-sky-50 border-sky-200 text-sky-800"
+                            }`}>
+                              <b>{CATS[app.cat]?.txt || app.tipo}</b>
+                              {varios ? ` · ${fmtF(fecha)}` : ""}
+                              {" · "}
+                              {app.estado === "pendiente" ? "Pendent a l’app" : "Acceptada a l’app"}
+                              {app.estado === "aceptada" && (
+                                app.okBC === false ? " · App OK · BC pendent d’importar" : app.okBC ? " · Ja a BC (okBC)" : ""
+                              )}
+                              {app.fraccion < 1 ? ` · ${(app.fraccion * 100).toFixed(0)}% jornada` : ""}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       <table className="w-full text-sm mt-4 border">
                         <thead>
                           <tr className="bg-slate-50 text-slate-600">
-                            {varios && <th className="px-3 py-1.5 border text-left">Fecha</th>}
-                            <th className="px-3 py-1.5 border text-left">Tipo de hora</th>
-                            <th className="px-3 py-1.5 border text-right">Horas</th>
-                            <th className="px-3 py-1.5 border text-left">Nº Parte</th>
-                            <th className="px-3 py-1.5 border text-left">Nº OT</th>
-                            <th className="px-3 py-1.5 border text-left">Cliente</th>
+                            {varios && <th className="px-3 py-1.5 border text-left">Data</th>}
+                            <th className="px-3 py-1.5 border text-left">Tipus d’hora</th>
+                            <th className="px-3 py-1.5 border text-right">Hores</th>
+                            <th className="px-3 py-1.5 border text-left">Núm. part</th>
+                            <th className="px-3 py-1.5 border text-left">Núm. OT</th>
+                            <th className="px-3 py-1.5 border text-left">Client</th>
                           </tr>
                         </thead>
                         <tbody>
                           {movs.map((m, k) => (
-                            <tr key={k}>
+                            <tr key={k} className={m.origenApp ? "bg-sky-50/60" : ""}>
                               {varios && <td className="px-3 py-1 border whitespace-nowrap">{fmtF(m.fecha)}</td>}
-                              <td className="px-3 py-1 border font-mono text-xs">{m.tipoTrabajo || "—"}</td>
+                              <td className="px-3 py-1 border font-mono text-xs">
+                                {m.tipoTrabajo || "—"}
+                                {m.origenApp && (
+                                  <span className="ml-1 text-[10px] text-sky-700">
+                                    {m.estadoApp === "pendiente" ? "(app pendent)" : m.okBC === false ? "(app · BC pendent)" : "(app)"}
+                                  </span>
+                                )}
+                              </td>
                               <td className="px-3 py-1 border text-right">{h(m.horas)}{m.cantidadOriginal != null ? <div className="text-[10px] text-slate-400">{h(m.cantidadOriginal)} {m.unidad}</div> : null}</td>
-                              <td className="px-3 py-1 border">{m.doc}</td>
-                              <td className="px-3 py-1 border">{m.ot}</td>
+                              <td className="px-3 py-1 border">{m.doc || (m.origenApp ? "—" : "")}</td>
+                              <td className="px-3 py-1 border">{m.ot || ""}</td>
                               <td className="px-3 py-1 border">{datos.clientes?.[m.ot] || ""}</td>
                             </tr>
                           ))}
+                          {!movs.length && (
+                            <tr><td className="px-3 py-2 border text-slate-500" colSpan={varios ? 6 : 5}>Sense moviments BC aquest dia.</td></tr>
+                          )}
                           <tr className="bg-slate-50 font-semibold">
                             <td className="px-3 py-1.5 border" colSpan={varios ? 2 : 1}>Total</td>
                             <td className="px-3 py-1.5 border text-right">{h(movs.reduce((t, m) => t + m.horas, 0))}</td>
@@ -872,7 +1141,7 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
                   </div>
                 );
               })()}
-              <p className="text-xs text-slate-400 mt-2">Solo movimientos de tipo «Uso». Pulsa ▼ para plegar o desplegar las líneas de un trabajador y pulsa un día para ver su detalle (parte, OT y cliente). Debajo del nombre: Nº de recurso y códigos de tipo de trabajo del periodo. Los festivos (generales y de la población) y las incidencias de «Configuración» se tienen en cuenta. Pulsa un trabajador para ver sus movimientos.</p>
+              <p className="text-xs text-slate-400 mt-2">Només moviments de tipus «Ús». Les absències acceptades de l’app cobreixen el dia; les pendents es marquen amb «?». «App OK · BC pendent» = acceptada a l’app però encara no importada a BC.</p>
             </>
           )}
 
@@ -886,13 +1155,15 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
                     <th className="px-3 py-2 text-right">Extras declaradas</th>
                     <th className="px-3 py-2 text-right">Exceso sobre jornada</th>
                     {AUSENCIAS.map((a) => <th key={a} className="px-3 py-2 text-right">{CATS[a].txt}</th>)}
-                    <th className="px-3 py-2 text-right">Faltan (días incompletos)</th>
-                    <th className="px-3 py-2 text-right">Días sin imputar</th>
-                    <th className="px-3 py-2 text-right" title="Días distintos con parte esAmiant=1 (app)">Días amianto</th>
+                    <th className="px-3 py-2 text-right">Falten (dies incomplets)</th>
+                    <th className="px-3 py-2 text-right">Dies sense imputar</th>
+                    <th className="px-3 py-2 text-right" title="Sol·licituds pendents a l’app">App pendent</th>
+                    <th className="px-3 py-2 text-right" title="Acceptades a l’app encara no a BC">App·BC pendent</th>
+                    <th className="px-3 py-2 text-right" title="Dies distints amb part esAmiant=1 (app)">Dies amianto</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {visibles.filter((r) => r.t.extras || r.t.exceso || r.t.ausencias || r.t.faltan || r.t.sinImputar || diasAmiantoDe(r.recurso)).map((r) => (
+                  {visibles.filter((r) => r.t.extras || r.t.exceso || r.t.ausencias || r.t.faltan || r.t.sinImputar || r.t.appPendientes || r.t.appBcPendientes || diasAmiantoDe(r.recurso)).map((r) => (
                     <tr key={r.recurso} className="border-t border-slate-100">
                       <td className="px-3 py-1.5">
                         <button onClick={() => { setSel(r.recurso); setPestana("detalle"); }} className="hover:underline font-medium text-slate-700">{r.nombre}</button>
@@ -903,6 +1174,8 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
                       {AUSENCIAS.map((a) => <td key={a} className={`px-3 text-right ${CATS[a].color}`}>{h(r.t.porAus[a])}</td>)}
                       <td className="px-3 text-right text-amber-700">{h(r.t.faltan)}</td>
                       <td className="px-3 text-right text-red-600">{r.t.sinImputar || ""}</td>
+                      <td className="px-3 text-right text-orange-700">{r.t.appPendientes || ""}</td>
+                      <td className="px-3 text-right text-sky-800">{r.t.appBcPendientes || ""}</td>
                       <td className="px-3 text-right font-medium text-amber-800">{diasAmiantoDe(r.recurso) || ""}</td>
                     </tr>
                   ))}
@@ -915,6 +1188,8 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
                     {AUSENCIAS.map((a) => <td key={a} className="px-3 text-right">{h(visibles.reduce((t, r) => t + (r.t.porAus[a] || 0), 0))}</td>)}
                     <td className="px-3 text-right">{h(visibles.reduce((t, r) => t + r.t.faltan, 0))}</td>
                     <td className="px-3 text-right">{visibles.reduce((t, r) => t + r.t.sinImputar, 0) || ""}</td>
+                    <td className="px-3 text-right">{visibles.reduce((t, r) => t + (r.t.appPendientes || 0), 0) || ""}</td>
+                    <td className="px-3 text-right">{visibles.reduce((t, r) => t + (r.t.appBcPendientes || 0), 0) || ""}</td>
                     <td className="px-3 text-right">{visibles.reduce((t, r) => t + diasAmiantoDe(r.recurso), 0) || ""}</td>
                   </tr>
                 </tfoot>
@@ -936,7 +1211,8 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
                 return (
                   <section className="mt-3 bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
                     <div className="px-3 py-2 text-sm text-slate-600 border-b bg-slate-50">
-                      <b>{r.nombre}</b>{deptoDe(r.recurso) ? ` · ${deptoDe(r.recurso)}` : ""} · trabajadas {h(r.t.trabajadas) || 0} h de {h(r.t.teoricas) || 0} teóricas · extras {h(r.t.extras) || 0} · exceso {h(r.t.exceso) || 0} · ausencias {h(r.t.ausencias) || 0} · {r.t.sinImputar} días sin imputar
+                      <b>{r.nombre}</b>{deptoDe(r.recurso) ? ` · ${deptoDe(r.recurso)}` : ""} · treballades {h(r.t.trabajadas) || 0} h de {h(r.t.teoricas) || 0} teòriques · extres {h(r.t.extras) || 0} · excés {h(r.t.exceso) || 0} · absències {h(r.t.ausencias) || 0} · {r.t.sinImputar} dies sense imputar
+                      {(r.t.appPendientes || r.t.appBcPendientes) ? ` · app pendent ${r.t.appPendientes || 0} · app·BC pendent ${r.t.appBcPendientes || 0}` : ""}
                     </div>
                     <table className="w-full text-sm">
                       <thead><tr className="text-left text-xs text-slate-500"><th className="px-3 py-1.5">Fecha</th><th className="px-3">OT</th><th className="px-3">Tarea</th><th className="px-3">Tipo trabajo</th><th className="px-3">Clasificación</th><th className="px-3 text-right">Horas</th><th className="px-3">Descripción</th><th className="px-3">Documento</th></tr></thead>
