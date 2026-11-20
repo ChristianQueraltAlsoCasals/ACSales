@@ -3,12 +3,15 @@
  * El servidor las propone; el navegador las ejecuta (localStorage / UI).
  */
 import { cargarTareas, guardarTareas } from "./tareas.jsx";
+import { resumenComercialParaIA } from "./comercial.jsx";
+import { esEmpresaQuimlab } from "./empresa.jsx";
 
 export const LS_EVENTOS = "agente_ventas_calendario_v1";
 export const EVT_TAREAS = "acsales-tareas-cambio";
 export const EVT_EVENTOS = "acsales-eventos-cambio";
 
 export const SECCIONES_APP = [
+  { id: "panel", nombre: "Panel inicial" },
   { id: "cargar", nombre: "Cargar datos" },
   { id: "memoria", nombre: "Memoria histórica" },
   { id: "explorador", nombre: "Explorador de OTs" },
@@ -17,6 +20,7 @@ export const SECCIONES_APP = [
   { id: "precios", nombre: "Precios de artículos" },
   { id: "pedidosventa", nombre: "Pedidos de venta" },
   { id: "facturasventa", nombre: "Facturas de venta" },
+  { id: "comercial", nombre: "Comercial" },
   { id: "analisiscliente", nombre: "Anàlisi per client" },
   { id: "simuladortarifas", nombre: "Simulador tarifas 2027" },
   { id: "correo", nombre: "Correo" },
@@ -25,6 +29,7 @@ export const SECCIONES_APP = [
   { id: "ia", nombre: "Asistente IA" },
   { id: "ratios", nombre: "Ratios financieros" },
   { id: "horas", nombre: "Control de horas" },
+  { id: "ropa", nombre: "Ropa" },
 ];
 
 export const cargarEventos = () => {
@@ -74,6 +79,7 @@ export function snapshotAppParaIA() {
     lineasT,
     `Eventos de calendario próximos (${eventos.length}):`,
     lineasE,
+    resumenComercialParaIA(),
   ].join("\n");
 }
 
@@ -148,6 +154,7 @@ export function aplicarAccionesApp(acciones, { abrirSeccion } = {}) {
         const id = String(a.pantalla || a.seccion || "").trim();
         const ok = SECCIONES_APP.some((s) => s.id === id);
         if (!ok) throw new Error(`Pantalla desconocida: ${id}`);
+        if (id === "comercial" && !esEmpresaQuimlab()) throw new Error("Comercial solo está en la empresa Quimlab.");
         if (typeof abrirSeccion === "function") abrirSeccion(id);
         aplicadas.push({ tipo, ok: true, pantalla: id });
         const nom = SECCIONES_APP.find((s) => s.id === id)?.nombre || id;

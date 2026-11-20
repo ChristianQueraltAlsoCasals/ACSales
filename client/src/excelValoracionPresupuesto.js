@@ -304,14 +304,16 @@ function hojaConjunta(ws, { ot, sub, horas, compras, primera, ultima }) {
     const cant = Number(c.cantidad) || 0;
     const row = ws.getRow(r);
     row.height = 18;
+    // Los gastos manuals (degradación, imprevistos…) van como COMPRA
+    // para que el resumen (SUMIF) y los totales los sumen igual.
     const vals = [
       "COMPRA",
       ot,
-      c.documento || "",
+      c.documento || (c.manual ? "GASTO MANUAL" : ""),
       fechaTxt(c.fecha),
       "",
       c.numero || "",
-      c.proveedor || "",
+      c.proveedor || (c.manual ? "Manual ACSales" : ""),
       c.descripcion || "",
       cant,
       "",
@@ -320,7 +322,7 @@ function hojaConjunta(ws, { ot, sub, horas, compras, primera, ultima }) {
       Number(c.importe) || 0,
       null,
       null,
-      "Pendiente de revisar",
+      c.manual ? "Gasto manual" : "Pendiente de revisar",
       "",
       "",
     ];

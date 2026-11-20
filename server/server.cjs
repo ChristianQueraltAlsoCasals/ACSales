@@ -63,6 +63,11 @@ function guardarVistaPdfRecepcion(bytes) {
   vistasPdfRecepcion.set(id, { bytes: Buffer.from(bytes), expira: ahora + 2 * 60 * 60 * 1000 });
   return id;
 }
+function leerVistaPdfRecepcion(id) {
+  const v = vistasPdfRecepcion.get(String(id || ""));
+  if (!v || v.expira < Date.now()) return null;
+  return v.bytes;
+}
 
 const app = express();
 app.use(express.json({ limit: "500mb" })); // fichas + líneas con TODAS las columnas: el estado puede ser grande
@@ -77,7 +82,10 @@ const PORT = process.env.PORT || 3000;
 
 // Auth ERP + ACconstelation (mismo patrón que achuman / aclogistics)
 const { router: authRouter, requiereSesion } = require("./auth");
+const { prepararRecepcionAlbaran, crearPedidoPreparado } = require("./recepcionPreparar.cjs");
+const acfactory = require("./acfactory-client.cjs");
 const { soloControlHoras } = require("./permisos");
+const { prepararLogoCorreo } = require("./logoCliente.cjs");
 app.use("/api/auth", authRouter);
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
@@ -102,6 +110,7 @@ app.use("/api", (req, res, next) => {
 // versión — mezclarlos produce UND_ERR_INVALID_ARG.
 // ---------------------------------------------------------------------
 let fetchLento = fetch; // respaldo: fetch global con tiempos por defecto
+let fetchParteAlso = fetch;
 try {
   const undici = require("undici");
   const dispatcherLento = new undici.Agent({
@@ -110,6 +119,15 @@ try {
     bodyTimeout: 500_000,     // 500 s para el cuerpo completo
   });
   fetchLento = (url, opciones = {}) => undici.fetch(url, { ...opciones, dispatcher: dispatcherLento });
+  // app.alsocasals.com firma el parte con un certificado que el contenedor
+  // no tiene en su almacén. Solo esta URL se descarga sin comprobar la cadena.
+  const dispatcherParte = new undici.Agent({
+    connect: { rejectUnauthorized: false },
+    connectTimeout: 20_000,
+    headersTimeout: 60_000,
+    bodyTimeout: 60_000,
+  });
+  fetchParteAlso = (url, opciones = {}) => undici.fetch(url, { ...opciones, dispatcher: dispatcherParte });
 } catch {
   /* undici no instalado: se usan los tiempos por defecto de Node */
 }
@@ -310,9 +328,19 @@ app.delete("/api/estado", async (req, res) => {
 // ---------------------------------------------------------------------
 // 0a-bis) RECEPCIÓN — marcas compartidas (revisados, fechas, reclamados…)
 // ---------------------------------------------------------------------
-//   { revisados, fechas, reclamados, emailsProveedor, notas, registrados }
+//   { revisados, fechas, reclamados, emailsProveedor, notas, registrados,
+//     firmasAprendidas, recogedores }
 // ---------------------------------------------------------------------
-const RECEP_DEFAULT = { revisados: {}, fechas: {}, reclamados: {}, emailsProveedor: {}, notas: {}, registrados: {} };
+const RECEP_DEFAULT = {
+  revisados: {},
+  fechas: {},
+  reclamados: {},
+  emailsProveedor: {},
+  notas: {},
+  registrados: {},
+  firmasAprendidas: {},
+  recogedores: {},
+};
 const leerRecep = async () => db.getDoc(claveEmpresa("recepcion"), { ...RECEP_DEFAULT });
 const escribirRecep = async (d) => db.setDoc(claveEmpresa("recepcion"), d);
 
@@ -325,11 +353,74 @@ app.get("/api/recepcion", async (req, res) => {
   }
 });
 
+// Ficha de proveedores de BC (API v2.0 /vendors, solo LECTURA).
+// Cache corta por empresa: Validación de facturas lo usa para el desplegable
+// (nombre + CIF), no solo los que tienen pedido de compra cargado.
+const cacheProveedoresBc = new Map(); // empresaId → { ts, proveedores }
+const TTL_PROVEEDORES_BC_MS = 15 * 60 * 1000;
+
+function normalizarCifProveedor(s) {
+  return String(s || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .replace(/^ES/, "");
+}
+
+async function listarProveedoresBc() {
+  const empresa = EMPRESA_ID();
+  const cached = cacheProveedoresBc.get(empresa);
+  if (cached && Date.now() - cached.ts < TTL_PROVEEDORES_BC_MS) return cached.proveedores;
+
+  const token = await obtenerTokenBC();
+  const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${empresa})/vendors`;
+  // Sin $top: si se pone, BC no devuelve @odata.nextLink y se cortan
+  // cientos de proveedores (p. ej. solo salía 1 Saltoki de 7).
+  const headers = { Authorization: `Bearer ${token}`, Prefer: "odata.maxpagesize=200" };
+  let url = `${base}?$select=number,displayName,email,taxRegistrationNumber,blocked`;
+  const out = [];
+  let guard = 0;
+  while (url && guard < 80) {
+    guard += 1;
+    const r = await fetchConReintento(url, { headers });
+    if (!r.ok) {
+      const detalle = (await r.text().catch(() => "")).slice(0, 300);
+      throw new Error(`BC respondió ${r.status} al listar proveedores. ${detalle}`);
+    }
+    const j = await r.json();
+    for (const v of j.value || []) {
+      // Solo excluimos bloqueo total; "Payment" sigue siendo útil para facturas.
+      if (String(v.blocked || "").toUpperCase() === "ALL") continue;
+      const nombre = String(v.displayName || "").trim();
+      if (!nombre) continue;
+      out.push({
+        numero: String(v.number || "").trim(),
+        nombre,
+        cif: String(v.taxRegistrationNumber || "").trim(),
+        email: String(v.email || "").trim(),
+      });
+    }
+    url = j["@odata.nextLink"] || null;
+  }
+  out.sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+  cacheProveedoresBc.set(empresa, { ts: Date.now(), proveedores: out });
+  return out;
+}
+
+app.get("/api/bc/proveedores", async (req, res) => {
+  try {
+    const proveedores = await listarProveedoresBc();
+    res.json({ ok: true, n: proveedores.length, proveedores });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo listar los proveedores de BC.", detalle: String(err.message || err) });
+  }
+});
+
 // Email del PROVEEDOR desde su ficha en BC (API v2.0 /vendors, solo LECTURA).
 app.get("/api/bc/proveedor-email", async (req, res) => {
   const numero = String(req.query.numero || "").trim();
   const nombre = String(req.query.nombre || "").trim();
-  if (!numero && !nombre) return res.status(400).json({ error: "Falta 'numero' o 'nombre'." });
+  const cif = String(req.query.cif || "").trim();
+  if (!numero && !nombre && !cif) return res.status(400).json({ error: "Falta 'numero', 'nombre' o 'cif'." });
   try {
     const token = await obtenerTokenBC();
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/vendors`;
@@ -337,22 +428,37 @@ app.get("/api/bc/proveedor-email", async (req, res) => {
     const filtros = [];
     if (numero) filtros.push(`number eq '${esc(numero)}'`);
     if (nombre) filtros.push(`displayName eq '${esc(nombre)}'`);
+    if (cif) {
+      const cifN = normalizarCifProveedor(cif);
+      if (cifN) {
+        filtros.push(`number eq '${esc(cifN)}'`);
+        filtros.push(`taxRegistrationNumber eq '${esc(cifN)}'`);
+        if (cifN !== cif.toUpperCase().replace(/[^A-Z0-9]/g, "")) {
+          filtros.push(`taxRegistrationNumber eq '${esc("ES" + cifN)}'`);
+        }
+      }
+    }
     for (const f of filtros) {
-      const r = await fetchConReintento(`${base}?$filter=${encodeURIComponent(f)}&$select=number,displayName,email`, {
+      const r = await fetchConReintento(`${base}?$filter=${encodeURIComponent(f)}&$select=number,displayName,email,taxRegistrationNumber`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!r.ok) continue;
       const v = ((await r.json()).value || [])[0];
-      if (v) return res.json({ email: v.email || "", numero: v.number, nombre: v.displayName });
+      if (v) return res.json({ email: v.email || "", numero: v.number, nombre: v.displayName, cif: v.taxRegistrationNumber || "" });
     }
-    if (nombre) {
-      const r2 = await fetchConReintento(`${base}?$select=number,displayName,email&$top=400`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (r2.ok) {
-        const hit = ((await r2.json()).value || []).find((v) => v.displayName && proveedoresParecidos(nombre, v.displayName));
-        if (hit) return res.json({ email: hit.email || "", numero: hit.number, nombre: hit.displayName });
-      }
+    if (nombre || cif) {
+      try {
+        const lista = await listarProveedoresBc();
+        const cifN = normalizarCifProveedor(cif || nombre);
+        const porCif = cifN
+          ? lista.find((v) => normalizarCifProveedor(v.cif) === cifN || normalizarCifProveedor(v.numero) === cifN)
+          : null;
+        if (porCif) return res.json({ email: porCif.email || "", numero: porCif.numero, nombre: porCif.nombre, cif: porCif.cif || "" });
+        if (nombre) {
+          const hit = lista.find((v) => v.nombre && proveedoresParecidos(nombre, v.nombre));
+          if (hit) return res.json({ email: hit.email || "", numero: hit.numero, nombre: hit.nombre, cif: hit.cif || "" });
+        }
+      } catch { /* cae al vacío */ }
     }
     res.json({ email: "" });
   } catch (err) {
@@ -383,6 +489,41 @@ app.get("/api/bc/cliente-email", async (req, res) => {
     res.json({ email: "" });
   } catch (err) {
     res.status(500).json({ error: "No se pudo consultar el cliente en BC.", detalle: String(err.message || err) });
+  }
+});
+
+// Logo de la ficha del cliente (imagen de BC), recortado y pequeño, para el
+// correo a los encargados. Si el cliente no tiene imagen, logo = null.
+app.get("/api/bc/cliente-logo", async (req, res) => {
+  const numero = String(req.query.numero || "").trim();
+  const nombre = String(req.query.nombre || "").trim();
+  if (!numero && !nombre) return res.json({ logo: null });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/customers`;
+    const auth = { Authorization: `Bearer ${token}` };
+    const esc = (v) => v.replace(/'/g, "''");
+    const buscar = async (filtro) => {
+      const r = await fetchConReintento(`${base}?$filter=${encodeURIComponent(filtro)}&$select=id,number,displayName&$top=5`, { headers: auth });
+      if (!r.ok) return [];
+      return ((await r.json()).value) || [];
+    };
+    let cli = null;
+    if (numero) cli = (await buscar(`number eq '${esc(numero)}'`))[0] || null;
+    if (!cli && nombre) cli = (await buscar(`displayName eq '${esc(nombre)}'`))[0] || null;
+    if (!cli) return res.json({ logo: null });
+    const metaR = await fetchConReintento(`${base}(${cli.id})/picture`, { headers: { ...auth, Accept: "application/json" } });
+    if (!metaR.ok) return res.json({ logo: null });
+    const meta = await metaR.json();
+    if (!(meta.width > 0) || !(meta.height > 0)) return res.json({ logo: null });
+    const cr = await fetchConReintento(`${base}(${cli.id})/picture/pictureContent`, { headers: auth });
+    if (!cr.ok) return res.json({ logo: null });
+    const bytes = Buffer.from(await cr.arrayBuffer());
+    const logo = prepararLogoCorreo(bytes, meta.contentType || "");
+    res.json(logo ? { ...logo, cliente: cli.displayName || nombre } : { logo: null });
+  } catch (err) {
+    console.warn("[cliente-logo]", err.message);
+    res.json({ logo: null });
   }
 });
 
@@ -454,6 +595,281 @@ app.get("/api/bc/factura-venta-pdf", async (req, res) => {
   }
 });
 
+// Doc. extern de BC (93746-2026) → código del parte en Also (93746-26).
+function codigoParteAlso(externo) {
+  const m = /^(\d+)\s*[-/]\s*(\d{2}|\d{4})$/.exec(String(externo || "").trim());
+  if (!m) return "";
+  const anio = m[2].length === 4 ? m[2].slice(-2) : m[2];
+  return `${m[1]}-${anio}`;
+}
+
+async function descargarParteAlso(externo) {
+  const codigo = codigoParteAlso(externo);
+  if (!codigo) return { ok: false, aviso: "" };
+  const url = `https://app.alsocasals.com/ALSO/generarPartePDF.php?parte=${encodeURIComponent(codigo)}&noFeina=1`;
+  const r = await fetchParteAlso(url);
+  if (!r.ok) return { ok: false, codigo, aviso: `No se ha podido descargar el parte ${codigo} (respuesta ${r.status}). El PDF solo lleva el albarán.` };
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length < 5 || buf.subarray(0, 5).toString("latin1") !== "%PDF-") {
+    return { ok: false, codigo, aviso: `El parte ${codigo} no ha llegado como PDF. El documento solo lleva el albarán.` };
+  }
+  return { ok: true, codigo, buf };
+}
+
+async function unirAlbaranYParte(albaranBuf, parteBuf) {
+  const out = await PDFDocument.create();
+  const alb = await PDFDocument.load(albaranBuf, { ignoreEncryption: true });
+  const par = await PDFDocument.load(parteBuf, { ignoreEncryption: true });
+  for (const p of await out.copyPages(alb, alb.getPageIndices())) out.addPage(p);
+  for (const p of await out.copyPages(par, par.getPageIndices())) out.addPage(p);
+  return { buf: Buffer.from(await out.save()), paginas: out.getPageCount() };
+}
+
+// PDF del albarán de venta registrado (histórico), no del pedido.
+// En BC se localiza por Nº documento externo, que en la app es Doc. extern
+// (p. ej. PV26-001682 → 93746-2026 → ALBV26-002117). Si el pedido se
+// registró con otro externo (el del albarán no coincide con el del PV),
+// se busca también por número de pedido. Detrás se añade el parte de
+// trabajo de app.alsocasals.com (93746-26).
+function numeroAlbaran(number) {
+  const m = String(number || "").match(/(\d+)(?!.*\d)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+function albaranMasAlto(lista) {
+  let mejor = null;
+  for (const s of lista || []) {
+    if (!mejor) { mejor = s; continue; }
+    const a = numeroAlbaran(s.number);
+    const b = numeroAlbaran(mejor.number);
+    if (a > b || (a === b && String(s.number || "") > String(mejor.number || ""))) mejor = s;
+  }
+  return mejor;
+}
+
+// Del mismo pedido puede haber dos albaranes (ALBV26-003705 y ALBV26-003827).
+// El bueno es el de número más alto.
+function quedarAlbaranMasAltoPorPedido(lista) {
+  const porPedido = new Map();
+  const sinPedido = [];
+  for (const s of lista || []) {
+    const ped = String(s.orderNumber || "").trim();
+    if (!ped) { sinPedido.push(s); continue; }
+    const prev = porPedido.get(ped);
+    porPedido.set(ped, prev ? albaranMasAlto([prev, s]) : s);
+  }
+  return [...porPedido.values(), ...sinPedido];
+}
+
+async function listarAlbaranesVenta(base, auth, filtro) {
+  const busca = await fetchConReintento(
+    `${base}/salesShipments?$filter=${encodeURIComponent(filtro)}&$select=id,number,externalDocumentNumber,orderNumber,postingDate&$top=50`,
+    { headers: auth }
+  );
+  if (!busca.ok) {
+    const detalle = await busca.text();
+    return { ok: false, status: busca.status, detalle: detalle.slice(0, 400), lista: [] };
+  }
+  return { ok: true, lista: (await busca.json()).value || [] };
+}
+
+// PDF ya generado, unos minutos, para abrirlo con el nombre del albarán (101412-2026M.pdf).
+const pdfAlbaranTemporal = new Map();
+function guardarPdfAlbaranTemporal(nombre, base64) {
+  const ahora = Date.now();
+  for (const [id, item] of pdfAlbaranTemporal) {
+    if (item.exp < ahora) pdfAlbaranTemporal.delete(id);
+  }
+  const id = require("crypto").randomBytes(12).toString("hex");
+  const archivo = String(nombre || "albaran.pdf").replace(/[^\w.-]+/g, "_");
+  pdfAlbaranTemporal.set(id, { buf: Buffer.from(base64, "base64"), nombre: archivo, exp: ahora + 5 * 60 * 1000 });
+  return `/api/bc/albaran-venta-pdf/archivo/${id}/${encodeURIComponent(archivo)}`;
+}
+
+app.get("/api/bc/albaran-venta-pdf/archivo/:id/:nombre", (req, res) => {
+  const item = pdfAlbaranTemporal.get(String(req.params.id || ""));
+  if (!item || item.exp < Date.now()) {
+    pdfAlbaranTemporal.delete(String(req.params.id || ""));
+    return res.status(404).type("text/plain").send("El PDF ya no está disponible. Vuelve a abrirlo desde el pedido.");
+  }
+  const nombre = item.nombre || "albaran.pdf";
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `inline; filename="${nombre}"; filename*=UTF-8''${encodeURIComponent(nombre)}`);
+  res.send(item.buf);
+});
+
+app.get("/api/bc/albaran-venta-pdf", async (req, res) => {
+  const externo = String(req.query.externo || "").trim();
+  const pedido = String(req.query.pedido || "").trim();
+  const numero = String(req.query.numero || "").trim();
+  if (!externo && !pedido) return res.status(400).json({ error: "Falta el nº de documento externo o el pedido." });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const auth = { Authorization: `Bearer ${token}` };
+    const mapa = new Map();
+    const meter = (lista) => {
+      for (const s of lista || []) if (s?.id && !mapa.has(s.id)) mapa.set(s.id, s);
+    };
+    if (externo) {
+      const porExterno = await listarAlbaranesVenta(base, auth, `externalDocumentNumber eq '${externo.replace(/'/g, "''")}'`);
+      if (!porExterno.ok && !pedido) {
+        return res.status(502).json({ error: `BC respondió ${porExterno.status} buscando el albarán.`, detalle: porExterno.detalle });
+      }
+      if (porExterno.ok) meter(porExterno.lista);
+    }
+    if (pedido) {
+      const porPedido = await listarAlbaranesVenta(base, auth, `orderNumber eq '${pedido.replace(/'/g, "''")}'`);
+      if (!porPedido.ok && mapa.size === 0) {
+        return res.status(502).json({ error: `BC respondió ${porPedido.status} buscando el albarán del pedido.`, detalle: porPedido.detalle });
+      }
+      if (porPedido.ok) meter(porPedido.lista);
+    }
+    let lista = [...mapa.values()];
+    lista.sort((a, b) => String(b.postingDate || "").localeCompare(String(a.postingDate || "")));
+    if (pedido) {
+      const delPedido = lista.filter((s) => String(s.orderNumber || "") === pedido);
+      if (delPedido.length) lista = delPedido;
+    }
+    if (numero) lista = lista.filter((s) => String(s.number || "") === numero);
+    let avisoElegido = "";
+    if (!numero && lista.length > 1) {
+      const antes = lista.slice();
+      lista = quedarAlbaranMasAltoPorPedido(lista);
+      const quedan = new Set(lista.map((s) => s.id));
+      const fuera = antes.filter((s) => !quedan.has(s.id)).map((s) => s.number).filter(Boolean);
+      if (fuera.length === antes.length - lista.length && lista.length === 1) {
+        const todos = [lista[0].number, ...fuera].filter(Boolean).sort();
+        avisoElegido = `De este pedido había varios albaranes (${todos.join(", ")}). Se usa ${lista[0].number}, el de número más alto.`;
+      }
+    }
+    if (!lista.length) {
+      return res.status(404).json({
+        error: `No hay albarán de venta con documento externo ${externo}${pedido ? ` del pedido ${pedido}` : ""} en el histórico de Business Central.`,
+      });
+    }
+    if (lista.length > 1 && !numero) {
+      return res.json({
+        varios: lista.map((s) => ({
+          numero: s.number,
+          pedido: s.orderNumber || "",
+          externo: s.externalDocumentNumber || externo,
+          fecha: s.postingDate || "",
+        })),
+      });
+    }
+    const shipment = lista[0];
+    const raiz = `${base}/salesShipments(${shipment.id})/pdfDocument`;
+    let ultimo = null;
+    for (const accept of ["application/pdf", "application/octet-stream"]) {
+      const got = await leerPdfBC(`${raiz}/pdfDocumentContent`, { ...auth, Accept: accept });
+      if (got.ok) {
+        const docAlbaran = String(shipment.externalDocumentNumber || "").trim();
+        const candidatosParte = [];
+        for (const c of [externo, docAlbaran]) {
+          const t = String(c || "").trim();
+          if (t && !candidatosParte.includes(t)) candidatosParte.push(t);
+        }
+        const docExterno = docAlbaran || externo;
+        let base64 = got.base64;
+        let parte = "";
+        let aviso = [
+          avisoElegido,
+          docAlbaran && externo && docAlbaran !== externo
+            ? `El albarán ${shipment.number} figura en BC con el documento externo ${docAlbaran}. El pedido tiene ${externo}.`
+            : "",
+        ].filter(Boolean).join(" ");
+        let paginas = null;
+        let material = null;
+        try {
+          let bajado = { ok: false, aviso: "" };
+          for (const c of candidatosParte) {
+            bajado = await descargarParteAlso(c);
+            if (bajado.ok) break;
+          }
+          if (bajado.ok && PDFDocument) {
+            const unido = await unirAlbaranYParte(Buffer.from(got.base64, "base64"), bajado.buf);
+            base64 = unido.buf.toString("base64");
+            parte = bajado.codigo;
+            paginas = unido.paginas;
+            try {
+              material = await require("./compararParteAlbaran.cjs").compararParteYAlbaran(Buffer.from(got.base64, "base64"), bajado.buf);
+            } catch (errCmp) {
+              aviso = aviso || `No se ha podido comparar el material. ${errCmp.message || ""}`.trim();
+            }
+          } else if (bajado.aviso) {
+            aviso = [aviso, bajado.aviso].filter(Boolean).join(" ");
+          } else if (bajado.ok && !PDFDocument) {
+            aviso = [aviso, "No se ha podido unir el parte: falta pdf-lib. El PDF solo lleva el albarán."].filter(Boolean).join(" ");
+          }
+        } catch (errParte) {
+          aviso = [aviso, `No se ha podido añadir el parte de trabajo. El PDF solo lleva el albarán. ${errParte.message || ""}`.trim()].filter(Boolean).join(" ");
+        }
+        const nombreBase = String(docExterno || shipment.number || externo || "albaran").trim().replace(/[^\w.-]+/g, "_");
+        const nombre = `${nombreBase || "albaran"}.pdf`;
+        const url = guardarPdfAlbaranTemporal(nombre, base64);
+        return res.json({
+          nombre,
+          url,
+          base64,
+          mime: "application/pdf",
+          albaran: shipment.number,
+          pedido: shipment.orderNumber || pedido,
+          externo: docExterno,
+          parte: parte || null,
+          paginas,
+          aviso: aviso || null,
+          material,
+        });
+      }
+      ultimo = got;
+    }
+    return res.status(502).json({ error: ultimo?.error || "Business Central no ha devuelto el PDF del albarán.", detalle: ultimo?.detalle || "" });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudo obtener el PDF del albarán.", detalle: String(err.message || err) });
+  }
+});
+
+app.post("/api/bc/albaranes-por-pedido", async (req, res) => {
+  const pedidos = [];
+  const vistos = new Set();
+  for (const item of Array.isArray(req.body?.pedidos) ? req.body.pedidos : []) {
+    const n = String(item || "").trim();
+    if (!n || vistos.has(n)) continue;
+    vistos.add(n);
+    pedidos.push(n);
+    if (pedidos.length >= 40) break;
+  }
+  if (!pedidos.length) return res.json({ albaranes: {} });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const auth = { Authorization: `Bearer ${token}` };
+    const albaranes = {};
+    const lote = 5;
+    for (let i = 0; i < pedidos.length; i += lote) {
+      const grupo = pedidos.slice(i, i + lote);
+      const listas = await Promise.all(grupo.map(async (pedido) => {
+        const r = await listarAlbaranesVenta(base, auth, `orderNumber eq '${pedido.replace(/'/g, "''")}'`);
+        if (!r.ok) return { pedido, error: r.detalle || `BC ${r.status}` };
+        const s = albaranMasAlto(r.lista || []);
+        return {
+          pedido,
+          ref: s ? {
+            externo: String(s.externalDocumentNumber || "").trim(),
+            albaran: s.number || "",
+            fecha: s.postingDate || "",
+          } : null,
+        };
+      }));
+      for (const item of listas) albaranes[item.pedido] = item.ref === undefined ? null : item.ref;
+    }
+    res.json({ albaranes });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudieron localizar los albaranes.", detalle: String(err.message || err) });
+  }
+});
+
 app.post("/api/recepcion", async (req, res) => {
   try {
     const actual = await leerRecep();
@@ -465,6 +881,8 @@ app.post("/api/recepcion", async (req, res) => {
       emailsProveedor: { ...(actual.emailsProveedor || {}), ...(body.emailsProveedor || {}) },
       notas: actual.notas || {},
       registrados: actual.registrados || {},
+      firmasAprendidas: actual.firmasAprendidas || {},
+      recogedores: actual.recogedores || {},
     };
     for (const campo of ["revisados", "fechas", "reclamados", "emailsProveedor"]) {
       for (const k in body[campo] || {}) if (body[campo][k] === null) delete combinado[campo][k];
@@ -1147,6 +1565,105 @@ async function elegirClienteBC(base, token, clienteNombre, pista) {
   }
   return { elegido };
 }
+app.post("/api/correo/chat-rec", async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: "Falta ANTHROPIC_API_KEY en .env." });
+  }
+  const cuerpo = req.body || {};
+  const mensaje = String(cuerpo.mensaje || "").trim().slice(0, 1200);
+  if (!mensaje) return res.status(400).json({ error: "Falta el missatge." });
+  const correo = cuerpo.correo || {};
+  const rec = cuerpo.recomendacion || {};
+  const historial = Array.isArray(cuerpo.historial) ? cuerpo.historial.slice(-8) : [];
+  const nombre = req.usuario?.nom_treballador || req.usuario?.nombre || "Maria Rufí";
+  const plano = textoPlanoCorreo(correo.cuerpo, correo.tipoCuerpo);
+  try {
+    const historialTxt = historial.map((m) => {
+      const qui = m?.rol === "yo" ? nombre : "Assistent";
+      return `${qui}: ${String(m?.texto || "").slice(0, 600)}`;
+    }).join("\n");
+    const prompt = `Ets l'assistent de correu d'ALSO CASALS dins la pantalla «Recomanació de resposta».
+La ${nombre} et parla sobre el correu obert. Pots:
+- Explicar què pots fer (respondre, millorar borrador, preparar albarà de venda, crear tasca, obrir abonament/factura a BC si escau).
+- Millorar o reescriure el borrador de resposta.
+- Ajustar queHacer / acciones de Business Central si el correu ho demana amb claredat.
+No inventis números, clients ni empreses. Respon en l'idioma del missatge de la Maria (o del correu si no queda clar).
+
+CORREU
+De: ${correo.deNombre || ""} <${correo.de || ""}>
+Assumpte: ${correo.asunto || ""}
+${plano || "(sense text)"}
+
+RECOMANACIÓ ACTUAL (JSON):
+${JSON.stringify({
+  recomendacion: rec.recomendacion || "",
+  queHacer: rec.queHacer || "",
+  acciones: rec.acciones || [],
+  apoyos: rec.apoyos || [],
+  borrador: rec.borrador || "",
+}).slice(0, 8000)}
+
+HISTORIAL RECENT:
+${historialTxt || "(buit)"}
+
+MISSATGE NOU DE ${nombre}:
+${mensaje}
+
+Retorna NOMÉS un JSON, sense markdown:
+{"respuesta":"resposta curta al xat (1-4 frases)","recomendacion":null,"queHacer":null,"acciones":null,"apoyos":null,"borrador":null}
+- respuesta: sempre.
+- borrador: només si cal actualitzar el text de resposta (sense salutació final ni avís legal).
+- recomendacion / queHacer / acciones / apoyos: només si cal actualitzar-los; si no, null.
+- acciones: mateix format que la recomanació (tipo abono|factura, factura, cliente, empresa).`;
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5",
+        max_tokens: 1800,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) throw new Error(`API Claude respondió ${r.status}`);
+    const data = await r.json();
+    let texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    texto = texto.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    let parsed;
+    try { parsed = JSON.parse(texto); }
+    catch {
+      const i = texto.indexOf("{");
+      const j = texto.lastIndexOf("}");
+      try { parsed = i >= 0 && j > i ? JSON.parse(texto.slice(i, j + 1)) : null; }
+      catch { parsed = null; }
+      if (!parsed) parsed = { respuesta: texto };
+    }
+    const acciones = Array.isArray(parsed.acciones)
+      ? parsed.acciones.map((a) => ({
+          tipo: a?.tipo === "factura" ? "factura" : a?.tipo === "abono" ? "abono" : "",
+          factura: String(a?.factura || "").trim().slice(0, 30),
+          cliente: String(a?.cliente || "").trim().slice(0, 120),
+          empresa: String(a?.empresa || "").trim().slice(0, 60),
+        })).filter((a) => a.tipo && (a.factura || a.cliente || a.empresa)).slice(0, 6)
+      : null;
+    res.json({
+      respuesta: String(parsed.respuesta || "").trim() || "D'acord.",
+      recomendacion: parsed.recomendacion != null ? String(parsed.recomendacion).trim() : null,
+      queHacer: parsed.queHacer != null ? String(parsed.queHacer).trim() : null,
+      apoyos: Array.isArray(parsed.apoyos) ? parsed.apoyos.map((x) => String(x)).slice(0, 8) : null,
+      acciones,
+      borrador: parsed.borrador != null ? String(parsed.borrador).trim() : null,
+    });
+  } catch (err) {
+    console.error("Error chat-rec correo:", err);
+    res.status(500).json({ error: "No he podido responder al chat.", detalle: String(err.message || err) });
+  }
+});
+
 app.post("/api/correo/accion-bc", async (req, res) => {
   const tipo = req.body?.tipo === "factura" ? "factura" : req.body?.tipo === "abono" ? "abono" : "";
   const factura = String(req.body?.factura || "").trim();
@@ -1508,6 +2025,168 @@ app.get("/api/buzon/mensaje/:id", async (req, res) => {
   }
 });
 
+// Correos ENVIADOS desde el buzón de quien está logueado que mencionan una OT.
+// Busca en Enviados (asunto y cuerpo) y completa con el resto de enviados del mismo hilo.
+function patronesCorreoOT(codigo, numero) {
+  const cod = String(codigo || "").trim().toUpperCase();
+  const deNumero = String(numero || "").replace(/\D/g, "");
+  const deCodigo = (cod.match(/(\d{3,6})(?=\/\d{4}$)/) || cod.match(/(\d{3,6})/) || [])[1] || "";
+  const n = parseInt(deNumero || deCodigo, 10);
+  const pad = n ? String(n).padStart(6, "0") : "";
+  const pref = (cod.match(/^([A-Z]{2,4})/) || [])[1] || "";
+  const anio = (cod.match(/\/(\d{4})$/) || [])[1] || "";
+  const frases = new Set();
+  if (cod.length >= 4) frases.add(cod);
+  if (pref && pad) {
+    frases.add(`${pref}${pad}`);
+    if (anio) frases.add(`${pref}${pad}/${anio}`);
+  }
+  if (pref && n && String(n) !== pad) frases.add(`${pref}${n}`);
+  if (n) {
+    frases.add(`OT ${n}`);
+    if (pad && pad !== String(n)) frases.add(`OT ${pad}`);
+    frases.add(`OT: ${pad || n}`);
+  }
+  return [...frases].filter((p) => p.length >= 4);
+}
+
+function mencionaCorreoOT(texto, patrones) {
+  const t = String(texto || "");
+  return patrones.some((p) => {
+    const esc = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?<![A-Za-z0-9])${esc}(?![A-Za-z0-9])`, "i").test(t);
+  });
+}
+
+function seQuedaCorreoOT(m, patrones) {
+  const texto = `${m.subject || ""}\n${m.bodyPreview || ""}`;
+  if (mencionaCorreoOT(texto, patrones)) return true;
+  const codigos = texto.match(/\b[A-Z]{2,4}\d{5,6}\/\d{4}\b/gi) || [];
+  if (!codigos.length) return true;
+  return codigos.some((c) => mencionaCorreoOT(c, patrones));
+}
+
+function kqlCorreoOT(patrones) {
+  const partes = patrones.map((p) => {
+    const limpio = String(p).replace(/"/g, "");
+    return /[\s/:.]/.test(limpio) ? `"${limpio}"` : limpio;
+  });
+  return `"${partes.join(" OR ").replace(/"/g, '\\"')}"`;
+}
+
+function resumirEnviadoOT(m) {
+  return {
+    id: m.id,
+    asunto: m.subject || "(sin asunto)",
+    para: (m.toRecipients || []).map((t) => t.emailAddress?.address).filter(Boolean),
+    cc: (m.ccRecipients || []).map((t) => t.emailAddress?.address).filter(Boolean),
+    fecha: m.sentDateTime || m.receivedDateTime || "",
+    adjuntos: !!m.hasAttachments,
+    preview: String(m.bodyPreview || "").replace(/\s+/g, " ").trim().slice(0, 280),
+    enlace: m.webLink || "",
+  };
+}
+
+async function buscarEnviadosOT(token, buzon, expresion) {
+  const headers = { Authorization: `Bearer ${token}`, ConsistencyLevel: "eventual" };
+  const sel = "id,subject,toRecipients,ccRecipients,sentDateTime,receivedDateTime,hasAttachments,bodyPreview,webLink,conversationId";
+  let url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/sentitems/messages?$search=${encodeURIComponent(expresion)}&$select=${sel}&$top=25`;
+  const mensajes = [];
+  const ids = new Set();
+  let paginas = 0;
+  let hayMas = false;
+  while (url && paginas < 8 && mensajes.length < 200) {
+    const r = await fetchConReintento(url, { headers });
+    if (!r.ok) {
+      const detalle = (await r.text()).slice(0, 400);
+      const err = new Error(`Graph respondió ${r.status}: ${detalle}`);
+      err.status = r.status;
+      throw err;
+    }
+    const j = await r.json();
+    for (const m of j.value || []) {
+      if (ids.has(m.id)) continue;
+      ids.add(m.id);
+      mensajes.push(m);
+    }
+    url = j["@odata.nextLink"] || "";
+    paginas += 1;
+    if (url && (paginas >= 8 || mensajes.length >= 200)) hayMas = true;
+  }
+  return { mensajes, hayMas };
+}
+
+async function enviadosDelHiloOT(token, buzon, conversationId) {
+  const headers = { Authorization: `Bearer ${token}` };
+  const sel = "id,subject,toRecipients,ccRecipients,sentDateTime,receivedDateTime,hasAttachments,bodyPreview,webLink,conversationId";
+  const filtro = `conversationId eq '${String(conversationId).replace(/'/g, "''")}'`;
+  const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/sentitems/messages?$filter=${encodeURIComponent(filtro)}&$select=${sel}&$top=30`;
+  const r = await fetchConReintento(url, { headers });
+  if (!r.ok) return [];
+  const j = await r.json();
+  return j.value || [];
+}
+
+app.get("/api/correo/ot-enviados", async (req, res) => {
+  if (!process.env.M365_CLIENT_SECRET) {
+    return res.status(503).json({ error: "Falta configurar M365_* en .env." });
+  }
+  const codigo = String(req.query.codigo || "").trim();
+  const numero = String(req.query.numero || "").trim();
+  const patrones = patronesCorreoOT(codigo, numero);
+  if (!patrones.length) return res.status(400).json({ error: "Falta el código de la OT." });
+  try {
+    const buzon = await buzonDelUsuario(req, res);
+    if (!buzon) return;
+    const token = await obtenerTokenGraph();
+    const tokenSimple = patrones.find((p) => /^[A-Z]{2,4}\d{6}$/.test(p)) || patrones.find((p) => /^[A-Z0-9]+$/.test(p));
+    let encontrados;
+    try {
+      encontrados = await buscarEnviadosOT(token, buzon, kqlCorreoOT(patrones));
+    } catch (err) {
+      if (!tokenSimple || err.status !== 400) throw err;
+      console.warn("[correo/ot-enviados] búsqueda amplia rechazada, reintento con", tokenSimple);
+      encontrados = await buscarEnviadosOT(token, buzon, `"${tokenSimple}"`);
+    }
+    const semillas = encontrados.mensajes.filter((m) => seQuedaCorreoOT(m, patrones));
+    const porId = new Map(semillas.map((m) => [m.id, m]));
+    const hilos = [...new Set(semillas.map((m) => m.conversationId).filter(Boolean))].slice(0, 25);
+    for (let i = 0; i < hilos.length; i += 4) {
+      const grupo = hilos.slice(i, i + 4);
+      const listas = await Promise.all(grupo.map((id) => enviadosDelHiloOT(token, buzon, id).catch(() => [])));
+      for (const lista of listas) {
+        for (const m of lista) if (!porId.has(m.id)) porId.set(m.id, m);
+      }
+    }
+    const mensajes = [...porId.values()].map(resumirEnviadoOT).sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
+    console.log(`[correo/ot-enviados] ${buzon} ${codigo || numero}: ${mensajes.length} enviados`);
+    res.json({ buzon, mensajes, hayMas: encontrados.hayMas });
+  } catch (err) {
+    console.error("Error /api/correo/ot-enviados:", err);
+    res.status(500).json({ error: "No se pudieron leer los correos enviados.", detalle: String(err.message || err) });
+  }
+});
+
+function adjuntoLogoCliente(logo) {
+  if (!logo?.base64) return null;
+  let bytes;
+  try {
+    bytes = Buffer.from(String(logo.base64).replace(/\s/g, ""), "base64");
+  } catch {
+    return null;
+  }
+  const listo = prepararLogoCorreo(bytes, logo.mime);
+  if (!listo) return null;
+  return {
+    "@odata.type": "#microsoft.graph.fileAttachment",
+    name: listo.mime === "image/jpeg" ? "logo-cliente.jpg" : "logo-cliente.png",
+    contentType: listo.mime,
+    contentBytes: listo.base64,
+    contentId: "logo-cliente",
+    isInline: true,
+  };
+}
+
 function adjuntoFirmaCorreo() {
   try {
     const bytes = require("fs").readFileSync(path.join(__dirname, "public", "firma-correo.png"));
@@ -1532,7 +2211,7 @@ app.post("/api/correo/enviar", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   }
-  const { para, cc, asunto, cuerpoHtml, adjunto, adjuntos: adjuntosPedido, incluirFirma, respuestaA } = req.body || {};
+  const { para, cc, asunto, cuerpoHtml, adjunto, adjuntos: adjuntosPedido, incluirFirma, respuestaA, logoCliente } = req.body || {};
   const destinatarios = Array.isArray(para) ? para.filter(Boolean) : [];
   const enPara = new Set(destinatarios.map((e) => String(e).trim().toLowerCase()));
   const copiasVistas = new Set();
@@ -1609,6 +2288,7 @@ app.post("/api/correo/enviar", async (req, res) => {
       body: body === undefined ? undefined : JSON.stringify(body),
     }, 1);
     const firma = incluirFirma ? adjuntoFirmaCorreo() : null;
+    const logoAdj = adjuntoLogoCliente(logoCliente);
 
     if (respuestaA) {
       const creado = await graph(`${base}/messages/${encodeURIComponent(respuestaA)}/createReply`, "POST", {});
@@ -1627,6 +2307,10 @@ app.post("/api/correo/enviar", async (req, res) => {
       if (firma) {
         const af = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", firma);
         if (!af.ok) console.warn("[correo/enviar] firma no adjuntada", af.status);
+      }
+      if (logoAdj) {
+        const al = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", logoAdj);
+        if (!al.ok) console.warn("[correo/enviar] logo no adjuntado", al.status);
       }
       for (const f of ficheros) {
         const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", f);
@@ -1663,6 +2347,10 @@ app.post("/api/correo/enviar", async (req, res) => {
         const af = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", firma);
         if (!af.ok) console.warn("[correo/enviar] firma no adjuntada", af.status);
       }
+      if (logoAdj) {
+        const al = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", logoAdj);
+        if (!al.ok) console.warn("[correo/enviar] logo no adjuntado", al.status);
+      }
       for (const f of ficheros) {
         const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", f);
         if (!aa.ok) {
@@ -1683,6 +2371,7 @@ app.post("/api/correo/enviar", async (req, res) => {
     }
     const adjuntos = [];
     if (firma) adjuntos.push(firma);
+    if (logoAdj) adjuntos.push(logoAdj);
     for (const f of ficheros) adjuntos.push(f);
     if (adjuntos.length) mensaje.attachments = adjuntos;
     const url = `${base}/sendMail`;
@@ -1733,6 +2422,49 @@ app.post("/api/avisos", async (req, res) => {
   } catch (err) {
     console.error("Error guardando avisos:", err);
     res.status(500).json({ error: "No se pudo guardar los avisos." });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Comercial: clientes en seguimiento, tarifa de presupuesto y correos.
+// Un documento por empresa (Also Casals → "comercial"; otra → comercial_slug).
+// ---------------------------------------------------------------------
+const COMERCIAL_VACIO = { contactos: [], tarifa: [], presupuestos: [], actualizado: null };
+
+function documentoComercial(body) {
+  const b = body && typeof body === "object" ? body : {};
+  const lista = (v, tope) => (Array.isArray(v) ? v.slice(0, tope) : []);
+  return {
+    contactos: lista(b.contactos, 5000),
+    tarifa: lista(b.tarifa, 20000),
+    presupuestos: lista(b.presupuestos, 5000),
+    actualizado: new Date().toISOString(),
+  };
+}
+
+app.get("/api/comercial", async (req, res) => {
+  try {
+    const doc = await db.getDoc(claveEmpresa("comercial"), COMERCIAL_VACIO);
+    res.json({
+      contactos: Array.isArray(doc.contactos) ? doc.contactos : [],
+      tarifa: Array.isArray(doc.tarifa) ? doc.tarifa : [],
+      presupuestos: Array.isArray(doc.presupuestos) ? doc.presupuestos : [],
+      actualizado: doc.actualizado || null,
+    });
+  } catch (err) {
+    console.error("Error leyendo comercial:", err);
+    res.status(500).json({ error: "No se pudo leer el seguimiento comercial." });
+  }
+});
+
+app.post("/api/comercial", async (req, res) => {
+  try {
+    const doc = documentoComercial(req.body);
+    await db.setDoc(claveEmpresa("comercial"), doc);
+    res.json(doc);
+  } catch (err) {
+    console.error("Error guardando comercial:", err);
+    res.status(500).json({ error: "No se pudo guardar el seguimiento comercial." });
   }
 });
 
@@ -3096,10 +3828,9 @@ app.get("/api/bc/:fuente", async (req, res) => {
 //
 //   POST /api/recepcion/extraer  { nombre, base64 }
 //     Solo LECTURA en BC (consulta, no escribe). Recorta el PDF en
-//     lotes de páginas y se los pasa a Claude DIRECTAMENTE COMO PDF
-//     (no como texto extraído): así funciona igual con PDFs digitales
-//     que con documentos escaneados/fotocopiados, porque Claude "ve"
-//     cada página como imagen además de leer el texto si lo hay.
+//     lotes de páginas. Si el lote tiene texto legible, Claude recibe
+//     solo el texto; si es un escaneo sin texto, se manda el PDF como
+//     documento/imagen.
 //     Identifica, por página: NUESTRO Nº de pedido (PCNN-NNNNNN /
 //     OCNN-NNNNNN), el Nº de albarán DEL PROVEEDOR y las líneas de
 //     material (descripción + cantidad). Agrupa solo las páginas
@@ -3148,14 +3879,13 @@ app.get("/api/bc/:fuente", async (req, res) => {
 //         confirmar, el match puede equivocarse con descripciones parecidas.
 // ---------------------------------------------------------------------
 
-// Manda un LOTE de páginas (como PDF de verdad, no texto) a Claude y
-// pide un JSON con lo detectado en cada una. Funciona igual con PDFs
-// digitales que escaneados, porque Claude lee el documento como imagen.
+// Manda un LOTE de páginas a Claude. Si el PDF tiene texto legible, solo
+// se envía el texto (como en Validación de facturas). Si es un escaneo
+// sin texto, se manda el PDF como documento/imagen.
 async function extraerLotePDF(bytesLotePdf, numPaginasLote) {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error("Falta ANTHROPIC_API_KEY en .env.");
   }
-  const base64Lote = Buffer.from(bytesLotePdf).toString("base64");
   const prompt = `Eres un asistente que lee documentos de proveedores (albaranes de entrega, notas de entrega, confirmaciones de pedido) que llegan escaneados/fotocopiados o exportados a PDF, con MUCHAS páginas seguidas.
 
 Te adjunto un PDF con ${numPaginasLote} página(s), en orden. Lee CADA página por separado. No des por hecho que dos páginas son el mismo documento.
@@ -3183,6 +3913,23 @@ Responde ÚNICAMENTE con un array JSON, sin texto adicional, backticks ni explic
 Ejemplo: la página 1 y la 3 son del MISMO proveedor, pero son albaranes y pedidos distintos, así que NO se heredan. La página 2 sí es continuación de la 1. La página 4 es UN albarán con varios PC manuscritos, uno por línea:
 [{"pagina":1,"pedido":"PC26-002262","oferta":null,"albaran":"A-99321","esContinuacion":false,"lineas":[{"descripcion":"Tornillo M8 x100","cantidad":100,"pedido":null,"oferta":null}]},{"pagina":2,"pedido":null,"oferta":null,"albaran":null,"esContinuacion":true,"lineas":[{"descripcion":"Tuerca M8","cantidad":100,"pedido":null,"oferta":null}]},{"pagina":3,"pedido":null,"oferta":"OCAC26-004443","albaran":"A-99402","esContinuacion":false,"lineas":[{"descripcion":"Arandela","cantidad":50,"pedido":null,"oferta":null}]},{"pagina":4,"pedido":null,"oferta":null,"albaran":"A/261701","esContinuacion":false,"lineas":[{"descripcion":"ENVASES","cantidad":3,"pedido":"PC 26-3776","oferta":null},{"descripcion":"AEROSOLES","cantidad":27,"pedido":null,"oferta":null},{"descripcion":"BROSSA","cantidad":17,"pedido":"PC26-3676","oferta":null}]}]`;
 
+  let textoPdf = "";
+  try {
+    const leido = await pdfParse(Buffer.from(bytesLotePdf));
+    textoPdf = String(leido?.text || "").replace(/\u0000/g, "").trim();
+  } catch { /* PDF escaneado o protegido: se lee como imagen */ }
+  const letras = (textoPdf.match(/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]/g) || []).length;
+  const porTexto = letras >= Math.max(120, numPaginasLote * 40);
+  console.log(`[recepcion/extraer] lote de ${numPaginasLote} pág. · ${porTexto ? `texto (${letras} caracteres)` : "imagen"}`);
+
+  const cierre = "Responde ÚNICAMENTE con el array JSON. Sin análisis, sin markdown y sin texto antes ni después.";
+  const content = porTexto
+    ? [{ type: "text", text: `${prompt}\n\nTEXTO DEL PDF (no inventes líneas que no estén aquí):\n${textoPdf.slice(0, 50000)}\n\n${cierre}` }]
+    : [
+        { type: "document", source: { type: "base64", media_type: "application/pdf", data: Buffer.from(bytesLotePdf).toString("base64") } },
+        { type: "text", text: `${prompt}\n\n${cierre}` },
+      ];
+
   const response = await fetchConReintento("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -3193,15 +3940,7 @@ Ejemplo: la página 1 y la 3 son del MISMO proveedor, pero son albaranes y pedid
     body: JSON.stringify({
       model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
       max_tokens: 8192,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Lote } },
-            { type: "text", text: prompt },
-          ],
-        },
-      ],
+      messages: [{ role: "user", content }],
     }),
   });
 
@@ -3428,20 +4167,69 @@ function puntuarCoincidencia(a, b) {
 // Línea de pedido tal como la pinta Recepción. El precio editable es el
 // coste directo (directUnitCost): es el campo que la API v2.0 acepta al
 // modificar la línea. unitCost sale calculado y no se escribe.
+function numCampoBC(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Campos de precio/descuento de purchaseOrderLines (API v2.0) o OData Pedido_compra_ExcelPurchLines.
+ * BC v2.0 reales (PC26-004202): discountPercent, amountExcludingTax, netAmount, directUnitCost.
+ * OData: Line_Discount_Percent / Percent_Dto_linea_1 / Line_Amount / Direct_Unit_Cost. */
+function preciosLineaPedidoBC(lb) {
+  if (!lb) return { precio: null, descuentoPct: null, importeLinea: null, precioNeto: null };
+  const precio = numCampoBC(lb.directUnitCost) ?? numCampoBC(lb.Direct_Unit_Cost);
+  const descuentoPct =
+    numCampoBC(lb.discountPercent) ??
+    numCampoBC(lb.lineDiscountPercent) ??
+    numCampoBC(lb.Line_Discount_Percent) ??
+    numCampoBC(lb.Percent_Dto_linea_1);
+  const qty = Number(lb.quantity ?? lb.Quantity) || 0;
+  // Importe línea excl. IVA ya neto en BC — no recalcular si BC lo manda.
+  let importeLinea =
+    numCampoBC(lb.amountExcludingTax) ??
+    numCampoBC(lb.netAmount) ??
+    numCampoBC(lb.Line_Amount) ??
+    numCampoBC(lb.lineAmount);
+  if (importeLinea == null && precio != null && qty && descuentoPct != null) {
+    importeLinea = Math.round(qty * precio * (1 - descuentoPct / 100) * 100) / 100;
+  }
+  const precioNeto = (precio != null && descuentoPct != null)
+    ? Math.round(precio * (1 - descuentoPct / 100) * 1000) / 1000
+    : null;
+  return { precio, descuentoPct, importeLinea, precioNeto };
+}
+
+function pendienteFacturarLineaBC(lb, recibida, facturada) {
+  if (numCampoBC(lb?.invoiceQuantity) != null) return Math.max(0, Number(lb.invoiceQuantity) || 0);
+  if (numCampoBC(lb?.Qty_to_Invoice) != null) return Math.max(0, Number(lb.Qty_to_Invoice) || 0);
+  return Math.max(0, (Number(recibida) || 0) - (Number(facturada) || 0));
+}
+
 function resumenLineaPedidoBC(lb) {
   const pedida = Number(lb.quantity) || 0;
   const recibida = Number(lb.receivedQuantity) || 0;
-  const precio = lb.directUnitCost !== undefined && lb.directUnitCost !== null && lb.directUnitCost !== ""
-    ? Number(lb.directUnitCost)
-    : null;
+  const facturada = Number(lb.invoicedQuantity ?? lb.Quantity_Invoiced) || 0;
+  const pendienteFacturar = pendienteFacturarLineaBC(lb, recibida, facturada);
+  const { precio, descuentoPct, importeLinea, precioNeto } = preciosLineaPedidoBC(lb);
   return {
     id: lb.id,
-    codigo: lb.lineObjectNumber || "",
-    descripcion: lb.description || "",
+    codigo: lb.lineObjectNumber || lb.No || "",
+    descripcion: lb.description || lb.Description || "",
     cantidadPedida: pedida,
     cantidadRecibida: recibida,
+    cantidadFacturada: facturada,
+    cantidadPendienteFacturar: pendienteFacturar,
     cantidadPendiente: Math.max(0, pedida - recibida),
     precio,
+    precioBC: precio,
+    directUnitCost: precio,
+    descuentoPct,
+    discountPercent: descuentoPct,
+    importeLinea,
+    amountExcludingTax: importeLinea,
+    netAmount: importeLinea,
+    precioNeto,
   };
 }
 
@@ -3472,6 +4260,29 @@ function emparejarLineas(lineasAlbaran, lineasBC) {
   });
 }
 
+// Departamento (dimensión 1) y OT (dimensión 2) de la cabecera del pedido.
+// La API v2.0 no trae Shortcut_Dimension_*; están en Pedido_compra_Excel.
+async function dimensionesCabeceraPedido(numero, token) {
+  try {
+    const raiz = raizODataBC();
+    const servicio = FUENTES_WS.pedidos_compra.servicio;
+    const esc = String(numero || "").replace(/'/g, "''");
+    const filtro = `Document_Type eq 'Order' and No eq '${esc}'`;
+    const url = `${raiz}/${encodeURIComponent(servicio)}?$filter=${encodeURIComponent(filtro)}&$select=Shortcut_Dimension_1_Code,Shortcut_Dimension_2_Code&$top=1`;
+    const r = await fetchConReintento(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    });
+    if (!r.ok) return { departamento: "", ot: "" };
+    const cab = ((await r.json()).value || [])[0] || {};
+    return {
+      departamento: String(cab.Shortcut_Dimension_1_Code || "").trim(),
+      ot: String(cab.Shortcut_Dimension_2_Code || "").trim(),
+    };
+  } catch {
+    return { departamento: "", ot: "" };
+  }
+}
+
 // Busca el pedido en la API estándar v2.0 y trae sus líneas de tipo
 // artículo. Solo LECTURA. Si algo falla, no lanza — devuelve {error}.
 async function buscarPedidoYLineasBC(pedido) {
@@ -3487,13 +4298,16 @@ async function buscarPedidoYLineasBC(pedido) {
     if (!cabecera) return { error: `Pedido "${pedido}" no encontrado en purchaseOrders (api/v2.0).` };
 
     const urlLineas = `${base}/companies(${EMPRESA_ID()})/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${cabecera.id}`)}`;
-    const rLineas = await fetchConReintento(urlLineas, { headers: cabeceras });
+    const [rLineas, dims] = await Promise.all([
+      fetchConReintento(urlLineas, { headers: cabeceras }),
+      dimensionesCabeceraPedido(cabecera.number || pedido, token),
+    ]);
     // vendorNumber: sin $select, así que si el campo existe en el
     // pedido ya viene en "cabecera" — nombre estándar de la API v2.0,
     // sin confirmar todavía contra este BC en concreto (a diferencia de
     // vendorName, que sí se usa ya en producción).
     const vendorNumber = cabecera.vendorNumber || cabecera.buyFromVendorNumber || null;
-    if (!rLineas.ok) return { error: `BC respondió ${rLineas.status} obteniendo las líneas del pedido.`, purchaseOrderId: cabecera.id, vendorName: cabecera.vendorName || null, vendorNumber };
+    if (!rLineas.ok) return { error: `BC respondió ${rLineas.status} obteniendo las líneas del pedido.`, purchaseOrderId: cabecera.id, vendorName: cabecera.vendorName || null, vendorNumber, departamento: dims.departamento, ot: dims.ot };
     const datosLineas = await rLineas.json();
     // TODAS las líneas del pedido, del tipo que sean (Artículo, Cargo
     // (Prod.), Cuenta contable, etc.) — antes solo se cogían las de tipo
@@ -3506,10 +4320,33 @@ async function buscarPedidoYLineasBC(pedido) {
     const lineas = (datosLineas.value || []).filter(
       (l) => l.lineType || l.description || Number(l.quantity) || l.lineObjectNumber
     );
-    return { purchaseOrderId: cabecera.id, vendorName: cabecera.vendorName || null, vendorNumber, lineasBC: lineas };
+    const totalPedido = numCampoBC(cabecera.totalAmountExcludingTax);
+    return {
+      purchaseOrderId: cabecera.id,
+      vendorName: cabecera.vendorName || null,
+      vendorNumber,
+      departamento: dims.departamento,
+      ot: dims.ot,
+      lineasBC: lineas,
+      // Base imponible del pedido en BC (tras descuentos de línea).
+      totalAmountExcludingTax: totalPedido,
+    };
   } catch (e) {
     return { error: String(e.message || e) };
   }
+}
+
+function importePedidoDesdeLineasBC(lineasBC) {
+  if (!Array.isArray(lineasBC) || !lineasBC.length) return null;
+  let sum = 0;
+  let hay = false;
+  for (const l of lineasBC) {
+    const { importeLinea } = preciosLineaPedidoBC(l);
+    if (importeLinea == null) continue;
+    hay = true;
+    sum += importeLinea;
+  }
+  return hay ? Math.round(sum * 100) / 100 : null;
 }
 
 app.get("/api/recepcion/vista.pdf", (req, res) => {
@@ -3603,6 +4440,8 @@ app.post("/api/recepcion/extraer", async (req, res) => {
         pdfBase64,
         pdfVista,
         vendorName: bc.vendorName || null,
+        departamento: bc.departamento || "",
+        ot: bc.ot || "",
         bcError: bc.error || null,
         lineasEmparejadas,
         lineasDisponiblesBC,
@@ -3616,6 +4455,142 @@ app.post("/api/recepcion/extraer", async (req, res) => {
     console.error("Error /api/recepcion/extraer:", err);
     res.status(500).json({ error: "Error extrayendo los pedidos del documento.", detalle: String(err.message || err) });
   }
+});
+
+function depsPrepararRecepcion() {
+  return {
+    obtenerTokenBC,
+    fetchConReintento,
+    empresaId: EMPRESA_ID,
+    empresaNombre: EMPRESA_NOMBRE,
+    pdfDocument: PDFDocument,
+    guardarVistaPdf: guardarVistaPdfRecepcion,
+    leerVistaPdf: leerVistaPdfRecepcion,
+    servicioPedidos: FUENTES_WS.pedidos_compra.servicio,
+    ponerOtEnLineaApi,
+    escribirOtPedidoCompra,
+    reabrirPedidoCompraSiLanzado,
+    lanzarPedidoCompra,
+    escribirAlbaranPedido: async (numero, albaran, token) => {
+      const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+      const raizWS = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+      const clave = `(Document_Type='Order',No='${String(numero).replace(/'/g, "''")}')`;
+      const r = await fetchConReintento(`${raizWS}/${encodeURIComponent(FUENTES_WS.pedidos_compra.servicio)}${clave}`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json", "If-Match": "*" },
+        body: JSON.stringify({ Vendor_Shipment_No: String(albaran) }),
+      });
+      if (r.ok) return null;
+      return `No se ha podido guardar el nº de albarán: ${(await r.text().catch(() => "")).slice(0, 160)}`;
+    },
+  };
+}
+
+// Lee un albarán, busca si el pedido de ese proveedor y esa OT ya existe
+// y propone artículo, cantidad, precio y descuento. No escribe en BC.
+app.post("/api/recepcion/preparar", async (req, res) => {
+  try {
+    const out = await prepararRecepcionAlbaran(depsPrepararRecepcion(), req.body || {});
+    res.json(out);
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("Error /api/recepcion/preparar:", err);
+    res.status(status).json({ error: err.message || "No se ha podido preparar el pedido.", detalle: status >= 500 ? String(err.message || err) : undefined });
+  }
+});
+
+// Familias del alta (GoCatalog): nivel 1, y 2/3 según la elegida arriba.
+app.get("/api/recepcion/preparar/familias", async (req, res) => {
+  try {
+    if (!acfactory.configurado()) return res.status(503).json({ error: "No puedo cargar las familias desde aquí." });
+    const nivel = Math.min(Math.max(Number(req.query.nivel) || 1, 1), 3);
+    const items = await acfactory.buscarGoCatalog({
+      nivel,
+      padre: String(req.query.padre || "").trim() || undefined,
+      abuelo: String(req.query.abuelo || "").trim() || undefined,
+      q: String(req.query.q || "").trim() || undefined,
+      top: 300,
+    }, fetchConReintento);
+    res.json({
+      items: (items || []).map((x) => ({
+        code: String(x.code || x.name || x.label || "").trim(),
+        name: String(x.name || x.label || x.code || "").trim(),
+      })).filter((x) => x.code && x.name),
+    });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("Error /api/recepcion/preparar/familias:", err);
+    res.status(status).json({ error: err.message || "No se han podido cargar las familias." });
+  }
+});
+
+// Alta de un artículo que no está en el catálogo. La línea del pedido no se escribe aquí.
+app.post("/api/recepcion/preparar/articulo", async (req, res) => {
+  try {
+    const descripcion = String(req.body?.descripcion || "").trim();
+    if (!descripcion) return res.status(400).json({ error: "Falta la descripción del artículo." });
+    const cat1 = String(req.body?.cat1 || "").trim();
+    const cat2 = String(req.body?.cat2 || "").trim();
+    const cat3 = String(req.body?.cat3 || "").trim();
+    if (!cat1 || !cat2 || !cat3) return res.status(400).json({ error: "Elige las tres familias del artículo." });
+    if (!acfactory.configurado()) return res.status(503).json({ error: "No puedo crear artículos desde aquí." });
+    const resolved = await acfactory.resolverGoCatalog({ cat1, cat2, cat3 }, fetchConReintento);
+    const u = req.usuario || {};
+    const datos = {
+      displayName: descripcion.slice(0, 100),
+      type: "Inventory",
+      baseUnitOfMeasureCode: "UD",
+      cat1: resolved.cat1,
+      cat2: resolved.cat2,
+      cat3: resolved.cat3,
+      usuario: {
+        id: u.id,
+        username: u.username,
+        nombre: u.nom_treballador || u.nombre || u.username || "desconocido",
+      },
+    };
+    const ref = String(req.body?.codigoProveedor || "").trim();
+    if (ref) datos.refFabricant = ref;
+    const imagen = String(req.body?.imagenBase64 || "");
+    if (imagen) {
+      if (!/^data:image\/(png|jpeg|jpg|webp|gif);base64,/i.test(imagen)) {
+        return res.status(400).json({ error: "La imagen del producto no es válida." });
+      }
+      if (imagen.length > 6 * 1024 * 1024) {
+        return res.status(400).json({ error: "La imagen pesa demasiado. Pega una foto más pequeña." });
+      }
+      datos.imagenBase64 = imagen;
+    }
+    const data = await acfactory.crearProducto(datos, fetchConReintento);
+    const numero = data?.number || data?.also?.number || data?.producto?.number || data?.bc?.number || "";
+    if (!numero) return res.status(502).json({ error: "El alta no ha devuelto el número del artículo." });
+    res.json({ numero, descripcion: data?.also?.displayName || data?.displayName || descripcion });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("Error /api/recepcion/preparar/articulo:", err);
+    res.status(status).json({ error: err.message || "No se ha podido crear el artículo." });
+  }
+});
+
+// Crea el pedido, o añade las líneas que faltan, solo si la usuaria confirma.
+app.post("/api/recepcion/preparar/crear", async (req, res) => {
+  try {
+    const out = await crearPedidoPreparado(depsPrepararRecepcion(), req.body || {});
+    if (out?.numero) out.enlace = enlacePedidoCompraBC(out.numero);
+    res.json(out);
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("Error /api/recepcion/preparar/crear:", err);
+    res.status(status).json({ error: err.message || "No se ha podido crear el pedido." });
+  }
+});
+
+// Abre la ficha del pedido de compra en el cliente web de BC.
+app.get("/api/recepcion/enlace-pedido", (req, res) => {
+  const n = String(req.query.n || "").trim();
+  const enlace = enlacePedidoCompraBC(n);
+  if (!enlace) return res.status(400).json({ error: "Falta el número de pedido." });
+  res.redirect(enlace);
 });
 
 function normalizarNumOferta(v) {
@@ -3718,9 +4693,139 @@ app.post("/api/recepcion/cruzar", async (req, res) => {
     const bc = await buscarPedidoYLineasBC(pedido);
     const lineasEmparejadas = bc.lineasBC ? emparejarLineas(lineasPdf, bc.lineasBC) : [];
     const lineasDisponiblesBC = (bc.lineasBC || []).map(resumenLineaPedidoBC);
-    res.json({ pedido, oferta, ofertaAviso, vendorName: bc.vendorName || null, bcError: bc.error || null, lineasEmparejadas, lineasDisponiblesBC });
+    res.json({ pedido, oferta, ofertaAviso, vendorName: bc.vendorName || null, departamento: bc.departamento || "", ot: bc.ot || "", bcError: bc.error || null, lineasEmparejadas, lineasDisponiblesBC });
   } catch (err) {
     res.status(500).json({ error: "No se pudo cruzar el pedido con BC.", detalle: String(err.message || err) });
+  }
+});
+
+// Registrar la recepción desde la tabla (sin albarán ni PDF).
+// Marca la cantidad a recibir de las líneas indicadas y ejecuta «Recibir».
+// No contabiliza la factura de compra.
+app.post("/api/recepcion/registrar", async (req, res) => {
+  const pedido = String(req.body?.pedido || "").trim();
+  if (!pedido) return res.status(400).json({ error: "Falta el Nº de pedido." });
+  const pedidas = Array.isArray(req.body?.lineas) ? req.body.lineas : null;
+  try {
+    const token = await obtenerTokenBC();
+    const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+    const esc = pedido.replace(/'/g, "''");
+    const busca = await fetchConReintento(
+      `${urlApiComprasBC()}/purchaseOrders?$filter=${encodeURIComponent(`number eq '${esc}'`)}&$top=1&$select=id,number,status,fullyReceived`,
+      { headers }
+    );
+    if (!busca.ok) {
+      const detalle = (await busca.text().catch(() => "")).slice(0, 300);
+      return res.status(502).json({ error: `BC respondió ${busca.status} al buscar el pedido.`, detalle });
+    }
+    const cab = ((await busca.json()).value || [])[0];
+    if (!cab?.id) return res.status(404).json({ error: `Pedido ${pedido} no encontrado en Business Central.` });
+    if (cab.fullyReceived) return res.status(409).json({ error: "El pedido ya está recibido entero." });
+
+    // En API v2 a veces sale "Draft" aunque en Pedido_compra_Excel el Status
+    // sea Released. La acción Microsoft.NAV.release no está publicada (404).
+    // Si la ficha ya está lanzada, o si release no existe, se continúa.
+    const estado = String(cab.status || "");
+    let estadoFicha = "";
+    try {
+      const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+      const raizWS = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+      const clave = `(Document_Type='Order',No='${pedido.replace(/'/g, "''")}')`;
+      const rSt = await fetchConReintento(`${raizWS}/${encodeURIComponent(FUENTES_WS.pedidos_compra.servicio)}${clave}?$select=Status`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      });
+      if (rSt.ok) estadoFicha = String((await rSt.json()).Status || "");
+    } catch { /* se usa solo el de la API */ }
+    const yaLanzado = /^released$/i.test(estado) || /^released$/i.test(estadoFicha);
+    if (!yaLanzado && /^draft$|^in review$/i.test(estado)) {
+      const rel = await accionPedidoEnCualquierApi(cab.id, "release", token);
+      if (!rel.ok && !/already|ya.*lanzad|released/i.test(String(rel.texto || ""))) {
+        if (!esAccionAusente(rel.status, rel.texto)) {
+          return res.status(502).json({ error: `El pedido está abierto y no se ha podido lanzar antes de recibir. ${textoErrorBC(rel.texto)}` });
+        }
+        console.warn(`[recepcion/registrar] ${pedido}: release no disponible (API ${rel.status}, ficha=${estadoFicha || "—"}); se continúa.`);
+      }
+    }
+
+    const rLin = await fetchConReintento(
+      `${urlApiComprasBC()}/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${cab.id}`)}&$select=id,sequence,lineType,lineObjectNumber,description,quantity,receivedQuantity,receiveQuantity`,
+      { headers }
+    );
+    if (!rLin.ok) {
+      const detalle = (await rLin.text().catch(() => "")).slice(0, 300);
+      return res.status(502).json({ error: `BC respondió ${rLin.status} al leer las líneas.`, detalle });
+    }
+    const bcLineas = (await rLin.json()).value || [];
+    const porSeq = new Map();
+    if (pedidas) {
+      for (const l of pedidas) {
+        const seq = Number(l.lineNo);
+        const cant = Number(l.cantidad);
+        if (!Number.isFinite(seq) || !(cant > 0)) continue;
+        porSeq.set(seq, (porSeq.get(seq) || 0) + cant);
+      }
+    }
+
+    const patchHeaders = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" };
+    let reabierto = false;
+    const aplicadas = [];
+    for (const l of bcLineas) {
+      const qty = Number(l.quantity) || 0;
+      const rec = Number(l.receivedQuantity) || 0;
+      const pend = Math.max(0, Math.round((qty - rec) * 1000) / 1000);
+      const esMaterial = /item|charge/i.test(String(l.lineType || ""));
+      let querer = 0;
+      if (pedidas) {
+        if (porSeq.has(Number(l.sequence))) querer = Math.min(porSeq.get(Number(l.sequence)), pend);
+      } else if (pend > 0 && esMaterial) {
+        querer = pend;
+      }
+      if (Number(l.receiveQuantity) !== querer) {
+        const urlLinea = `${urlApiComprasBC()}/purchaseOrderLines(${l.id})`;
+        const cuerpo = JSON.stringify({ receiveQuantity: querer });
+        let rP = await fetchConReintento(urlLinea, { method: "PATCH", headers: patchHeaders, body: cuerpo });
+        let detalleFallo = rP.ok ? "" : await rP.text().catch(() => "");
+        if (!rP.ok && /Status must be equal to 'Open'/i.test(detalleFallo) && !reabierto) {
+          const re = await reabrirPedidoCompra(cab.id, token);
+          if (!re.ok) return res.status(502).json({ error: re.error });
+          reabierto = true;
+          rP = await fetchConReintento(urlLinea, { method: "PATCH", headers: patchHeaders, body: cuerpo });
+          detalleFallo = rP.ok ? "" : await rP.text().catch(() => "");
+        }
+        if (!rP.ok) {
+          return res.status(502).json({ error: `No se ha podido marcar la cantidad a recibir de la línea ${l.sequence}. ${textoErrorBC(detalleFallo)}` });
+        }
+      }
+      if (querer > 0) {
+        aplicadas.push({
+          lineNo: l.sequence,
+          articulo: l.lineObjectNumber || "",
+          descripcion: l.description || "",
+          cantidad: querer,
+        });
+      }
+    }
+    if (!aplicadas.length) return res.status(400).json({ error: "No hay cantidad pendiente que registrar en este pedido." });
+
+    if (reabierto) {
+      const rel = await lanzarPedidoCompra(cab.id, token);
+      if (!rel.ok) return res.status(502).json({ error: rel.error });
+    }
+
+    const recibo = await registrarRecepcionPorApi(cab.id, token, pedido);
+    if (!recibo.ok) {
+      const fb = await registrarPedidoPorServicio(pedido);
+      if (!fb.ok) {
+        return res.status(502).json({
+          error: `No se ha registrado la recepción. ${textoErrorBC(recibo.texto) || recibo.hint || ""} ${fb.error || ""}`.trim(),
+        });
+      }
+    }
+    console.log(`[recepcion/registrar] OK ${pedido} · ${aplicadas.map((l) => `${l.articulo || l.lineNo}:${l.cantidad}`).join(", ")}`);
+    res.json({ ok: true, pedido, lineas: aplicadas, via: recibo.ok ? (recibo.viaApi || "api") : "playwright" });
+  } catch (err) {
+    console.error("Error /api/recepcion/registrar:", err);
+    res.status(500).json({ error: "No se pudo registrar la recepción.", detalle: String(err.message || err) });
   }
 });
 
@@ -3922,14 +5027,32 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
       resultado.adjunto.error = "Sin PDF que adjuntar.";
     }
 
-    // 2b) LÍNEAS NUEVAS (cargos/material) — se crean ANTES de registrar
+    // 2b) LÍNEAS NUEVAS (cargos/material) — se crean ANTES de registrar.
+    // Si el PC está Released, se reabre (Open) igual que en ajustes / recepcionPreparar.
     resultado.nuevasLineas = [];
     let fallaNuevaLinea = false;
+    let pedidoReabierto = false;
     if (Array.isArray(nuevasLineas) && nuevasLineas.length) {
       if (!purchaseOrderId) {
         for (const nl of nuevasLineas) resultado.nuevasLineas.push({ codigo: nl.codigo, ok: false, error: "Pedido no localizado en purchaseOrders (api/v2.0)." });
         fallaNuevaLinea = true;
       } else {
+        const prepNl = await reabrirPedidoCompraSiLanzado(purchaseOrderId, token);
+        if (!prepNl.ok) {
+          fallaNuevaLinea = true;
+          for (const nl of nuevasLineas) {
+            resultado.nuevasLineas.push({
+              codigo: nl.codigo,
+              descripcion: nl.descripcion,
+              ok: false,
+              error: prepNl.error || "El pedido está lanzado y no se ha podido reabrir para añadir líneas.",
+            });
+          }
+        } else {
+          if (prepNl.reabierto) {
+            pedidoReabierto = true;
+            resultado.reabierto = true;
+          }
         const urlLineasApi = `${base}/companies(${EMPRESA_ID()})/purchaseOrderLines`;
         let ref = null;
         try {
@@ -3958,13 +5081,23 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
             for (const tipo of tipos) {
               const body = { documentId: purchaseOrderId, lineType: tipo, lineObjectNumber: String(nl.codigo).trim(), quantity: cantidad };
               if (!Number.isNaN(coste) && nl.coste !== null && nl.coste !== "") body.directUnitCost = coste;
-              const r = await fetchConReintento(urlLineasApi, { method: "POST", headers: { ...cabeceras, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+              let r = await fetchConReintento(urlLineasApi, { method: "POST", headers: { ...cabeceras, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+              let txt = "";
               if (r.ok) { creada = await r.json(); break; }
-              const txt = (await r.text().catch(() => "")).slice(0, 300);
+              txt = (await r.text().catch(() => "")).slice(0, 300);
+              if (/Status must be equal to 'Open'/i.test(txt) && !pedidoReabierto) {
+                const re = await reabrirPedidoCompra(purchaseOrderId, token);
+                if (!re.ok) throw new Error(re.error);
+                pedidoReabierto = true;
+                resultado.reabierto = true;
+                r = await fetchConReintento(urlLineasApi, { method: "POST", headers: { ...cabeceras, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+                if (r.ok) { creada = await r.json(); break; }
+                txt = (await r.text().catch(() => "")).slice(0, 300);
+              }
               if (!ultimoErr) ultimoErr = `BC respondió ${r.status}: ${txt}`;
               if (!/InvalidOptionEnumValue|is not an option/i.test(txt)) break;
             }
-            if (!creada) throw new Error(ultimoErr);
+            if (!creada) throw new Error(mensajeSiPedidoLanzado(ultimoErr));
             info.lineaId = creada.id;
             const parche = { receiveQuantity: cantidad };
             const dto = Number(nl.dto);
@@ -4015,6 +5148,7 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
           }
           resultado.nuevasLineas.push(info);
         }
+        }
       }
     }
 
@@ -4026,7 +5160,6 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
     const ajustes = Array.isArray(req.body?.ajustesPedido) ? req.body.ajustesPedido : [];
     resultado.ajustesPedido = [];
     let fallaAjuste = false;
-    let pedidoReabierto = false;
     if (ajustes.length && !purchaseOrderId) {
       fallaAjuste = true;
       for (const a of ajustes) resultado.ajustesPedido.push({ lineaId: a?.lineaId || null, ok: false, error: "Pedido no localizado en purchaseOrders (api/v2.0)." });
@@ -4036,8 +5169,10 @@ app.post("/api/recepcion/subir-bc", async (req, res) => {
         fallaAjuste = true;
         for (const a of ajustes) resultado.ajustesPedido.push({ lineaId: a?.lineaId || null, ok: false, error: prep.error });
       } else {
-        pedidoReabierto = !!prep.reabierto;
-        if (pedidoReabierto) resultado.reabierto = true;
+        if (prep.reabierto) {
+          pedidoReabierto = true;
+          resultado.reabierto = true;
+        }
       for (const a of ajustes) {
         const lineaId = String(a?.lineaId || "").trim();
         const info = { lineaId, ok: false };
@@ -4296,6 +5431,30 @@ function jsonDeRespuestaIA(texto) {
   return null;
 }
 
+// Facturas densas (p. ej. Saltoki) generan JSON muy largo: si un lote
+// no cabe en la respuesta de la IA, se parte en dos mitades y se reintenta.
+async function extraerLoteFacturaPartido(bytesLotePdf, numPaginasLote) {
+  if (!PDFDocument || numPaginasLote < 2) {
+    throw new Error("No se pudo partir el lote de factura para releerlo.");
+  }
+  const src = await PDFDocument.load(bytesLotePdf, { ignoreEncryption: true });
+  const mitad = Math.ceil(numPaginasLote / 2);
+  const gruposIndices = [
+    Array.from({ length: mitad }, (_, i) => i),
+    Array.from({ length: numPaginasLote - mitad }, (_, i) => i + mitad),
+  ];
+  const out = [];
+  for (const indices of gruposIndices) {
+    if (!indices.length) continue;
+    const lotePdf = await PDFDocument.create();
+    const copiadas = await lotePdf.copyPages(src, indices);
+    copiadas.forEach((p) => lotePdf.addPage(p));
+    const bytes = await lotePdf.save();
+    out.push(...(await extraerLoteFacturaPDF(bytes, indices.length)));
+  }
+  return out;
+}
+
 async function extraerLoteFacturaPDF(bytesLotePdf, numPaginasLote) {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error("Falta ANTHROPIC_API_KEY en .env.");
@@ -4348,7 +5507,8 @@ El resultado es un array JSON de ${numPaginasLote} objetos, en orden. Aunque el 
       },
       body: JSON.stringify({
         model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
-        max_tokens: 4096,
+        // Facturas densas (Saltoki): hace falta mucho espacio de salida.
+        max_tokens: 32000,
         messages,
       }),
       signal: AbortSignal.timeout(180_000),
@@ -4358,24 +5518,18 @@ El resultado es un array JSON de ${numPaginasLote} objetos, en orden. Aunque el 
       throw new Error(`Anthropic respondió ${response.status}: ${detalle.slice(0, 300)}`);
     }
     const data = await response.json();
-    return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+    return {
+      texto: (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n"),
+      stopReason: data.stop_reason || null,
+    };
   };
 
-  let texto = await pedir([{ role: "user", content }]);
-  let parseado = jsonDeRespuestaIA(texto);
-  if (!parseado) {
-    console.warn(`[facturas-compra/extraer] la IA respondió en texto, se pide el JSON otra vez: ${texto.slice(0, 180)}`);
-    texto = await pedir([
-      { role: "user", content },
-      { role: "assistant", content: texto.slice(0, 12000) },
-      { role: "user", content: "Eso no vale. Devuelve solo el array JSON con pagina, factura, proveedor, fecha, baseImponible, importeTotal y lineas. Sin explicación." },
-    ]);
-    parseado = jsonDeRespuestaIA(texto);
-  }
-  if (!parseado) {
-    throw new Error(`No se pudo interpretar la respuesta de la IA para este lote: ${String(texto).replace(/```json|```/g, "").trim().slice(0, 200)}`);
-  }
-  return (Array.isArray(parseado) ? parseado : []).map((item) => ({
+  const pareceJsonCortado = (t) => {
+    const s = String(t || "").replace(/```json|```/g, "").trim();
+    return s.startsWith("[") && !s.endsWith("]");
+  };
+
+  const normalizarPaginasFactura = (parseado) => (Array.isArray(parseado) ? parseado : []).map((item) => ({
     pagina: item.pagina,
     factura: item.factura ? item.factura.toString().trim() : null,
     proveedor: item.proveedor ? item.proveedor.toString().trim() : null,
@@ -4393,6 +5547,56 @@ El resultado es un array JSON de ${numPaginasLote} objetos, en orden. Aunque el 
           .filter((l) => l.descripcion)
       : [],
   }));
+
+  const pedirCompacto = async () => {
+    console.warn(`[facturas-compra/extraer] página densa: reintento con descripciones cortas (${numPaginasLote} pág.)`);
+    const contentCompacto = [
+      ...content,
+      {
+        type: "text",
+        text: "IMPORTANTE: en cada línea, \"descripcion\" máximo 60 caracteres. No omitas líneas. Solo el array JSON.",
+      },
+    ];
+    const r = await pedir([{ role: "user", content: contentCompacto }]);
+    return jsonDeRespuestaIA(r.texto);
+  };
+
+  const partirSiSePuede = async (motivo, texto) => {
+    if (numPaginasLote > 1) {
+      console.warn(`[facturas-compra/extraer] ${motivo}; se parte el lote de ${numPaginasLote} pág. en dos`);
+      return extraerLoteFacturaPartido(bytesLotePdf, numPaginasLote);
+    }
+    const compacto = await pedirCompacto();
+    if (compacto) return normalizarPaginasFactura(compacto);
+    throw new Error(`No se pudo interpretar la respuesta de la IA para este lote: ${String(texto).replace(/```json|```/g, "").trim().slice(0, 200)}`);
+  };
+
+  let { texto, stopReason } = await pedir([{ role: "user", content }]);
+  console.log(`[facturas-compra/extraer] lote ${numPaginasLote} pág. · stop_reason=${stopReason || "?"} · chars=${String(texto || "").length}`);
+  let parseado = jsonDeRespuestaIA(texto);
+  // JSON a medias (típico Saltoki): partir ya, sin gastar otro intento en prosa.
+  if (!parseado && (stopReason === "max_tokens" || pareceJsonCortado(texto))) {
+    return partirSiSePuede(
+      stopReason === "max_tokens" ? "respuesta cortada por límite de tokens" : "JSON cortado a medias",
+      texto
+    );
+  }
+  if (!parseado) {
+    console.warn(`[facturas-compra/extraer] la IA respondió en texto, se pide el JSON otra vez: ${texto.slice(0, 180)}`);
+    ({ texto, stopReason } = await pedir([
+      { role: "user", content },
+      { role: "assistant", content: texto.slice(0, 12000) },
+      { role: "user", content: "Eso no vale. Devuelve solo el array JSON con pagina, factura, proveedor, fecha, baseImponible, importeTotal y lineas. Sin explicación." },
+    ]));
+    parseado = jsonDeRespuestaIA(texto);
+  }
+  if (!parseado) {
+    return partirSiSePuede(
+      stopReason === "max_tokens" || pareceJsonCortado(texto) ? "respuesta cortada por límite de tokens" : "JSON no interpretable",
+      texto
+    );
+  }
+  return normalizarPaginasFactura(parseado);
 }
 
 // Agrupa páginas consecutivas de la MISMA factura (una factura puede
@@ -4457,14 +5661,161 @@ function precioDifiere(precioFactura, precioBC) {
 // mano en pantalla (desplegable de "Validación de facturas"). Compartido
 // entre /extraer y /refrescar-pedido para no tener el mapeo duplicado.
 function lineasDisponiblesDesdeBC(lineasBC) {
-  return (lineasBC || []).map((lb) => ({
-    id: lb.id,
-    codigo: lb.lineObjectNumber || "",
-    descripcion: lb.description || "",
-    cantidadPedida: Number(lb.quantity) || 0,
-    cantidadRecibida: Number(lb.receivedQuantity) || 0,
-    precioBC: lb.directUnitCost !== undefined && lb.directUnitCost !== null ? Number(lb.directUnitCost) : null,
-  }));
+  return (lineasBC || []).map((lb) => {
+    const pedida = Number(lb.quantity ?? lb.Quantity) || 0;
+    const recibida = Number(lb.receivedQuantity ?? lb.Quantity_Received) || 0;
+    const facturada = Number(lb.invoicedQuantity ?? lb.Quantity_Invoiced) || 0;
+    const pendienteFacturar = pendienteFacturarLineaBC(lb, recibida, facturada);
+    const { precio, descuentoPct, importeLinea, precioNeto } = preciosLineaPedidoBC(lb);
+    return {
+      id: lb.id,
+      codigo: lb.lineObjectNumber || lb.No || "",
+      descripcion: lb.description || lb.Description || "",
+      cantidadPedida: pedida,
+      cantidadRecibida: recibida,
+      cantidadFacturada: facturada,
+      cantidadPendienteFacturar: pendienteFacturar,
+      precioBC: precio,
+      precio: precio,
+      directUnitCost: precio,
+      // Exactos de BC (0 es válido; no omitir).
+      descuentoPct,
+      discountPercent: descuentoPct,
+      importeLinea,
+      amountExcludingTax: importeLinea,
+      netAmount: importeLinea,
+      precioNeto,
+    };
+  });
+}
+
+/**
+ * Fusiona línea de albarán (qty) con línea del PC (precio / % dto / importe).
+ * Los purchaseReceiptLines suelen traer unitCost 0 o incompleto; el pedido sí tiene
+ * directUnitCost, discountPercent y amountExcludingTax.
+ */
+function fusionarLineaAlbaranConPedido(lineaAlb, lineasPedido) {
+  const codigo = String(lineaAlb?.codigo || "").trim().toUpperCase();
+  const desc = String(lineaAlb?.descripcion || "").trim().toUpperCase();
+  const lista = Array.isArray(lineasPedido) ? lineasPedido : [];
+  let po = null;
+  if (codigo) po = lista.find((p) => String(p.codigo || "").trim().toUpperCase() === codigo) || null;
+  if (!po && desc) {
+    po = lista.find((p) => String(p.descripcion || "").trim().toUpperCase() === desc) || null;
+  }
+  if (!po && desc) {
+    let mejor = null;
+    let mejorPunt = 0;
+    for (const p of lista) {
+      const punt = Math.max(
+        puntuarCoincidencia(lineaAlb.descripcion, p.descripcion),
+        puntuarCoincidencia(lineaAlb.descripcion, p.codigo)
+      );
+      if (punt > mejorPunt) {
+        mejorPunt = punt;
+        mejor = p;
+      }
+    }
+    if (mejor && mejorPunt >= 0.35) po = mejor;
+  }
+
+  const qty = Number(lineaAlb.cantidad) || 0;
+  const precioAlb = numCampoBC(lineaAlb.precioBC) ?? numCampoBC(lineaAlb.precio);
+  const precioPo = po ? (numCampoBC(po.precioBC) ?? numCampoBC(po.precio) ?? numCampoBC(po.directUnitCost)) : null;
+  const precio = (precioPo != null && precioPo !== 0) || precioAlb == null || precioAlb === 0
+    ? (precioPo ?? precioAlb)
+    : precioAlb;
+  const descuentoPct = po && po.descuentoPct != null && po.descuentoPct !== ""
+    ? Number(po.descuentoPct)
+    : (numCampoBC(lineaAlb.descuentoPct) ?? numCampoBC(lineaAlb.discountPercent));
+
+  const pedidaPo = po ? (Number(po.cantidadPedida) || 0) : 0;
+  const importePo = po
+    ? (numCampoBC(po.importeLinea) ?? numCampoBC(po.amountExcludingTax) ?? numCampoBC(po.netAmount))
+    : null;
+  let importeLinea = null;
+  if (importePo != null && pedidaPo > 0.0001 && qty > 0) {
+    // Proporcional al importe neto del pedido (respeta dto de BC).
+    importeLinea = Math.round((qty / pedidaPo) * Number(importePo) * 100) / 100;
+  } else if (precio != null && qty > 0) {
+    const factor = descuentoPct != null && Number.isFinite(Number(descuentoPct))
+      ? (1 - Number(descuentoPct) / 100)
+      : 1;
+    importeLinea = Math.round(qty * Number(precio) * factor * 100) / 100;
+  } else {
+    importeLinea = numCampoBC(lineaAlb.importeLinea) ?? numCampoBC(lineaAlb.amountExcludingTax);
+  }
+
+  return {
+    ...lineaAlb,
+    cantidad: qty,
+    precioBC: precio,
+    precio,
+    descuentoPct: descuentoPct != null && Number.isFinite(Number(descuentoPct)) ? Number(descuentoPct) : null,
+    discountPercent: descuentoPct != null && Number.isFinite(Number(descuentoPct)) ? Number(descuentoPct) : null,
+    importeLinea,
+    amountExcludingTax: importeLinea,
+    lineaPedidoId: po?.id || null,
+    codigoPedido: po?.codigo || lineaAlb.codigo || "",
+    preciosDesdePedido: !!po,
+  };
+}
+
+/** Albaranes ya registrados + líneas con qty > 0, precios fusionados del PC. */
+async function albaranesConLineasDePedido(pedido, lineasPedido = []) {
+  const numero = String(pedido || "").trim();
+  if (!numero) return [];
+  try {
+    const token = await obtenerTokenBC();
+    const cabeceras = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const esc = numero.replace(/'/g, "''");
+    const rRec = await fetchConReintento(
+      `${base}/purchaseReceipts?$filter=${encodeURIComponent(`orderNumber eq '${esc}'`)}&$select=id,number,postingDate,orderNumber`,
+      { headers: cabeceras }
+    );
+    if (!rRec.ok) return [];
+    const recs = (await rRec.json()).value || [];
+    const out = [];
+    for (const rec of recs) {
+      if (!rec?.id) continue;
+      const rLin = await fetchConReintento(
+        `${base}/purchaseReceiptLines?$filter=${encodeURIComponent(`documentId eq ${rec.id}`)}`,
+        { headers: cabeceras }
+      );
+      const raw = rLin.ok ? ((await rLin.json()).value || []) : [];
+      const lineas = raw
+        .map((l) => {
+          const qty = Number(l.quantity) || 0;
+          if (qty <= 0.0001) return null;
+          const bruto = {
+            id: l.id,
+            codigo: l.lineObjectNumber || "",
+            descripcion: l.description || "",
+            cantidad: qty,
+            precioBC: numCampoBC(l.unitCost) ?? numCampoBC(l.directUnitCost),
+            precio: numCampoBC(l.unitCost) ?? numCampoBC(l.directUnitCost),
+            descuentoPct: numCampoBC(l.discountPercent),
+            discountPercent: numCampoBC(l.discountPercent),
+            importeLinea: numCampoBC(l.amountExcludingTax) ?? numCampoBC(l.netAmount),
+            lineType: l.lineType || "Item",
+            unitOfMeasureCode: l.unitOfMeasureCode || null,
+          };
+          return fusionarLineaAlbaranConPedido(bruto, lineasPedido);
+        })
+        .filter(Boolean);
+      if (!lineas.length) continue;
+      out.push({
+        numero: rec.number || "",
+        fecha: rec.postingDate || "",
+        id: rec.id,
+        lineas,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 function emparejarLineasFactura(lineasFactura, lineasBC) {
@@ -4491,7 +5842,8 @@ function emparejarLineasFactura(lineasFactura, lineasBC) {
     if (mejor && (manual || mejorPunt >= 0.35)) usadas.add(mejor.id);
 
     const cantidadRecibida = mejor ? Number(mejor.receivedQuantity) || 0 : 0;
-    const precioBC = mejor && mejor.directUnitCost !== undefined && mejor.directUnitCost !== null ? Number(mejor.directUnitCost) : null;
+    const precios = mejor ? preciosLineaPedidoBC(mejor) : null;
+    const precioBC = precios ? precios.precio : null;
     const pendienteRecepcion = mejor ? cantidadRecibida < (Number(lf.cantidad) || 0) - 0.001 : true;
     const diferenciaPrecio = mejor ? precioDifiere(lf.precioUnitario, precioBC) : null;
 
@@ -4507,6 +5859,13 @@ function emparejarLineasFactura(lineasFactura, lineasBC) {
             cantidadPedida: Number(mejor.quantity) || 0,
             cantidadRecibida,
             precioBC,
+            directUnitCost: precioBC,
+            descuentoPct: precios.descuentoPct,
+            discountPercent: precios.descuentoPct,
+            importeLinea: precios.importeLinea,
+            amountExcludingTax: precios.importeLinea,
+            netAmount: precios.importeLinea,
+            precioNeto: precios.precioNeto,
             // Tipo real de la línea en BC ("Item", "Charge (Item)"...) —
             // hace falta para crear la línea de factura con el MISMO tipo;
             // si se fuerza siempre a "Item" (como se hacía antes), BC
@@ -4573,6 +5932,10 @@ const CANDIDATOS_HISTORICO_FACTURAS_COMPRA = [
 
 const HISTORICO_FACTURAS_COMPRA_TTL_MS = 3 * 60 * 1000; // 3 min
 let historicoFacturasCompraCache = null; // { servicio, campoFactura, campoNumero, campoProveedor, filas, cargadoEn }
+let historicoFacturasCompraFallidoHasta = 0; // no reintentar servicios OData muertos en bucle
+const odataServiciosFacturaMuertos = new Set(); // "servicio|campo" o "servicio" con 404 reciente
+const PURCHASE_INVOICES_IDX_TTL_MS = 3 * 60 * 1000;
+let purchaseInvoicesIdxCache = null; // { cargadoEn, porVendorInvoice: Map }
 
 async function cargarTodasLasFilas(url, cabeceras) {
   const filas = [];
@@ -4587,9 +5950,51 @@ async function cargarTodasLasFilas(url, cabeceras) {
   return { filas };
 }
 
+async function obtenerIndicePurchaseInvoices() {
+  if (purchaseInvoicesIdxCache && Date.now() - purchaseInvoicesIdxCache.cargadoEn < PURCHASE_INVOICES_IDX_TTL_MS) {
+    return purchaseInvoicesIdxCache;
+  }
+  const token = await obtenerTokenBC();
+  const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+  const api = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+  const porVendorInvoice = new Map();
+  let next = `${api}/purchaseInvoices?$select=number,vendorName,vendorInvoiceNumber,status&$top=200`;
+  let paginas = 0;
+  while (next && paginas < 50) {
+    const r = await fetchConReintento(next, { headers });
+    if (!r.ok) {
+      console.warn(`[facturas-compra/duplicados] purchaseInvoices índice HTTP ${r.status}`);
+      break;
+    }
+    const pagina = await r.json();
+    for (const fila of pagina.value || []) {
+      const key = String(fila.vendorInvoiceNumber || "").trim().toUpperCase();
+      if (!key) continue;
+      const hit = resultadoFacturaYaEntrada({
+        numeroBC: fila.number,
+        proveedor: fila.vendorName,
+        status: fila.status,
+        fuente: "api",
+      });
+      const prev = porVendorInvoice.get(key);
+      if (!prev || (prev.estado !== "registrada" && hit.estado === "registrada")) {
+        porVendorInvoice.set(key, hit);
+      }
+    }
+    next = pagina["@odata.nextLink"] || null;
+    paginas += 1;
+  }
+  purchaseInvoicesIdxCache = { cargadoEn: Date.now(), porVendorInvoice, filas: porVendorInvoice.size };
+  console.log(`[facturas-compra/duplicados] Índice purchaseInvoices: ${porVendorInvoice.size} nº proveedor (Open/Draft/Paid en API)`);
+  return purchaseInvoicesIdxCache;
+}
+
 async function obtenerHistoricoFacturasCompra(raiz, cabeceras) {
   if (historicoFacturasCompraCache && Date.now() - historicoFacturasCompraCache.cargadoEn < HISTORICO_FACTURAS_COMPRA_TTL_MS) {
     return historicoFacturasCompraCache;
+  }
+  if (Date.now() < historicoFacturasCompraFallidoHasta) {
+    return null;
   }
 
   const probar = async (servicio) => {
@@ -4650,56 +6055,150 @@ async function obtenerHistoricoFacturasCompra(raiz, cabeceras) {
     console.warn("[facturas-compra/duplicados] Descubrimiento en el catálogo falló:", String(e.message || e));
   }
 
+  // Sin servicio usable (p. ej. solo líneas sin Vendor Invoice No.): no
+  // martillar OData en cada factura del lote — reintentar en 15 min.
+  historicoFacturasCompraFallidoHasta = Date.now() + 15 * 60 * 1000;
+  console.warn("[facturas-compra/duplicados] Histórico OData no usable; se omite 15 min (API purchaseInvoices sigue activa).");
   return null;
 }
 
+// API v2 BC: Draft/In Review = borrador; Open/Paid = ya registrada
+// (Open = contabilizada pendiente de pago). Serie PFC* = borrador; FC* =
+// histórico aunque status sea Open.
+function estadoDocumentoCompraBC({ numeroBC, status, fuente }) {
+  const n = String(numeroBC || "").trim().toUpperCase();
+  const st = String(status || "").trim().toLowerCase();
+  if (/^PFC\b/.test(n)) return "borrador";
+  if (/^FC\b/.test(n)) return "registrada";
+  if (facturaCompraEnBorrador(status) || /^(draft|in review)$/.test(st) || /borrador|en revisi[oó]n/.test(st)) {
+    return "borrador";
+  }
+  if (fuente === "historico") return "registrada";
+  if (/^(open|paid|canceled|cancelled|corrective)$/.test(st)) return "registrada";
+  if (/pagad|cancel|correctiv/.test(st)) return "registrada";
+  return fuente === "api" ? "borrador" : "registrada";
+}
+
+function resultadoFacturaYaEntrada({ numeroBC, proveedor, status, fuente }) {
+  const estado = estadoDocumentoCompraBC({ numeroBC, status, fuente });
+  return {
+    encontrada: true,
+    numeroBC: numeroBC || null,
+    proveedor: proveedor || null,
+    status: status || null,
+    estado,
+    borrador: estado === "borrador",
+  };
+}
+
+function elegirMejorMatchFactura(candidatos, proveedorHint) {
+  const lista = (candidatos || []).filter((c) => c?.encontrada);
+  if (!lista.length) return null;
+  if (proveedorHint) {
+    const conProv = lista.filter((c) => c.proveedor && proveedoresParecidos(proveedorHint, c.proveedor));
+    if (conProv.length) {
+      const reg = conProv.find((c) => c.estado === "registrada");
+      return reg || conProv[0];
+    }
+  }
+  return lista.find((c) => c.estado === "registrada") || lista[0];
+}
+
+// Devuelve el match o null. Prioriza API v2 purchaseInvoices (FC* Open =
+// ya registrada; PFC* = borrador). OData histórico solo si hay servicio
+// vivo — los 404 se cachean para no bloquear el lote de la bandeja.
 async function facturaYaEntradaRapida(vendorInvoiceNumber) {
-  const seguro = String(vendorInvoiceNumber || "").trim().replace(/'/g, "''");
-  if (!seguro) return { encontrada: false };
+  const original = String(vendorInvoiceNumber || "").trim();
+  const seguro = original.replace(/'/g, "''");
+  if (!seguro) return null;
   const token = await obtenerTokenBC();
   const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
   const api = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+  const hits = [];
   try {
-    const r = await fetchConReintento(`${api}/purchaseInvoices?$filter=vendorInvoiceNumber eq '${seguro}'&$top=1&$select=number,vendorName,vendorInvoiceNumber`, { headers });
-    if (r.ok) {
-      const fila = ((await r.json()).value || [])[0];
-      if (fila) return { encontrada: true, numeroBC: fila.number || null, proveedor: fila.vendorName || null };
-    }
-  } catch { /* se prueba el histórico publicado */ }
+    const idx = await obtenerIndicePurchaseInvoices();
+    const delIdx = idx?.porVendorInvoice?.get(original.toUpperCase());
+    if (delIdx?.encontrada) hits.push(delIdx);
+  } catch { /* filtro puntual abajo */ }
+  if (!hits.length) {
+    try {
+      const filtro = encodeURIComponent(`vendorInvoiceNumber eq '${seguro}'`);
+      const r = await fetchConReintento(
+        `${api}/purchaseInvoices?$filter=${filtro}&$top=5&$select=number,vendorName,vendorInvoiceNumber,status`,
+        { headers }
+      );
+      if (r.ok) {
+        for (const fila of (await r.json()).value || []) {
+          if (String(fila.vendorInvoiceNumber || "").trim().toUpperCase() !== original.toUpperCase()) continue;
+          hits.push(resultadoFacturaYaEntrada({
+            numeroBC: fila.number,
+            proveedor: fila.vendorName,
+            status: fila.status,
+            fuente: "api",
+          }));
+        }
+      }
+    } catch { /* se prueba el histórico publicado */ }
+  }
+  if (hits.some((h) => h.estado === "registrada")) return elegirMejorMatchFactura(hits);
+  if (Date.now() < historicoFacturasCompraFallidoHasta) return elegirMejorMatchFactura(hits);
+
   const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
   const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
-  const servicios = ["Hist_facturas_compra_Excel", "Purchase_Invoice_Header_Excel", "Purch_Inv_Header_Excel"];
-  let algunaLista = false;
+  const servicios = [
+    "Hist_facturas_compra_Excel",
+    "Hist_fras_compra_Excel",
+    "Purch_Inv_Header_Excel",
+    "Purchase_Invoice_Header_Excel",
+  ];
+  const camposFactura = ["Vendor_Invoice_No", "Vendor_Invoice_No_", "VendorInvoiceNo", "Vendor_Invoice_Number"];
   for (const servicio of servicios) {
-    for (const campo of ["Vendor_Invoice_No", "Vendor_Invoice_No_"]) {
+    if (odataServiciosFacturaMuertos.has(servicio)) continue;
+    for (const campo of camposFactura) {
+      const clave = `${servicio}|${campo}`;
+      if (odataServiciosFacturaMuertos.has(clave)) continue;
       try {
-        const url = `${raiz}/${encodeURIComponent(servicio)}?$filter=${campo} eq '${seguro}'&$top=1`;
+        const filtro = encodeURIComponent(`${campo} eq '${seguro}'`);
+        const url = `${raiz}/${encodeURIComponent(servicio)}?$filter=${filtro}&$top=5`;
         const r = await fetchConReintento(url, { headers });
-        if (!r.ok) continue;
-        algunaLista = true;
-        const fila = ((await r.json()).value || [])[0];
-        if (fila) {
-          return {
-            encontrada: true,
-            numeroBC: fila.No || fila.Document_No || null,
-            proveedor: fila.Buy_from_Vendor_Name || fila.Vendor_Name || null,
-          };
+        if (!r.ok) {
+          if (r.status === 404) odataServiciosFacturaMuertos.add(servicio);
+          else odataServiciosFacturaMuertos.add(clave);
+          continue;
         }
-      } catch { /* siguiente columna */ }
+        for (const fila of (await r.json()).value || []) {
+          const numProv = fila[campo] || fila.Vendor_Invoice_No || fila.Vendor_Invoice_No_;
+          if (String(numProv || "").trim().toUpperCase() !== original.toUpperCase()) continue;
+          hits.push(resultadoFacturaYaEntrada({
+            numeroBC: fila.No || fila.No_ || fila.Document_No || fila.Document_No_ || null,
+            proveedor: fila.Buy_from_Vendor_Name || fila.Vendor_Name || fila.Buy_from_Vendor_Name_ || null,
+            fuente: "historico",
+          }));
+        }
+        if (hits.some((h) => h.estado === "registrada")) return elegirMejorMatchFactura(hits);
+      } catch { /* siguiente columna / servicio */ }
     }
   }
-  return algunaLista ? { encontrada: false } : null;
+  return elegirMejorMatchFactura(hits);
 }
 
-async function facturaYaEntradaEnBC(vendorInvoiceNumber) {
+async function facturaYaEntradaEnBC(vendorInvoiceNumber, opts = {}) {
   if (!vendorInvoiceNumber) return { encontrada: false };
+  const proveedorHint = String(opts.proveedor || "").trim();
   try {
     try {
       const rapida = await facturaYaEntradaRapida(vendorInvoiceNumber);
-      if (rapida) return rapida;
+      if (rapida?.encontrada) {
+        const mejor = elegirMejorMatchFactura([rapida], proveedorHint) || rapida;
+        if (!proveedorHint || !mejor.proveedor || proveedoresParecidos(proveedorHint, mejor.proveedor) || mejor.estado === "registrada") {
+          return mejor;
+        }
+      }
     } catch (e) {
       console.warn("[facturas-compra/duplicados] Consulta directa falló, se mira el histórico:", String(e.message || e));
     }
+
+    if (Date.now() < historicoFacturasCompraFallidoHasta) return { encontrada: false };
 
     const token = await obtenerTokenBC();
     const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
@@ -4710,18 +6209,187 @@ async function facturaYaEntradaEnBC(vendorInvoiceNumber) {
     if (!historico) return { encontrada: false };
 
     const objetivo = vendorInvoiceNumber.toString().trim().toUpperCase();
-    const fila = historico.filas.find((f) => (f[historico.campoFactura] || "").toString().trim().toUpperCase() === objetivo);
-    if (!fila) return { encontrada: false };
+    const filas = historico.filas.filter((f) => (f[historico.campoFactura] || "").toString().trim().toUpperCase() === objetivo);
+    if (!filas.length) return { encontrada: false };
 
-    return {
-      encontrada: true,
+    const candidatos = filas.map((fila) => resultadoFacturaYaEntrada({
       numeroBC: historico.campoNumero ? fila[historico.campoNumero] : null,
       proveedor: historico.campoProveedor ? fila[historico.campoProveedor] : null,
-    };
+      fuente: "historico",
+    }));
+    return elegirMejorMatchFactura(candidatos, proveedorHint) || candidatos[0];
   } catch (e) {
     console.warn("[facturas-compra/duplicados] Error comprobando duplicado:", String(e.message || e));
     return { encontrada: false };
   }
+}
+
+async function marcarFacturaDetectadaEnBandeja({ factura, msg, att, chequeo }) {
+  if (!chequeo?.encontrada || chequeo.borrador || chequeo.estado === "borrador") return { marcada: false };
+  const num = String(factura || "").trim();
+  const motivo = `⚠ Esta factura ya está registrada en BC: ${chequeo.numeroBC || "?"}${chequeo.proveedor ? " · " + chequeo.proveedor : ""}. No se analiza ni se crea borrador.`;
+  try {
+    const d = await leerIndicePdfPendientes();
+    let tocado = false;
+    for (const it of d.items || []) {
+      const mismaFac = num && (it.factura === num || it.extraida?.factura === num || (it.facturas || []).includes(num));
+      const mismoMail = msg && it.msg === msg && String(it.att ?? "") === String(att ?? "");
+      if (!mismaFac && !mismoMail) continue;
+      const previa = it.extraida || {};
+      it.extraida = {
+        ...previa,
+        yaEntrada: true,
+        veredicto: "ya_entrada",
+        entradaInfo: chequeo,
+        motivos: [motivo],
+      };
+      if (num) it.factura = num;
+      tocado = true;
+      if (it.msg && it.att != null && it.att !== "") {
+        const mailClave = `mail:${it.msg}|${it.att}`;
+        if (!(d.registradas || []).includes(mailClave)) d.registradas = [mailClave, ...(d.registradas || [])];
+      }
+    }
+    if (num && !(d.registradas || []).includes(`fac:${num}`)) {
+      d.registradas = [`fac:${num}`, ...(d.registradas || [])];
+      tocado = true;
+    }
+    if (msg && att != null && att !== "") {
+      const mailClave = `mail:${msg}|${att}`;
+      if (!(d.registradas || []).includes(mailClave)) {
+        d.registradas = [mailClave, ...(d.registradas || [])];
+        tocado = true;
+      }
+    }
+    if (tocado) await escribirIndicePdfPendientes(d);
+  } catch (e) {
+    console.warn("[facturas-pdf] No se pudo marcar la factura ya entrada en bandeja:", String(e.message || e));
+    return { marcada: false };
+  }
+  return { marcada: true };
+}
+
+// Regla permanente (Maria): TODAS las facturas de la bandeja cuyo nº de
+// proveedor ya esté registrado en BC (histórico FC* / Open/Paid) salen de
+// Pendientes → Entradas. PFC* solo avisa «ya hay borrador». Sin tope: el
+// bucle de 5 min y el POST deben recorrer el conjunto pendiente completo
+// (antes el limite 25/40 re-chequeaba siempre las mismas y las de más
+// abajo nunca salían).
+async function reconciliarFacturasYaEntradasEnBC({ soloFactura = null, limite = null } = {}) {
+  const d = await leerIndicePdfPendientes();
+  const reg = new Set(d.registradas || []);
+  // Reparar índices a medias: fac:/mail: en registradas pero sin
+  // yaEntrada / sin mail: → que salgan de Pendientes sin reconsultar BC.
+  let reparadas = 0;
+  for (const it of d.items || []) {
+    const fac = String(it.extraida?.factura || it.factura || "").trim();
+    if (soloFactura && fac && fac.toUpperCase() !== String(soloFactura).trim().toUpperCase()) continue;
+    const mailClave = it.msg && it.att != null && it.att !== "" ? `mail:${it.msg}|${it.att}` : null;
+    const yaReg = (fac && reg.has(`fac:${fac}`)) || (mailClave && reg.has(mailClave));
+    if (!yaReg) continue;
+    const previa = it.extraida || {};
+    const faltaFlag = !(previa.yaEntrada || previa.veredicto === "ya_entrada");
+    const faltaMail = mailClave && !reg.has(mailClave);
+    if (!faltaFlag && !faltaMail) continue;
+    const chequeo = previa.entradaInfo && previa.entradaInfo.encontrada
+      ? previa.entradaInfo
+      : { encontrada: true, estado: "registrada", numeroBC: previa.entradaInfo?.numeroBC || null, proveedor: previa.proveedor || null, borrador: false };
+    if (chequeo.borrador || chequeo.estado === "borrador") continue;
+    await marcarFacturaDetectadaEnBandeja({ factura: fac || previa.factura, msg: it.msg, att: it.att, chequeo });
+    if (mailClave) reg.add(mailClave);
+    if (fac) reg.add(`fac:${fac}`);
+    reparadas += 1;
+  }
+
+  const dFresh = reparadas ? await leerIndicePdfPendientes() : d;
+  const regFresh = new Set(dFresh.registradas || []);
+  const pendientes = [];
+  for (const it of dFresh.items || []) {
+    const fac = String(it.extraida?.factura || it.factura || "").trim();
+    if (!fac) continue;
+    if (soloFactura && fac.toUpperCase() !== String(soloFactura).trim().toUpperCase()) continue;
+    if (it.extraida?.yaEntrada || it.extraida?.veredicto === "ya_entrada") continue;
+    if (regFresh.has(`fac:${fac}`)) continue;
+    if (it.msg && it.att != null && regFresh.has(`mail:${it.msg}|${it.att}`)) continue;
+    pendientes.push(it);
+  }
+  const vistos = new Set();
+  const unicos = [];
+  const tope = limite == null || !Number.isFinite(Number(limite)) || Number(limite) <= 0
+    ? null
+    : Math.floor(Number(limite));
+  for (const it of pendientes) {
+    const fac = String(it.extraida?.factura || it.factura || "").trim().toUpperCase();
+    if (vistos.has(fac)) continue;
+    vistos.add(fac);
+    unicos.push(it);
+    if (tope != null && unicos.length >= tope) break;
+  }
+  // Una sola carga de purchaseInvoices (Open/Draft/Paid) para emparejar
+  // todo el lote por vendorInvoiceNumber — evita N idas a BC y el martilleo
+  // OData cuando el histórico publicado no trae Vendor Invoice No.
+  if (unicos.length) {
+    try {
+      await obtenerIndicePurchaseInvoices();
+    } catch (e) {
+      console.warn("[bandeja] Precarga purchaseInvoices para reconciliar:", String(e.message || e));
+    }
+  }
+  const resultados = [];
+  let marcadas = 0;
+  let borradores = 0;
+  for (const it of unicos) {
+    const fac = String(it.extraida?.factura || it.factura || "").trim();
+    const proveedor = it.extraida?.proveedor || "";
+    try {
+      const chequeo = await facturaYaEntradaEnBC(fac, { proveedor });
+      if (!chequeo.encontrada) {
+        resultados.push({ factura: fac, encontrada: false });
+        continue;
+      }
+      if (chequeo.borrador || chequeo.estado === "borrador") {
+        const d2 = await leerIndicePdfPendientes();
+        const facUp = fac.toUpperCase();
+        for (const x of d2.items || []) {
+          const xFac = String(x.extraida?.factura || x.factura || "").trim();
+          const mismaFac = xFac && xFac.toUpperCase() === facUp;
+          const mismoMail = x.msg === it.msg && String(x.att ?? "") === String(it.att ?? "");
+          if (!mismaFac && !mismoMail) continue;
+          const previa = x.extraida || {};
+          if (previa.yaEntrada || previa.veredicto === "ya_entrada") continue;
+          x.extraida = {
+            ...previa,
+            yaBorrador: true,
+            veredicto: "ya_borrador",
+            entradaInfo: chequeo,
+            motivos: [
+              `⚠ Esta factura ya tiene un borrador en BC (${chequeo.numeroBC || "PFC…"}). No se crea otro.`,
+              ...(previa.motivos || []).filter((m) => !String(m).includes("borrador en BC")),
+            ],
+          };
+        }
+        await escribirIndicePdfPendientes(d2);
+        borradores += 1;
+        resultados.push({ factura: fac, encontrada: true, estado: "borrador", numeroBC: chequeo.numeroBC });
+        continue;
+      }
+      await marcarFacturaDetectadaEnBandeja({ factura: fac, msg: it.msg, att: it.att, chequeo });
+      marcadas += 1;
+      resultados.push({ factura: fac, encontrada: true, estado: "registrada", numeroBC: chequeo.numeroBC, marcada: true });
+    } catch (e) {
+      resultados.push({ factura: fac, error: String(e.message || e) });
+    }
+  }
+  return {
+    revisadas: resultados.length,
+    pendientesConNumero: pendientes.length,
+    unicasRevisadas: unicos.length,
+    marcadas: marcadas + reparadas,
+    marcadasBc: marcadas,
+    reparadas,
+    borradores,
+    resultados,
+  };
 }
 
 // -----------------------------------------------------------------------
@@ -4961,6 +6629,93 @@ function otUtil(valor) {
   return s;
 }
 
+/** Ferros Coll de l'Alba como proveedor: pedido con cuenta 60700004 (trabajos grupo). */
+const REGLA_FERROS_GRUPO = {
+  id: "ferros-grupo",
+  cuenta: "60700004",
+  descripcion: "TRABAJOS ENTRE EMPRESAS DEL GRUPO",
+  lineType: "Account",
+};
+
+function esProveedorFerrosGrupo(nombre) {
+  const n = normalizarTextoBC(nombre || "");
+  if (!n || !/FERROS/.test(n)) return false;
+  return /COLL/.test(n) || /ALBA/.test(n) || /FERROSCA/.test(n);
+}
+
+/** OT en factura Ferros: AC00XXXXX/2026 o OT XXXXX → formato BC AC######/AAAA. */
+function normalizarOtFactura(raw) {
+  const s = String(raw || "").trim().toUpperCase();
+  if (!s) return "";
+  const ac = s.match(/\bAC0?(\d{4,6})\/(\d{4})\b/);
+  if (ac) return `AC${String(parseInt(ac[1], 10)).padStart(6, "0")}/${ac[2]}`;
+  const ot = s.match(/\bOT\s*0*(\d{3,6})\b/);
+  if (ot) return `AC${String(parseInt(ot[1], 10)).padStart(6, "0")}/${new Date().getFullYear()}`;
+  return otUtil(s);
+}
+
+function extraerOtDeTextoFactura(texto) {
+  const t = String(texto || "");
+  const ac = t.match(/\bAC0?\d{4,6}\/\d{4}\b/i);
+  if (ac) return normalizarOtFactura(ac[0]);
+  const ot = t.match(/\bOT\s*0*\d{3,6}\b/i);
+  if (ot) return normalizarOtFactura(ot[0]);
+  return "";
+}
+
+function importeDesdeDatosPedido(datos) {
+  const base = Number(datos?.baseImponible);
+  if (base && !Number.isNaN(base)) return base;
+  const lineas = Array.isArray(datos?.lineas) ? datos.lineas : [];
+  let sum = 0;
+  let hay = false;
+  for (const l of lineas) {
+    const c = Number(l.cantidad) > 0 ? Number(l.cantidad) : 1;
+    const p = Number(l.precioUnitario);
+    if (p != null && !Number.isNaN(p)) {
+      sum += c * p;
+      hay = true;
+    }
+  }
+  return hay ? Math.round(sum * 100) / 100 : null;
+}
+
+async function propuestaPedidoFerrosGrupo(datos = {}) {
+  const proveedor = String(datos?.proveedor || "").trim();
+  const ot = normalizarOtFactura(datos?.ot) || null;
+  const vendorNumber = await buscarNumeroProveedor(proveedor);
+  return {
+    proveedorFactura: proveedor,
+    proveedorBC: proveedor || "Ferros Coll de l'Alba, S.L.",
+    vendorNumber: vendorNumber || null,
+    numeroBC: null,
+    facturaProveedor: datos?.factura || null,
+    fecha: null,
+    cuenta: REGLA_FERROS_GRUPO.cuenta,
+    ot,
+    departamento: null,
+    lineType: REGLA_FERROS_GRUPO.lineType,
+    puedeCrear: true,
+    regla: REGLA_FERROS_GRUPO.id,
+    descripcionFija: REGLA_FERROS_GRUPO.descripcion,
+    lineas: [{
+      tipo: "Cuenta",
+      tipoApi: REGLA_FERROS_GRUPO.lineType,
+      cuenta: REGLA_FERROS_GRUPO.cuenta,
+      ot: ot || "",
+      departamento: "",
+      descripcion: REGLA_FERROS_GRUPO.descripcion,
+      importe: null,
+      cantidad: 1,
+      precio: null,
+      pedido: "",
+    }],
+    resumen: ot
+      ? `Ferros Coll de l'Alba: pedido con cuenta ${REGLA_FERROS_GRUPO.cuenta}, «${REGLA_FERROS_GRUPO.descripcion}», OT ${ot}. Luego se factura como el resto.`
+      : `Ferros Coll de l'Alba: pedido con cuenta ${REGLA_FERROS_GRUPO.cuenta} y «${REGLA_FERROS_GRUPO.descripcion}». Indica la OT (en la factura suele ser AC00…/AAAA o OT …) antes de crear el pedido.`,
+  };
+}
+
 async function proponerUltimaEntrada(nombreProveedor) {
   if (!nombreProveedor) return null;
   const token = await obtenerTokenBC();
@@ -5093,6 +6848,20 @@ function lineasBorradorComoUltima(comoUltima, propuesta) {
 }
 
 function lineasPedidoComoUltima(datos, propuesta) {
+  if (propuesta?.regla === REGLA_FERROS_GRUPO.id) {
+    const importe = importeDesdeDatosPedido(datos);
+    if (importe == null || !propuesta.cuenta) return [];
+    const ot = normalizarOtFactura(datos?.ot) || otUtil(propuesta.ot) || null;
+    return [{
+      codigoBC: REGLA_FERROS_GRUPO.cuenta,
+      lineType: REGLA_FERROS_GRUPO.lineType,
+      ot,
+      depto: null,
+      descripcion: REGLA_FERROS_GRUPO.descripcion,
+      cantidad: 1,
+      precio: importe,
+    }];
+  }
   const plantillas = (propuesta.lineas || []).filter((l) => l.cuenta && l.tipoApi);
   const pdf = (Array.isArray(datos?.lineas) ? datos.lineas : []).filter((l) => l && (l.descripcion || l.precioUnitario != null || l.cantidad != null));
   const mezclar = (plantilla, actual) => ({
@@ -5350,20 +7119,99 @@ async function aplicarOtAlPedido(pedido) {
   return cerrar(puestas === lineas.length);
 }
 
-async function crearPedidoComoUltima(datos) {
-  const proveedor = String(datos?.proveedor || "").trim();
-  if (!proveedor) throw new Error("Falta el proveedor.");
-  const propuesta = await proponerUltimaEntrada(proveedor);
-  if (!propuesta?.puedeCrear) throw new Error(propuesta?.resumen || "No hay una factura anterior de este proveedor para copiar el pedido.");
-  if (typeof datos?.ot === "string") {
-    const ot = otUtil(datos.ot);
-    propuesta.ot = ot || null;
-    propuesta.lineas = (propuesta.lineas || []).map((l) => ({ ...l, ot }));
+function lineasPedidoDesdeLineasBC(datos, extras = {}) {
+  const ot = otUtil(datos?.ot) || null;
+  const depto = extras.departamento || null;
+  return (Array.isArray(datos?.lineasBC) ? datos.lineasBC : [])
+    .map((l) => {
+      const codigo = String(l?.codigo || l?.codigoBC || "").trim();
+      const cantidad = Number(l?.cantidad);
+      if (!codigo || !(cantidad > 0)) return null;
+      const tipo = String(l?.tipo || l?.lineType || "Item");
+      const lineType = /charge/i.test(tipo) ? "Charge" : (/account|cuenta/i.test(tipo) ? "Account" : "Item");
+      const precioRaw = l?.coste ?? l?.precio ?? l?.precioUnitario;
+      const precio = precioRaw === "" || precioRaw == null || Number.isNaN(Number(precioRaw)) ? null : Number(precioRaw);
+      return {
+        codigoBC: codigo,
+        lineType,
+        ot,
+        depto,
+        descripcion: String(l?.descripcion || "").trim().slice(0, 100) || undefined,
+        cantidad,
+        precio,
+      };
+    })
+    .filter(Boolean);
+}
+
+/** Cód. almacén de la primera línea de artículo del pedido (OData página líneas). */
+async function almacenDePedidoCompra(numeroPedido, token) {
+  const pedido = String(numeroPedido || "").trim();
+  if (!pedido) return null;
+  const empresa = encodeURIComponent(EMPRESA_NOMBRE() || "");
+  const raiz = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/ODataV4/Company('${empresa}')`;
+  const servicio = FUENTES_WS.lineas_compra.servicio;
+  const esc = pedido.replace(/'/g, "''");
+  const r = await fetchConReintento(
+    `${raiz}/${encodeURIComponent(servicio)}?$filter=${encodeURIComponent(`Document_No eq '${esc}'`)}`,
+    { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } }
+  );
+  if (!r.ok) return null;
+  const filas = (await r.json()).value || [];
+  const conAlmacen = filas.find((f) => String(f.Location_Code || "").trim() && /item|artículo|articulo/i.test(String(f.Type || "")));
+  const cualquiera = filas.find((f) => String(f.Location_Code || "").trim());
+  const codigo = String((conAlmacen || cualquiera)?.Location_Code || "").trim();
+  return codigo || null;
+}
+
+async function idAlmacenPorCodigo(codigo, token) {
+  const code = String(codigo || "").trim();
+  if (!code) return null;
+  const r = await fetchConReintento(
+    `${urlApiComprasBC()}/locations?$filter=${encodeURIComponent(`code eq '${code.replace(/'/g, "''")}'`)}&$select=id,code&$top=1`,
+    { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } }
+  );
+  if (!r.ok) return null;
+  return ((await r.json()).value || [])[0]?.id || null;
+}
+
+/** Pone almacén en líneas de artículo: locationId por API v2 (el WS de líneas suele ser solo lectura). */
+async function ponerAlmacenEnPedidoCompra(pedido, locationCode, token, lineasApi = []) {
+  const codigo = String(locationCode || "").trim();
+  if (!codigo) return "Falta el Cód. almacén.";
+  const locationId = await idAlmacenPorCodigo(codigo, token);
+  if (!locationId) return `No encuentro el almacén ${codigo} en BC.`;
+  const avisos = [];
+  let ok = 0;
+  const candidatas = (lineasApi || []).filter((l) => l?.id && /item/i.test(String(l.lineType || "")));
+  let lista = candidatas;
+  if (!lista.length && pedido?.id) {
+    const r = await fetchConReintento(
+      `${urlApiComprasBC()}/purchaseOrderLines?$filter=${encodeURIComponent(`documentId eq ${pedido.id}`)}&$select=id,sequence,lineType`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } }
+    );
+    if (r.ok) lista = ((await r.json()).value || []).filter((l) => /item/i.test(String(l.lineType || "")));
   }
-  const vendorNumber = propuesta.vendorNumber || await buscarNumeroProveedor(propuesta.proveedorBC || proveedor);
-  if (!vendorNumber) throw new Error(`No encuentro el nº de proveedor de ${propuesta.proveedorBC || proveedor} en BC.`);
-  const lineas = lineasPedidoComoUltima(datos, propuesta);
+  for (const l of lista) {
+    const r = await fetchConReintento(`${urlApiComprasBC()}/purchaseOrderLines(${l.id})`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "If-Match": "*" },
+      body: JSON.stringify({ locationId }),
+    });
+    if (r.ok) ok += 1;
+    else avisos.push(`Línea ${l.sequence || l.id}: no se pudo poner el almacén (BC ${r.status})`);
+  }
+  if (ok > 0 && !avisos.length) return null;
+  if (ok > 0) return avisos.join(" ");
+  return avisos.join(" ") || `No se pudo poner el almacén ${codigo} en las líneas.`;
+}
+async function crearPedidoCompraConLineas(datos, lineas, meta = {}) {
+  const proveedor = String(datos?.proveedor || meta.proveedorBC || "").trim();
+  if (!proveedor) throw new Error("Falta el proveedor.");
   if (!lineas.length) throw new Error("No hay líneas para crear el pedido.");
+  let vendorNumber = meta.vendorNumber || null;
+  if (!vendorNumber) vendorNumber = await buscarNumeroProveedor(proveedor);
+  if (!vendorNumber) throw new Error(`No encuentro el nº de proveedor de ${proveedor} en BC.`);
   const token = await obtenerTokenBC();
   const cabeceras = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
   const urlBase = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
@@ -5377,6 +7225,13 @@ async function crearPedidoComoUltima(datos) {
   const cab = await rCab.json();
   const avisos = [];
   const lineasCreadas = [];
+  const lineasApi = [];
+  const pedidoOrigen = String(datos?.pedidoOrigen || "").trim();
+  let locationCode = String(datos?.locationCode || meta.locationCode || "").trim() || null;
+  if (!locationCode && pedidoOrigen) {
+    locationCode = await almacenDePedidoCompra(pedidoOrigen, token);
+  }
+  let locationId = locationCode ? await idAlmacenPorCodigo(locationCode, token) : null;
   for (const l of lineas) {
     const body = {
       documentId: cab.id,
@@ -5386,39 +7241,124 @@ async function crearPedidoComoUltima(datos) {
       description: l.descripcion || undefined,
     };
     if (l.precio != null && !Number.isNaN(Number(l.precio))) body.directUnitCost = Number(l.precio);
-    const rLinea = await fetchConReintento(`${urlBase}/purchaseOrderLines`, {
+    if (locationId && /item/i.test(String(l.lineType || ""))) body.locationId = locationId;
+    let rLinea = await fetchConReintento(`${urlBase}/purchaseOrderLines`, {
       method: "POST",
       headers: cabeceras,
       body: JSON.stringify(body),
     });
+    // Algunos entornos esperan "Charge (Item)" en lugar de "Charge".
+    if (!rLinea.ok && l.lineType === "Charge") {
+      const txt = (await rLinea.text().catch(() => "")).slice(0, 180);
+      if (/InvalidOptionEnumValue|is not an option/i.test(txt)) {
+        rLinea = await fetchConReintento(`${urlBase}/purchaseOrderLines`, {
+          method: "POST",
+          headers: cabeceras,
+          body: JSON.stringify({ ...body, lineType: "Charge (Item)" }),
+        });
+      } else {
+        avisos.push(`Línea ${l.codigoBC}: BC ${rLinea.status} ${txt}`);
+        continue;
+      }
+    }
     if (!rLinea.ok) {
       avisos.push(`Línea ${l.codigoBC}: BC ${rLinea.status} ${(await rLinea.text().catch(() => "")).slice(0, 180)}`);
       continue;
     }
     const creada = await rLinea.json();
+    lineasApi.push(creada);
     lineasCreadas.push(l.descripcion || l.codigoBC);
     if (l.ot || l.depto) {
       const avisoDim = await ponerOtEnLineaApi(creada.id, l, token);
       if (avisoDim) avisos.push(avisoDim);
     }
   }
+  if (locationCode) {
+    const malAlm = await ponerAlmacenEnPedidoCompra(
+      { numero: cab.number, id: cab.id },
+      locationCode,
+      token,
+      lineasApi
+    );
+    if (malAlm) avisos.push(malAlm);
+  } else if (lineas.some((l) => /item/i.test(String(l.lineType || "")))) {
+    avisos.push("No se ha podido copiar el Cód. almacén (falta en el pedido de origen). Revísalo antes de registrar.");
+  }
   return {
     numero: cab.number,
     id: cab.id,
     enlace: enlacePedidoCompraBC(cab.number),
-    vendorName: propuesta.proveedorBC,
+    vendorName: meta.proveedorBC || proveedor,
     lineasCreadas,
     avisos,
+    locationCode: locationCode || null,
     plantilla: {
-      numeroBC: propuesta.numeroBC,
-      facturaProveedor: propuesta.facturaProveedor,
-      fecha: propuesta.fecha,
-      cuenta: propuesta.cuenta,
-      ot: propuesta.ot,
-      departamento: propuesta.departamento,
-      lineType: propuesta.lineType,
+      numeroBC: meta.numeroBC || null,
+      facturaProveedor: meta.facturaProveedor || null,
+      fecha: meta.fecha || null,
+      cuenta: lineas[0]?.codigoBC || meta.cuenta || null,
+      ot: lineas[0]?.ot || otUtil(datos?.ot) || null,
+      departamento: lineas[0]?.depto || meta.departamento || null,
+      lineType: lineas[0]?.lineType || meta.lineType || null,
+      locationCode: locationCode || null,
     },
   };
+}
+
+async function crearPedidoComoUltima(datos) {
+  const proveedor = String(datos?.proveedor || "").trim();
+  if (!proveedor) throw new Error("Falta el proveedor.");
+
+  // Pedido nuevo con artículos/cargos ya elegidos en pantalla (p. ej. líneas
+  // de factura que no caben en un PC lanzado). No copia la cuenta de la última factura.
+  const lineasBC = lineasPedidoDesdeLineasBC(datos);
+  if (lineasBC.length) {
+    let meta = { proveedorBC: proveedor, vendorNumber: null, departamento: null };
+    try {
+      const prop = await proponerUltimaEntrada(proveedor);
+      if (prop) {
+        meta = {
+          proveedorBC: prop.proveedorBC || proveedor,
+          vendorNumber: prop.vendorNumber || null,
+          departamento: prop.departamento || null,
+          numeroBC: prop.numeroBC || null,
+          facturaProveedor: prop.facturaProveedor || null,
+          fecha: prop.fecha || null,
+          cuenta: prop.cuenta || null,
+          lineType: prop.lineType || null,
+        };
+        if (meta.departamento) {
+          for (const l of lineasBC) if (!l.depto) l.depto = meta.departamento;
+        }
+      }
+    } catch { /* basta con el nº de proveedor */ }
+    return crearPedidoCompraConLineas(datos, lineasBC, meta);
+  }
+
+  const esFerros = datos?.regla === REGLA_FERROS_GRUPO.id || esProveedorFerrosGrupo(proveedor);
+  const propuesta = esFerros
+    ? await propuestaPedidoFerrosGrupo(datos)
+    : await proponerUltimaEntrada(proveedor);
+  if (!propuesta?.puedeCrear) throw new Error(propuesta?.resumen || "No hay una factura anterior de este proveedor para copiar el pedido.");
+  if (esFerros && !normalizarOtFactura(datos?.ot) && !otUtil(propuesta.ot)) {
+    throw new Error("Ferros Coll de l'Alba: falta la OT (en la factura suele ser AC00…/AAAA o OT …). Indícala antes de crear el pedido.");
+  }
+  if (typeof datos?.ot === "string") {
+    const ot = esFerros ? normalizarOtFactura(datos.ot) : otUtil(datos.ot);
+    propuesta.ot = ot || null;
+    propuesta.lineas = (propuesta.lineas || []).map((l) => ({ ...l, ot }));
+  }
+  const lineas = lineasPedidoComoUltima(datos, propuesta);
+  return crearPedidoCompraConLineas(datos, lineas, {
+    proveedorBC: propuesta.proveedorBC,
+    vendorNumber: propuesta.vendorNumber,
+    numeroBC: propuesta.numeroBC,
+    facturaProveedor: propuesta.facturaProveedor,
+    fecha: propuesta.fecha,
+    cuenta: propuesta.cuenta,
+    departamento: propuesta.departamento,
+    lineType: propuesta.lineType,
+  });
 }
 
 function urlApiComprasBC() {
@@ -5477,7 +7417,7 @@ function textoErrorBC(texto) {
 function mensajeSiPedidoLanzado(txt) {
   const limpio = textoErrorBC(txt);
   if (/Status must be equal to 'Open'/i.test(limpio)) {
-    return `El pedido está lanzado. Business Central solo deja cambiar la cantidad y el coste si está abierto. ${limpio}`;
+    return `El pedido está lanzado (Released). Business Central solo deja añadir líneas o cambiar cantidad/coste si está abierto (Open). ${limpio}`;
   }
   return limpio;
 }
@@ -5497,7 +7437,7 @@ async function reabrirPedidoCompra(idPedido, token) {
   if (!re.ok) {
     return {
       ok: false,
-      error: `El pedido está lanzado y no se ha podido reabrir para cambiar la cantidad o el coste (BC ${re.status}). ${mensajeSiPedidoLanzado(re.texto)}`,
+      error: `El pedido está lanzado y no se ha podido reabrir para añadir líneas o cambiar cantidad/coste (BC ${re.status}). ${mensajeSiPedidoLanzado(re.texto)}`,
     };
   }
   return { ok: true, reabierto: true };
@@ -5712,15 +7652,10 @@ async function resumenPedidoCompra(numero) {
       break;
     }
   } catch (_) {}
-  let importe = null;
-  if (Array.isArray(bc.lineasBC) && bc.lineasBC.length) {
-    importe = Math.round(bc.lineasBC.reduce((s, l) => {
-      if (l.amountExcludingTax != null && l.amountExcludingTax !== "" && !Number.isNaN(Number(l.amountExcludingTax))) return s + Number(l.amountExcludingTax);
-      const qty = Number(l.quantity) || 0;
-      const precio = Number(l.directUnitCost);
-      if (!qty || Number.isNaN(precio)) return s;
-      return s + qty * precio;
-    }, 0) * 100) / 100;
+  // Preferir total del pedido en cabecera BC; si no, suma de líneas con dto.
+  let importe = bc.totalAmountExcludingTax != null ? Number(bc.totalAmountExcludingTax) : null;
+  if (importe == null || Number.isNaN(importe)) {
+    importe = importePedidoDesdeLineasBC(bc.lineasBC);
   }
   return { fecha, albaran: albaran || null, importe };
 }
@@ -5739,7 +7674,11 @@ app.post("/api/facturas-compra/resumen-pedido", async (req, res) => {
 
 app.post("/api/facturas-compra/crear-pedido", async (req, res) => {
   const datos = req.body || {};
-  const clave = `${String(datos.proveedor || "").trim()}|${String(datos.factura || "").trim()}|${datos.msg || ""}|${datos.att || ""}`;
+  const firmaLineasBC = Array.isArray(datos.lineasBC) && datos.lineasBC.length
+    ? datos.lineasBC.map((l) => `${l.tipo || "Item"}:${l.codigo}:${l.cantidad}:${l.coste ?? l.precio ?? ""}`).join("|")
+    : "";
+  const esLineasBC = !!firmaLineasBC;
+  const clave = `${String(datos.proveedor || "").trim()}|${String(datos.factura || "").trim()}|${datos.msg || ""}|${datos.att || ""}${esLineasBC ? `|bc:${firmaLineasBC}` : ""}`;
   if (pedidosCreandose.has(clave)) {
     try {
       return res.json(await pedidosCreandose.get(clave));
@@ -5752,12 +7691,14 @@ app.post("/api/facturas-compra/crear-pedido", async (req, res) => {
   const espera = new Promise((ok, mal) => { resolver = ok; rechazar = mal; });
   pedidosCreandose.set(clave, espera);
   try {
-    const ya = await pedidoYaAnotado(datos);
+    // Las líneas explícitas (artículo/cargo) son un pedido adicional: no
+    // reutilizar el pedidoCreado de «factura sin PC».
+    const ya = esLineasBC ? null : await pedidoYaAnotado(datos);
     let pedido = ya || await crearPedidoComoUltima(datos);
-    if (!ya) await anotarPedidoCreado(datos, pedido);
+    if (!ya && !esLineasBC) await anotarPedidoCreado(datos, pedido);
     if (pedido.plantilla?.ot || pedido.plantilla?.departamento) {
       pedido = await aplicarOtAlPedido(pedido);
-      await anotarPedidoCreado(datos, pedido);
+      if (!esLineasBC) await anotarPedidoCreado(datos, pedido);
     }
     if (!pedido.registro?.ok) {
       pedido = {
@@ -5766,12 +7707,12 @@ app.post("/api/facturas-compra/crear-pedido", async (req, res) => {
           ? await registrarPedidoCompra(pedido)
           : { ok: false, error: "No se registra: no se creó ninguna línea del pedido." },
       };
-      await anotarPedidoCreado(datos, pedido);
+      if (!esLineasBC) await anotarPedidoCreado(datos, pedido);
     }
     if (pedido.numero) {
       try {
         pedido = { ...pedido, ...(await resumenPedidoCompra(pedido.numero)), resumenListo: true };
-        await anotarPedidoCreado(datos, pedido);
+        if (!esLineasBC) await anotarPedidoCreado(datos, pedido);
       } catch (_) {}
     }
     resolver(pedido);
@@ -5804,10 +7745,38 @@ app.get("/api/facturas-compra/ya-entrada", async (req, res) => {
   try {
     const factura = String(req.query.factura || "").trim();
     if (!factura) return res.status(400).json({ error: "Falta el nº de factura." });
-    const chequeo = await facturaYaEntradaEnBC(factura);
+    const chequeo = await facturaYaEntradaEnBC(factura, { proveedor: String(req.query.proveedor || "").trim() });
+    if (chequeo.encontrada && !(chequeo.borrador || chequeo.estado === "borrador")) {
+      const msg = String(req.query.msg || "").trim();
+      const att = req.query.att != null && req.query.att !== "" ? String(req.query.att) : "";
+      if (msg || factura) {
+        await marcarFacturaDetectadaEnBandeja({
+          factura,
+          msg: msg || null,
+          att: att || null,
+          chequeo,
+        });
+      }
+    }
     res.json(chequeo);
   } catch (err) {
     res.status(500).json({ error: "No se ha podido comprobar si la factura ya está entrada.", detalle: String(err.message || err) });
+  }
+});
+
+app.post("/api/facturas-compra/bandeja/reconciliar-bc", async (req, res) => {
+  try {
+    const soloFactura = String(req.body?.factura || req.query?.factura || "").trim() || null;
+    // Por defecto SIN tope: regla para todas las repetidas de la bandeja.
+    // limite explícito solo si el body/query lo pide (>0).
+    const rawLim = req.body?.limite ?? req.query?.limite;
+    const limite = rawLim === undefined || rawLim === null || rawLim === "" || rawLim === "all"
+      ? null
+      : Math.max(1, Math.floor(Number(rawLim)) || 0) || null;
+    const out = await reconciliarFacturasYaEntradasEnBC({ soloFactura, limite });
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    res.status(500).json({ error: "No se ha podido reconciliar con BC.", detalle: String(err.message || err) });
   }
 });
 
@@ -5815,7 +7784,9 @@ app.post("/api/facturas-compra/ultima-entrada", async (req, res) => {
   try {
     const proveedor = String(req.body?.proveedor || "").trim();
     if (!proveedor) return res.status(400).json({ error: "Falta el proveedor." });
-    const ultimaEntrada = await proponerUltimaEntrada(proveedor);
+    const ultimaEntrada = esProveedorFerrosGrupo(proveedor)
+      ? await propuestaPedidoFerrosGrupo({ proveedor, ot: req.body?.ot, factura: req.body?.factura })
+      : await proponerUltimaEntrada(proveedor);
     res.json({ ultimaEntrada });
   } catch (err) {
     res.status(500).json({ error: "No se ha podido mirar el historial de facturas de compra.", detalle: String(err.message || err) });
@@ -6004,7 +7975,9 @@ async function extraerFacturaHttp(req, res) {
 
     console.log(`[facturas-compra/extraer] "${nombre || "documento"}" · ${totalPaginas} páginas · pidiendo a la IA por lotes...`);
 
-    const LOTE = 8;
+    // 1 página por lote: Saltoki y similares saturan la respuesta si se
+    // agrupan. Si aún falla un lote >1 (por reintentos internos), se parte.
+    const LOTE = 1;
     const detecciones = [];
     for (let inicio = 0; inicio < totalPaginas; inicio += LOTE) {
       const indices = [];
@@ -6022,6 +7995,12 @@ async function extraerFacturaHttp(req, res) {
 
     const grupos = agruparPorFactura(detecciones);
 
+    let textoDocumento = "";
+    try {
+      const leidoDoc = await pdfParse(dataBuffer);
+      textoDocumento = String(leidoDoc?.text || "").replace(/\u0000/g, " ");
+    } catch { /* escaneado o protegido: la OT se pedirá a mano */ }
+
     // Caché de pedidos ya consultados a BC dentro de esta misma petición
     // (una factura puede repetir el mismo pedido en varias líneas).
     const cacheBC = new Map();
@@ -6033,6 +8012,14 @@ async function extraerFacturaHttp(req, res) {
     const facturasFinal = [];
     const aGuardarFacturas = [];
     for (const g of grupos) {
+      if (esProveedorFerrosGrupo(g.proveedor)) {
+        const trozos = [
+          textoDocumento,
+          g.factura,
+          ...(g.lineas || []).map((l) => l.descripcion),
+        ].filter(Boolean).join("\n");
+        g.otDetectada = extraerOtDeTextoFactura(trozos) || null;
+      }
       if (!g.factura || !g.paginas.length) {
         let pdfBase64 = null;
         if (g.paginas?.length) {
@@ -6059,21 +8046,25 @@ async function extraerFacturaHttp(req, res) {
 
       // Antes de analizar pedidos o proponer cómo entrarla: si este nº de
       // factura ya está registrado en BC, se para aquí.
-      const chequeoDuplicado = await facturaYaEntradaEnBC(g.factura);
+      const chequeoDuplicado = await facturaYaEntradaEnBC(g.factura, { proveedor: g.proveedor || "" });
       if (chequeoDuplicado.encontrada) {
+        const esBorrador = !!(chequeoDuplicado.borrador || chequeoDuplicado.estado === "borrador");
         const motivosDup = [
-          `⚠ Esta factura ya está entrada en BC (factura ${chequeoDuplicado.numeroBC || "?"}${chequeoDuplicado.proveedor ? " · " + chequeoDuplicado.proveedor : ""}). No se analiza ni se crea borrador.`,
+          esBorrador
+            ? `⚠ Esta factura ya tiene un borrador en BC (${chequeoDuplicado.numeroBC || "PFC…"}${chequeoDuplicado.proveedor ? " · " + chequeoDuplicado.proveedor : ""}). No se crea otro.`
+            : `⚠ Esta factura ya está registrada en BC: ${chequeoDuplicado.numeroBC || "?"}${chequeoDuplicado.proveedor ? " · " + chequeoDuplicado.proveedor : ""}. No se analiza ni se crea borrador.`,
         ];
         facturasFinal.push({
           ...g,
           pdfBase64,
           pedidosDetalle: [],
           lineasSinPedido: [],
-          veredicto: "ya_entrada",
+          veredicto: esBorrador ? "ya_borrador" : "ya_entrada",
           motivos: motivosDup,
           gastoSugerido: null,
           ultimaEntrada: null,
-          yaEntrada: true,
+          yaEntrada: !esBorrador,
+          yaBorrador: esBorrador,
           entradaInfo: chequeoDuplicado,
         });
         await registrarFacturaValidada({
@@ -6081,7 +8072,7 @@ async function extraerFacturaHttp(req, res) {
           fechaFactura: g.fecha || null,
           proveedores: g.proveedor ? [g.proveedor] : [],
           pedidos: [],
-          veredicto: "ya_entrada",
+          veredicto: esBorrador ? "ya_borrador" : "ya_entrada",
           motivos: motivosDup,
         });
         const { pdfBase64: _pdfDup, ...sinPdfDup } = facturasFinal[facturasFinal.length - 1];
@@ -6221,12 +8212,16 @@ async function extraerFacturaHttp(req, res) {
         // automático no encuentra nada o se equivoca — igual que ya hace
         // Recepción de material con "lineasDisponiblesBC".
         const lineasDisponiblesBC = lineasDisponiblesDesdeBC(bc.lineasBC);
+        const importePedido = bc.totalAmountExcludingTax != null
+          ? Number(bc.totalAmountExcludingTax)
+          : importePedidoDesdeLineasBC(bc.lineasBC);
         pedidosDetalle.push({
           pedido,
           vendorName: bc.vendorName || null,
           bcError: null,
           lineas: lineasEmparejadas,
           lineasDisponiblesBC,
+          importe: importePedido,
           enlaceBC: enlacePedidoCompraBC(pedido),
         });
 
@@ -6262,9 +8257,31 @@ async function extraerFacturaHttp(req, res) {
         }
       }
 
+      // Chips / propuestas = orden de lectura del PDF (bloques Su referencia /
+      // Pedido), no el orden en que la IA agrupó las líneas ni el de BC.
+      const pedidosDetalleOrden = ordenarPedidosDetallePorTexto(pedidosDetalle, textoDocumento);
+      pedidosDetalle.length = 0;
+      pedidosDetalle.push(...pedidosDetalleOrden);
+
       const hayPedidoUtil = pedidosDetalle.some((p) => p.pedido && !p.bcError);
       let ultimaEntrada = null;
-      if (!hayPedidoUtil && g.proveedor) {
+      // Ferros Coll de l'Alba: siempre pedido nuevo con cuenta 60700004
+      // (trabajos entre empresas del grupo), no se copia la última ni se
+      // trata como proveedor de gasto genérico.
+      if (!hayPedidoUtil && esProveedorFerrosGrupo(g.proveedor)) {
+        try {
+          ultimaEntrada = await propuestaPedidoFerrosGrupo({
+            proveedor: g.proveedor,
+            ot: g.otDetectada,
+            factura: g.factura,
+            baseImponible: g.baseImponible,
+          });
+          gastoSugerido = null;
+        } catch (e) {
+          console.warn("[facturas-compra/ferros] Error preparando la regla Ferros:", String(e.message || e));
+        }
+        if (ultimaEntrada?.resumen) motivos.push(ultimaEntrada.resumen);
+      } else if (!hayPedidoUtil && g.proveedor) {
         try {
           ultimaEntrada = await proponerUltimaEntrada(g.proveedor);
         } catch (e) {
@@ -6302,6 +8319,7 @@ async function extraerFacturaHttp(req, res) {
         motivos,
         gastoSugerido,
         ultimaEntrada,
+        otDetectada: g.otDetectada || null,
         yaEntrada: chequeoDuplicado.encontrada,
         entradaInfo: chequeoDuplicado.encontrada ? chequeoDuplicado : null,
       });
@@ -6350,8 +8368,16 @@ async function extraerFacturaHttp(req, res) {
     console.log(`[facturas-compra/extraer] ${identificadas} factura(s) identificada(s) de ${totalPaginas} páginas · ${paraEntrar} lista(s) para entrar`);
     const conNumero = facturasFinal.filter((f) => f.factura);
     if (origen?.msg && origen?.att != null && conNumero.length && conNumero.every((f) => f.yaEntrada)) {
-      try { await marcarCorreoEntrada(origen.msg, origen.att); }
-      catch (e) { console.warn("[facturas-pdf] No se pudo marcar el correo como entrada:", String(e.message || e)); }
+      try {
+        for (const f of conNumero) {
+          await marcarFacturaDetectadaEnBandeja({
+            factura: f.factura,
+            msg: origen.msg,
+            att: origen.att,
+            chequeo: f.entradaInfo || { encontrada: true, estado: "registrada", numeroBC: null },
+          });
+        }
+      } catch (e) { console.warn("[facturas-pdf] No se pudo marcar el correo como entrada:", String(e.message || e)); }
     }
     res.json({ paginas: totalPaginas, facturas: facturasFinal });
   } catch (err) {
@@ -6384,12 +8410,30 @@ app.post("/api/facturas-compra/refrescar-pedido", async (req, res) => {
   const { pedido } = req.body || {};
   if (!pedido) return res.status(400).json({ error: "Falta el nº de pedido." });
   const bc = await buscarPedidoYLineasBC(pedido);
-  if (bc.error) return res.json({ pedido, bcError: bc.error, vendorName: null, lineasDisponiblesBC: [], enlaceBC: enlacePedidoCompraBC(pedido) });
+  if (bc.error) {
+    return res.json({
+      pedido,
+      bcError: bc.error,
+      vendorName: null,
+      lineasDisponiblesBC: [],
+      albaranes: [],
+      importe: null,
+      enlaceBC: enlacePedidoCompraBC(pedido),
+    });
+  }
+  const lineasDisponiblesBC = lineasDisponiblesDesdeBC(bc.lineasBC);
+  // Qty del albarán + precio/% dto/importe del PC (los receipt lines casi nunca traen precio útil).
+  const albaranes = await albaranesConLineasDePedido(pedido, lineasDisponiblesBC);
+  const importe = bc.totalAmountExcludingTax != null
+    ? Number(bc.totalAmountExcludingTax)
+    : importePedidoDesdeLineasBC(bc.lineasBC);
   res.json({
     pedido,
     bcError: null,
     vendorName: bc.vendorName || null,
-    lineasDisponiblesBC: lineasDisponiblesDesdeBC(bc.lineasBC),
+    lineasDisponiblesBC,
+    albaranes,
+    importe,
     enlaceBC: enlacePedidoCompraBC(pedido),
   });
 });
@@ -6614,7 +8658,7 @@ function jsonUltimaLinea(texto) {
 // El perfil de Edge está en el PC. Desde Docker se llama al servicio
 // de bc_automation (puerto 5055). Si no responde, se lanza el script
 // cuando el archivo está en este equipo.
-async function lanzarScriptTraerAlbaranes(factura, pedido) {
+async function lanzarScriptTraerAlbaranes(factura, pedido, albaranes = []) {
   const script = path.join(__dirname, "..", "bc_automation", "traer_albaranes_compra.py");
   if (!fs.existsSync(script)) {
     return {
@@ -6626,6 +8670,9 @@ async function lanzarScriptTraerAlbaranes(factura, pedido) {
   }
   const { spawn } = require("child_process");
   const candidatos = [process.env.PYTHON_CMD, "py", "python", "python3"].filter(Boolean);
+  const args = [script, factura, pedido];
+  const alb = (Array.isArray(albaranes) ? albaranes : []).map((a) => String(a || "").trim()).filter(Boolean);
+  if (alb.length) args.push(`--albaranes=${alb.join(",")}`);
   let ultimo = "";
   for (const cmd of candidatos) {
     const r = await new Promise((resolve) => {
@@ -6633,7 +8680,7 @@ async function lanzarScriptTraerAlbaranes(factura, pedido) {
       let err = "";
       let proc;
       try {
-        proc = spawn(cmd, [script, factura, pedido], { windowsHide: false, cwd: path.join(__dirname, "..") });
+        proc = spawn(cmd, args, { windowsHide: false, cwd: path.join(__dirname, "..") });
       } catch (e) {
         return resolve({ code: -1, err: String(e), out: "" });
       }
@@ -6662,9 +8709,12 @@ async function lanzarScriptTraerAlbaranes(factura, pedido) {
   };
 }
 
-async function traerAlbaranesCompraUi(numeroFactura, numeroPedido) {
+async function traerAlbaranesCompraUi(numeroFactura, numeroPedido, albaranesElegidos = null) {
   const factura = String(numeroFactura || "").trim();
   const pedido = String(numeroPedido || "").trim();
+  const albaranes = [...new Set((Array.isArray(albaranesElegidos) ? albaranesElegidos : [])
+    .map((a) => String(a || "").trim().toUpperCase())
+    .filter(Boolean))];
   if (!factura || !pedido) return { ok: false, error: "Faltan el nº de factura de BC o el pedido." };
   const base = (process.env.BC_REGISTRO_URL || "http://localhost:5055").replace(/\/$/, "");
   try {
@@ -6672,7 +8722,11 @@ async function traerAlbaranesCompraUi(numeroFactura, numeroPedido) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: AbortSignal.timeout(90000),
-      body: JSON.stringify({ numero_factura: factura, numero_pedido: pedido }),
+      body: JSON.stringify({
+        numero_factura: factura,
+        numero_pedido: pedido,
+        ...(albaranes.length ? { albaranes } : {}),
+      }),
     });
     const datos = await r.json().catch(() => ({}));
     if (datos?.ok) return { ...datos, via: datos.via || "servicio" };
@@ -6690,7 +8744,7 @@ async function traerAlbaranesCompraUi(numeroFactura, numeroPedido) {
   } catch {
     // El servicio no está arrancado: el script abre Edge en este equipo (misma ruta rápida).
   }
-  return lanzarScriptTraerAlbaranes(factura, pedido);
+  return lanzarScriptTraerAlbaranes(factura, pedido, albaranes);
 }
 
 // Borrador de factura de compra: solo cabecera (vendorNumber,
@@ -6701,10 +8755,11 @@ async function traerAlbaranesCompraUi(numeroFactura, numeroPedido) {
 // Si ya hay un borrador abierto de esa factura de proveedor, no se crea
 // otro: se le traen los albaranes.
 app.post("/api/facturas-compra/registrar", async (req, res) => {
-  const { factura, fechaFactura, pedidos, msg, att, pdfBase64, nombreArchivo } = req.body || {};
+  const { factura, fechaFactura, pedidos, msg, att, pdfBase64, nombreArchivo, seleccionPorPedido } = req.body || {};
   const nums = [...new Set((Array.isArray(pedidos) ? pedidos : []).map((p) => String(p || "").trim()).filter(Boolean))];
   if (!factura) return res.status(400).json({ error: "Falta el nº de factura." });
   if (!nums.length) return res.status(400).json({ error: "Falta el pedido incluido en la factura." });
+  const selecciones = seleccionPorPedido && typeof seleccionPorPedido === "object" ? seleccionPorPedido : {};
   try {
     const invoiceDate = fechaIsoFactura(fechaFactura);
     const token = await obtenerTokenBC();
@@ -6756,7 +8811,16 @@ app.post("/api/facturas-compra/registrar", async (req, res) => {
         }
         return res.status(409).json({ error: `El pedido ${pedido} no tiene cantidad pendiente de facturar. No se ha creado un borrador.` });
       }
-      if (pedidoPendienteDeRecibir(lineas)) {
+      // Con albaranes ya elegidos se crea el borrador igual (traer esos ALBC).
+      // Solo se bloquea si el pedido sigue sin recibir y no hay albarán marcado.
+      const selPedido = selecciones[pedido] || selecciones[String(pedido || "").trim()] || {};
+      const albaranesSel = Array.isArray(selPedido.albaranes)
+        ? selPedido.albaranes.map((a) => String(a || "").trim()).filter(Boolean)
+        : [];
+      const lineasSelConAlbaran = Array.isArray(selPedido.lineas)
+        && selPedido.lineas.some((l) => String(l?.albaran || "").trim());
+      const hayAlbaranesElegidos = albaranesSel.length > 0 || lineasSelConAlbaran;
+      if (pedidoPendienteDeRecibir(lineas) && !hayAlbaranesElegidos) {
         return res.status(409).json({
           error: `El pedido ${pedido} todavía no está recibido. Pulsa Registrar: solo recibe el pedido de compra. No se ha creado una factura.`,
         });
@@ -6804,12 +8868,54 @@ app.post("/api/facturas-compra/registrar", async (req, res) => {
 
     const avisos = [];
     const traer = [];
+    // Todos los ALBC de la factura (varios pedidos) en UNA sola pasada:
+    // filtro BC «ALBC1|ALBC2». Si se hacía pedido a pedido, el 2.º borraba el 1.º.
+    const todosAlbaranes = [];
+    let algunModoAlbaran = false;
     for (const item of listos) {
-      const resultado = await traerAlbaranesCompraUi(numero, item.pedido);
-      traer.push({ pedido: item.pedido, ...resultado });
-      if (!resultado.ok) {
-        avisos.push(`Pedido ${item.pedido}: ${resultado.error || "no se han traído los albaranes."}`);
+      const sel = selecciones[item.pedido]
+        || selecciones[String(item.pedido).toUpperCase()]
+        || Object.entries(selecciones).find(([k]) => String(k).toUpperCase().replace(/\s+/g, "") === String(item.pedido).toUpperCase().replace(/\s+/g, ""))?.[1]
+        || null;
+      const albaranesSel = Array.isArray(sel?.albaranes)
+        ? [...new Set(sel.albaranes.map((a) => String(a || "").trim().toUpperCase()).filter(Boolean))]
+        : [];
+      const modoSel = String(sel?.modo || "").toLowerCase();
+      if (modoSel === "albaran") {
+        algunModoAlbaran = true;
+        if (!albaranesSel.length) {
+          return res.status(409).json({
+            error: `El pedido ${item.pedido} tiene varios albaranes: indica cuál(es) incluir. No se han traído todos para no mezclar facturas.`,
+          });
+        }
       }
+      for (const a of albaranesSel) {
+        if (!todosAlbaranes.includes(a)) todosAlbaranes.push(a);
+      }
+    }
+    const pedidoRef = listos.map((x) => x.pedido).join(",");
+    const filtroAlb = todosAlbaranes.length ? todosAlbaranes : (algunModoAlbaran ? [] : null);
+    console.log(
+      `[facturas-compra/registrar] traer ${pedidoRef}`
+      + (filtroAlb?.length ? ` · ALBC ${filtroAlb.join("|")}` : " · todos los albaranes del/los pedido(s)")
+    );
+    const resultado = await traerAlbaranesCompraUi(numero, listos[0].pedido, filtroAlb);
+    const entradaTraer = { pedido: pedidoRef, ...resultado };
+    if (resultado.ok && filtroAlb?.length) {
+      const traidosAlb = (resultado.albaranes || []).map((a) => String(a).toUpperCase());
+      const deMas = traidosAlb.filter((a) => !filtroAlb.includes(a));
+      const faltan = filtroAlb.filter((a) => !traidosAlb.includes(a));
+      if (deMas.length || faltan.length) {
+        entradaTraer.ok = false;
+        entradaTraer.error = [
+          deMas.length ? `han entrado de más ${deMas.join(", ")}` : "",
+          faltan.length ? `faltan ${faltan.join(", ")}` : "",
+        ].filter(Boolean).join("; ") + ". Revisa el borrador en BC.";
+      }
+    }
+    traer.push(entradaTraer);
+    if (!entradaTraer.ok) {
+      avisos.push(`Pedidos ${pedidoRef}: ${entradaTraer.error || "no se han traído los albaranes."}`);
     }
 
     let adjunto = null;
@@ -6827,9 +8933,15 @@ app.post("/api/facturas-compra/registrar", async (req, res) => {
     }
 
     const traidos = traer.filter((t) => t.ok);
+    const errorTraer = traer.map((t) => t.error).filter(Boolean).join(" ");
     const avisoBase = traidos.length
       ? (traidos.find((t) => t.mensaje)?.mensaje || avisoTraerAlbaranesOk({ numero, factura, pedidos: nums, traidos }))
-      : `Borrador ${numero || "sin nº"} creado (proveedor, nº factura y fecha) para el pedido ${nums.join(", ")}. No se han traído los albaranes: arranca python bc_automation/servicio_registro.py y pulsa otra vez.`;
+      : (
+        `Borrador ${numero || "sin nº"} creado (proveedor, nº factura y fecha) para el pedido ${nums.join(", ")}. `
+        + (errorTraer
+          ? `No se han traído los albaranes: ${errorTraer}`
+          : "No se han traído los albaranes: arranca python bc_automation/servicio_registro.py y pulsa otra vez.")
+      );
     const payload = {
       ok: true,
       borrador: true,
@@ -7679,9 +9791,27 @@ function programarBandejaFacturas() {
     }
     setTimeout(bucleLeer, espera);
   };
+  // Cada 5 min: TODAS las pendientes con nº de proveedor vs BC (registradas
+  // → Entradas; PFC* solo aviso borrador). Sin limite: si no, las de más
+  // abajo del índice nunca se tocaban.
+  const bucleReconciliar = async () => {
+    try {
+      const out = await reconciliarFacturasYaEntradasEnBC({ limite: null });
+      const marcadas = (out.resultados || []).filter((r) => r.marcada || r.estado === "registrada");
+      if (marcadas.length) {
+        console.log(`[bandeja] Reconciliación BC: ${marcadas.length} factura(s) ya registradas sacadas de Pendientes → ${marcadas.map((m) => `${m.factura}=${m.numeroBC}`).join(", ")}`);
+      } else if (out.unicasRevisadas) {
+        console.log(`[bandeja] Reconciliación BC: 0 nuevas entradas · ${out.unicasRevisadas} nº revisados · ${out.borradores || 0} borrador(es)`);
+      }
+    } catch (e) {
+      console.warn("[bandeja] Reconciliación BC:", e.message || e);
+    }
+    setTimeout(bucleReconciliar, 5 * 60 * 1000);
+  };
   setTimeout(bucleSync, 4000);
   setTimeout(bucleLeer, 8000);
-  console.log(`[bandeja] El buzón de facturas se actualiza y se lee en segundo plano (${PARALELO_BANDEJA} a la vez).`);
+  setTimeout(bucleReconciliar, 15000);
+  console.log(`[bandeja] El buzón de facturas se actualiza y se lee en segundo plano (${PARALELO_BANDEJA} a la vez). Reconciliación BC de repetidas cada 5 min (todas las pendientes).`);
 }
 
 app.get("/api/facturas-compra/bandeja/pdf", async (req, res) => {
@@ -7769,18 +9899,111 @@ function lineasEscritasEnTexto(texto) {
   return out;
 }
 
-function pedidosEscritosEnTexto(texto) {
+// Misma cola que el frontend (PC26-003946 ≡ PC3946) para no duplicar.
+function colaPedidoEscrito(raw) {
+  const m = String(raw || "").toUpperCase().replace(/\s+/g, "").match(/^(PC|OC)(?:\d{2})?-?(\d+)$/);
+  if (!m) return "";
+  return m[1] + String(Number(m[2]));
+}
+
+// PC/OC tolerante a saltos de línea (cabeceras Herraiz: "PC26-\n004079")
+// y a texto duplicado de pdf-parse ("PC26-003963PC26-003963") — sin \b final.
+const RE_PC_OC_NUM = /((?:PC|OC)\s*(?:\d{2}\s*[-/]\s*\d{3,7}|-\s*\d{3,7}))(?![0-9])/gi;
+
+// Grupos del cuerpo, de arriba abajo (Herraiz): "Pedido: S94046 ( PC26-003963 )"
+// También aguanta "Pedido:Pedido:" / "S94046S94046" / "(( PC…PC… ))".
+const RE_PEDIDO_GRUPO_CUERPO =
+  /pedido\s*(?:n[ºo°.]*)?\s*[:.\-]?\s*(?:pedido\s*(?:n[ºo°.]*)?\s*[:.\-]?\s*)?[^\n]{0,60}?\(\s*((?:PC|OC)\s*\d{2}\s*[-/]\s*\d{3,7})/gi;
+
+// "Su referencia: PC…" / "Nuestra referencia: PC…" (un PC por etiqueta).
+// NO usar "Referencia:" suelta: en Herraiz es un listado de cabecera.
+const RE_SU_REFERENCIA =
+  /(?:su|nuestra)\s+refer[eè]ncia\s*[:.\-]?\s*((?:PC|OC)\s*(?:\d{2}\s*[-/]\s*\d{3,7}|-\s*\d{3,7}))/gi;
+
+function mencionesPedidoEnTexto(texto, re) {
+  const s = String(texto || "");
   const out = [];
-  const vistos = new Set();
-  const re = /\b((?:PC|OC)\s*(?:\d{2}\s*[-/]\s*\d{3,7}|-\s*\d{3,7}))\b/gi;
+  re.lastIndex = 0;
   let m;
-  while ((m = re.exec(String(texto || "")))) {
-    const num = normalizarPedidoEscrito(m[1].replace(/\//g, "-"));
-    if (!num || vistos.has(num)) continue;
-    vistos.add(num);
-    out.push(num);
+  while ((m = re.exec(s))) {
+    const num = normalizarPedidoEscrito(String(m[1] || "").replace(/\//g, "-"));
+    if (!num) continue;
+    out.push({ num, cola: colaPedidoEscrito(num), index: m.index });
   }
   return out;
+}
+
+// Orden de chips = aparición de grupos de líneas en el cuerpo (Pedido:…(PC…)
+// / Su referencia), no el listado de PCs de la esquina de cabecera.
+// Los PC que solo salen en cabecera van al final, para no perderlos.
+function pedidosEscritosEnTexto(texto) {
+  const s = String(texto || "");
+  const out = [];
+  const vistos = new Set();
+  const push = (num) => {
+    const cola = colaPedidoEscrito(num);
+    if (!cola || vistos.has(cola)) return;
+    vistos.add(cola);
+    out.push(num);
+  };
+
+  const cuerpo = [
+    ...mencionesPedidoEnTexto(s, RE_PEDIDO_GRUPO_CUERPO),
+    ...mencionesPedidoEnTexto(s, RE_SU_REFERENCIA),
+  ].sort((a, b) => a.index - b.index || a.cola.localeCompare(b.cola));
+  for (const hit of cuerpo) push(hit.num);
+
+  const inicioCuerpo = cuerpo.length ? cuerpo[0].index : -1;
+  const todos = mencionesPedidoEnTexto(s, RE_PC_OC_NUM);
+  // Primero el resto que aparece desde el primer bloque de cuerpo (o todo
+  // el documento si no hay bloques reconocibles).
+  for (const hit of todos) {
+    if (inicioCuerpo >= 0 && hit.index < inicioCuerpo) continue;
+    push(hit.num);
+  }
+  // Cabecera / resumen: solo al final.
+  if (inicioCuerpo >= 0) {
+    for (const hit of todos) {
+      if (hit.index >= inicioCuerpo) continue;
+      push(hit.num);
+    }
+  }
+  return out;
+}
+
+function indicePedidoEnTexto(texto, pedido) {
+  const cola = colaPedidoEscrito(normalizarPedidoEscrito(pedido) || pedido);
+  if (!cola || !texto) return Number.POSITIVE_INFINITY;
+  const s = String(texto);
+  const cuerpo = [
+    ...mencionesPedidoEnTexto(s, RE_PEDIDO_GRUPO_CUERPO),
+    ...mencionesPedidoEnTexto(s, RE_SU_REFERENCIA),
+  ].filter((h) => h.cola === cola);
+  if (cuerpo.length) return Math.min(...cuerpo.map((h) => h.index));
+
+  const inicioCuerpo = (() => {
+    const todosCuerpo = [
+      ...mencionesPedidoEnTexto(s, RE_PEDIDO_GRUPO_CUERPO),
+      ...mencionesPedidoEnTexto(s, RE_SU_REFERENCIA),
+    ];
+    if (!todosCuerpo.length) return -1;
+    return Math.min(...todosCuerpo.map((h) => h.index));
+  })();
+  const todos = mencionesPedidoEnTexto(s, RE_PC_OC_NUM).filter((h) => h.cola === cola);
+  if (!todos.length) return Number.POSITIVE_INFINITY;
+  if (inicioCuerpo < 0) return Math.min(...todos.map((h) => h.index));
+  const enCuerpo = todos.filter((h) => h.index >= inicioCuerpo);
+  if (enCuerpo.length) return Math.min(...enCuerpo.map((h) => h.index));
+  // Solo en cabecera → después de cualquier PC del cuerpo.
+  return 1e12 + Math.min(...todos.map((h) => h.index));
+}
+
+function ordenarPedidosDetallePorTexto(pedidosDetalle, texto) {
+  if (!Array.isArray(pedidosDetalle) || pedidosDetalle.length < 2 || !texto) return pedidosDetalle;
+  return [...pedidosDetalle]
+    .map((p, i) => ({ p, i, idx: p?.pedido ? indicePedidoEnTexto(texto, p.pedido) : Number.POSITIVE_INFINITY }))
+    .sort((a, b) => (a.idx - b.idx) || (a.i - b.i))
+    .map((x) => x.p);
 }
 
 app.get("/api/facturas-compra/pedidos-factura", async (req, res) => {
@@ -7912,12 +10135,46 @@ app.post("/api/facturas-compra/bandeja/procesada", async (req, res) => {
 // ---------------------------------------------------------------------
 require("./iaBC.cjs")({ app, obtenerTokenBC, fetchConReintento, db });
 require("./contabilidad.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE, db, claveEmpresa });
+require("./panelInicial.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, leerPdfBC, fetchParteAlso });
 require("./macro.cjs")({ app, fetchConReintento, db });
 const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@alsocasals.com";
 require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep, escribirRecep, BUZON_PERSONAL });
-require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL });
+require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL, buzonDelUsuario });
 require("./teamsChatbot.cjs")({ app, db, obtenerTokenGraph, fetchConReintento });
 require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa });
+require("./recepcionFirmas.cjs")({
+  app,
+  obtenerTokenBC,
+  fetchConReintento,
+  EMPRESA_NOMBRE,
+  db,
+  claveEmpresa,
+  leerRecep,
+  escribirRecep,
+  leerVistaPdf: leerVistaPdfRecepcion,
+});
+async function buscarArticulosOferta(filtro) {
+  const token = await obtenerTokenBC();
+  const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/items`;
+  const r = await fetchConReintento(
+    `${base}?$filter=${encodeURIComponent(filtro)}&$top=80&$select=number,displayName,blocked`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!r.ok) throw new Error(`BC respondió ${r.status} al buscar artículos.`);
+  return ((await r.json()).value || []).map((it) => ({
+    numero: it.number,
+    descripcion: it.displayName || "",
+    blocked: !!it.blocked,
+  }));
+}
+require("./ofertasComparar.cjs").registrar({
+  app,
+  fetchConReintento,
+  buscarArticulos: buscarArticulosOferta,
+  empresaNombre: EMPRESA_NOMBRE,
+  db,
+  claveEmpresa,
+});
 require("./albaranVentaCorreo.cjs").registrarRutas({
   app,
   obtenerTokenBC,

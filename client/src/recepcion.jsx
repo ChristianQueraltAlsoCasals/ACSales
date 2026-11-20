@@ -15,10 +15,15 @@
  * Marcas de revisado y fechas editadas: COMPARTIDAS entre equipos, vía
  * el backend (/api/recepcion), no en el navegador.
  */
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { RefreshCw, Search, CheckCircle2, Mail, X, Upload, ChevronRight, ChevronDown, Send, StickyNote, Trash2, Paperclip } from "lucide-react";
-import { emailsPorCodigoDepartamento, copiasAdministracion } from "./departamentos.js";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
+import { RefreshCw, Search, CheckCircle2, Mail, X, Upload, ChevronRight, ChevronDown, Send, StickyNote, Trash2, Paperclip, Plus, User } from "lucide-react";
+import { emailsPorCodigoDepartamento, copiasAdministracion, codigoDepartamentoDesdeUnidad, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
 import { empresaGuardada } from "./empresa.jsx";
+
+// Un mismo PDF pedido desde Validación de facturas: si React remonta
+// la pantalla a mitad de la lectura, la segunda montura espera esta promesa.
+const extraccionDesdeFactura = { id: null, promesa: null, pdf: null };
 
 // --- utilidades de formato (es-ES) ---
 const parseNum = (v) => {
@@ -48,6 +53,11 @@ const fmtFecha = (s) => {
   const d = parseFecha(s);
   if (!d || d.getFullYear() < 1900) return "";
   return d.toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric" });
+};
+const fechaCorta = (s) => {
+  const d = parseFecha(s);
+  if (!d || d.getFullYear() < 1900) return "";
+  return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getFullYear()).slice(2)}`;
 };
 const fmtCant = (n) => (isNaN(n) ? "—" : n.toLocaleString("es-ES", { maximumFractionDigits: 3 }));
 const escHtml = (v) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -108,6 +118,7 @@ function colsLineas(headers) {
   return {
     // Español (tras mapeo) e inglés (crudo de BC).
     doc: H(/^document_no$/) || H(/n[º°o]?\.?\s*documento/),
+    tipo: H(/^document_type$/) || H(/tipo de documento/),
     importe: H(/^line_amount$/) || H(/importe l[ií]nea/),
     pend: H(/^outstanding_quantity$/) || H(/cantidad pendiente/),
     ot: H(/^shortcut_dimension_2_code$/) || H(/c[oó]d\.?\s*ot/),
@@ -135,14 +146,31 @@ function getRecepData(pedidos, lineas, recepFechas) {
   const hoy = new Date();
   const pendientes = [], excluidos = [];
 
-  // Índice de líneas por nº de pedido
+  // Índice de líneas por nº de pedido.
+  // El refresco horario puede haber guardado la MISMA línea (mismo tipo +
+  // documento + nº de línea) muchas veces. Se deja la última copia. Dos
+  // líneas distintas del mismo artículo (nº de línea distinto) se mantienen.
   const idxLineas = {};
   if (lineas?.headers?.length) {
     const lc = colsLineas(lineas.headers);
     if (lc.doc) {
+      const filasLinea = [];
+      const porClave = new Map();
       lineas.rows.forEach((r) => {
         const pc = String(r[lc.doc] || "").trim().toUpperCase();
         if (!pc) return;
+        const lineNo = lc.lineNo ? Number(r[lc.lineNo]) || 0 : 0;
+        if (lineNo > 0) {
+          const tipo = lc.tipo ? String(r[lc.tipo] || "").trim() : "";
+          const clave = `${pc}|${tipo}|${lineNo}`;
+          const ya = porClave.get(clave);
+          if (ya != null) { filasLinea[ya] = r; return; }
+          porClave.set(clave, filasLinea.length);
+        }
+        filasLinea.push(r);
+      });
+      filasLinea.forEach((r) => {
+        const pc = String(r[lc.doc] || "").trim().toUpperCase();
         if (!idxLineas[pc]) idxLineas[pc] = { importe: 0, pendiente: 0, ot: "", un: "", lineas: [] };
         const o = idxLineas[pc];
         const impL = parseNum(r[lc.importe]);
@@ -223,6 +251,41 @@ const COLOR_PRIORIDAD = {
   Revisar: "bg-amber-100 text-amber-700 border-amber-200",
   Normal: "bg-slate-100 text-slate-500 border-slate-200",
 };
+const RANK_PRIORIDAD = { Urgente: 4, Reclamar: 3, Revisar: 2, Normal: 1 };
+
+function valorOrdenRecepcion(p, col, recep) {
+  switch (col) {
+    case "Pedido": return p.num || "";
+    case "Tipo": return p.tipoDoc || "";
+    case "Fecha": return parseFecha(p.fecha)?.getTime() ?? null;
+    case "Recepción prevista": return parseFecha(p.recepPrev)?.getTime() ?? null;
+    case "Días": return p.dias == null || Number.isNaN(Number(p.dias)) ? null : Number(p.dias);
+    case "Proveedor": return p.prov || "";
+    case "Comprador": return p.comprador || "";
+    case "Un. negocio": return p.depto || "";
+    case "OT": return p.ot || "";
+    case "Alianza": return p.alianza ? "Sí" : "";
+    case "Importe": return Number(p.imp) || 0;
+    case "Imp. pendiente": return Number(p.impPend) || 0;
+    case "Prioridad": return RANK_PRIORIDAD[p.prioridad] || 0;
+    case "Alertas": return (p.alertas || []).join(" ");
+    case "Revisado": return recep.revisados?.[p.num]?.ts ? new Date(recep.revisados[p.num].ts).getTime() : null;
+    case "Notas": return (recep.notas?.[p.num] || []).length;
+    case "Reclamado": return recep.reclamados?.[p.num]?.ts ? new Date(recep.reclamados[p.num].ts).getTime() : null;
+    default: return "";
+  }
+}
+
+function compararOrden(a, b, dir) {
+  const vacio = (v) => v == null || v === "";
+  if (vacio(a) && vacio(b)) return 0;
+  if (vacio(a)) return 1;
+  if (vacio(b)) return -1;
+  const r = typeof a === "number" && typeof b === "number"
+    ? a - b
+    : String(a).localeCompare(String(b), "es", { numeric: true, sensitivity: "base" });
+  return dir === "desc" ? -r : r;
+}
 
 // ---------------------------------------------------------------------
 // RECLAMACIÓN AL PROVEEDOR — borrador de correo con las líneas pendientes
@@ -237,7 +300,16 @@ const NOMBRE_DEPTO = {
   MAN: "Mantenimiento",
   AUT: "Automatización",
   CON: "Construcción",
+  AMT: "Amianto",
 };
+
+const DEPTOS_RESPONSABLE = [
+  { codigo: "INS", nombre: "Instalaciones" },
+  { codigo: "MAN", nombre: "Mantenimiento" },
+  { codigo: "CON", nombre: "Construcción" },
+  { codigo: "AMT", nombre: "Amianto" },
+  { codigo: "AUT", nombre: "Automatización" },
+];
 
 function etiquetaDepartamento(codigo) {
   const raw = String(codigo || "").trim();
@@ -596,6 +668,680 @@ const CARGOS_PROD_RESPALDO = [
   { numero: "TASARES", descripcion: "TASA RESIDUOS" },
   { numero: "TRANSPORTE", descripcion: "TRANSPORTE" },
 ];
+function emailRecordadoProveedor(map, nombre) {
+  const n = String(nombre || "").trim().toLowerCase();
+  if (!n || !map) return "";
+  const exacta = Object.keys(map).find((k) => String(k).trim().toLowerCase() === n);
+  if (exacta) return map[exacta] || "";
+  if (n.length < 4) return "";
+  const parcial = Object.keys(map).filter((k) => {
+    const kl = String(k).trim().toLowerCase();
+    return kl.includes(n) || n.includes(kl);
+  });
+  return parcial.length === 1 ? (map[parcial[0]] || "") : "";
+}
+
+function lineasParaConsulta(g) {
+  const dePdf = (g?.lineasPdf || []).filter((l) => l && l.descripcion);
+  if (dePdf.length) return dePdf.map((l) => ({ descripcion: l.descripcion, cantidad: l.cantidad }));
+  return (g?.lineas || [])
+    .filter((l) => l && l.descripcionAlbaran)
+    .map((l) => ({ descripcion: l.descripcionAlbaran, cantidad: l.cantidadAlbaran }));
+}
+
+function textoConsultaPc({ proveedor, albaran, archivo, pedido, lineas }) {
+  const alb = albaran ? albaran : "(sin número)";
+  const deQuien = proveedor ? ` de ${proveedor}` : "";
+  const doc = archivo ? ` Documento: ${archivo}.` : "";
+  const filas = (lineas || [])
+    .filter((l) => l.descripcion)
+    .map((l) => `· ${l.descripcion}${l.cantidad != null && l.cantidad !== "" ? ` — cantidad ${l.cantidad}` : ""}`);
+  const bloque = filas.length ? `\n\nMaterial leído en el albarán:\n${filas.join("\n")}` : "";
+  if (pedido) {
+    return `Buenos días,\n\nHemos recibido el albarán ${alb}${deQuien}.${doc}\n\nEn el documento figura el pedido de compra ${pedido}. ¿Nos podéis confirmar a qué OT corresponde esta entrega?${bloque}`;
+  }
+  return `Buenos días,\n\nHemos recibido el albarán ${alb}${deQuien}.${doc}\n\nEn el documento no aparece nuestro número de pedido de compra (PC).\n\n¿Nos podéis indicar a qué pedido de compra (PC) o a qué OT corresponde esta entrega?${bloque}`;
+}
+
+function asuntoConsultaPc({ albaran, pedido }) {
+  const alb = albaran || "sin número";
+  const empresa = razonEmpresaFirma();
+  if (!pedido) return `Albarán ${alb} — ¿a qué pedido de compra (PC) u OT corresponde? – ${empresa}`;
+  return `Albarán ${alb} — pedido ${pedido}: ¿a qué OT corresponde? – ${empresa}`;
+}
+
+function htmlConsultaPc(intro, cierre) {
+  const cuerpo = [intro, cierre].filter(Boolean).map((t) => escHtml(t).split(/\n/).join("<br>")).join("<br><br>");
+  return `<div style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#1e293b">${cuerpo}</div>`;
+}
+
+function bytesDeBase64(b64) {
+  const limpio = String(b64 || "").replace(/\s/g, "");
+  if (!limpio) return 0;
+  const pad = limpio.endsWith("==") ? 2 : limpio.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor(limpio.length * 3 / 4) - pad);
+}
+
+function nombrePdfConsulta(albaran, pedido) {
+  const base = String(albaran || pedido || "albaran").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+  return `Albaran_${base}.pdf`;
+}
+
+// Pregunta, sin enviar al primer clic, a qué PC u OT pertenece un albarán.
+// Mismo envío que la reclamación: /api/correo/enviar, desde el buzón de quien está logueado.
+function ModalConsultaPc({ grupo, emailsProveedor, onClose, onEnviado }) {
+  const [proveedor, setProveedor] = useState(grupo.proveedor || "");
+  const [para, setPara] = useState(() => emailRecordadoProveedor(emailsProveedor, grupo.proveedor));
+  const paraTocado = useRef(false);
+  const [emailBC, setEmailBC] = useState(null);
+  const [remitente, setRemitente] = useState("");
+  const ccTocado = useRef(false);
+  const [cc, setCc] = useState("");
+  const cierreTocado = useRef(false);
+  const [cierre, setCierre] = useState(() => textoCierre(""));
+  const introTocado = useRef(false);
+  const [intro, setIntro] = useState(() => textoConsultaPc(grupo));
+  const [asunto, setAsunto] = useState(() => asuntoConsultaPc(grupo));
+  const pdfBytes = bytesDeBase64(grupo.pdfBase64);
+  const pdfOk = pdfBytes > 0 && pdfBytes <= TOPE_FICHERO;
+  const [adjuntarPdf, setAdjuntarPdf] = useState(pdfOk);
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.email) setRemitente(d.email);
+        if (!cierreTocado.current) setCierre(textoCierre(d.nombre));
+        if (!ccTocado.current) setCc(copiasAdministracion(d.email).join("; "));
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const nombre = proveedor.trim();
+    if (!nombre) { setEmailBC(""); return; }
+    let vivo = true;
+    setEmailBC(null);
+    const qs = new URLSearchParams({ nombre });
+    fetch(`/api/bc/proveedor-email?${qs}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (!vivo) return;
+        const e = (d && d.email) || "";
+        setEmailBC(e);
+        if (!paraTocado.current) setPara(e || emailRecordadoProveedor(emailsProveedor, nombre));
+      })
+      .catch(() => { if (vivo) setEmailBC(""); });
+    return () => { vivo = false; };
+  }, [proveedor, emailsProveedor]);
+
+  useEffect(() => {
+    if (introTocado.current) return;
+    setIntro(textoConsultaPc({ ...grupo, proveedor: proveedor.trim() }));
+  }, [proveedor, grupo]);
+
+  const html = useMemo(() => htmlConsultaPc(intro, cierre), [intro, cierre]);
+
+  const enviar = async () => {
+    const dest = partirEmails(para);
+    if (!dest.length) { setError("Escribe al menos un destinatario en Para. No se envía nada hasta que lo confirmes."); return; }
+    if (!(asunto || "").trim()) { setError("El asunto está vacío."); return; }
+    setEnviando(true);
+    setError(null);
+    try {
+      const adjuntos = adjuntarPdf && pdfOk
+        ? [{ nombre: nombrePdfConsulta(grupo.albaran, grupo.pedido), base64: grupo.pdfBase64, mime: "application/pdf" }]
+        : [];
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: dest,
+          cc: partirEmails(cc),
+          asunto: asunto.trim(),
+          cuerpoHtml: html,
+          adjuntos,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      const escrito = dest.join("; ");
+      onEnviado({
+        proveedor: proveedor.trim(),
+        para: escrito,
+        recordarEmail: proveedor.trim() && escrito !== (emailBC || "") ? escrito : null,
+      });
+    } catch (err) {
+      setError(err.message || String(err));
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[92vh] overflow-y-auto p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Mail size={18} /> Preguntar a qué PC u OT corresponde</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+        <p className="text-[12px] text-slate-500 mb-3">
+          Revisa destinatario, asunto y texto. No se envía hasta que pulses Enviar.
+          {grupo.pedido ? ` Pedido leído: ${grupo.pedido}.` : " Este albarán no trae número de pedido de compra."}
+          {grupo.albaran ? ` Albarán ${grupo.albaran}.` : ""}
+        </p>
+
+        <div className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-2 items-center text-[13px] mb-3">
+          <label className="text-xs font-semibold text-slate-500">Proveedor</label>
+          <div>
+            <input value={proveedor} onChange={(e) => setProveedor(e.target.value)} placeholder="Nombre tal como está en la ficha de BC, si lo conoces" className="w-full border border-slate-300 rounded px-2 py-1" />
+            <div className="text-[10px] text-slate-400 mt-0.5">Solo sirve para buscar el email. No crea el pedido.</div>
+          </div>
+          <label className="text-xs font-semibold text-slate-500">Para</label>
+          <div>
+            <input value={para} onChange={(e) => { paraTocado.current = true; setPara(e.target.value); }} placeholder="email del proveedor o de quien deba decir el PC o la OT" className="w-full border border-slate-300 rounded px-2 py-1" />
+            <div className="text-[10px] text-slate-400 mt-0.5">
+              {!proveedor.trim()
+                ? "Sin nombre de proveedor no se puede buscar el email. Escríbelo en Para."
+                : emailBC === null
+                  ? "Consultando la ficha del proveedor en BC…"
+                  : emailBC
+                    ? `Ficha BC: ${emailBC}`
+                    : "La ficha del proveedor en BC no tiene email con ese nombre exacto. Escríbelo y se recordará."}
+            </div>
+          </div>
+          <label className="text-xs font-semibold text-slate-500">CC</label>
+          <input value={cc} onChange={(e) => { ccTocado.current = true; setCc(e.target.value); }} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500">Asunto</label>
+          <input value={asunto} onChange={(e) => setAsunto(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Texto</label>
+          <textarea value={intro} onChange={(e) => { introTocado.current = true; setIntro(e.target.value); }} rows={9} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Despedida</label>
+          <textarea value={cierre} onChange={(e) => { cierreTocado.current = true; setCierre(e.target.value); }} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
+        </div>
+
+        <label className="flex items-center gap-2 text-[12px] text-slate-600 mb-3">
+          <input type="checkbox" checked={adjuntarPdf && pdfOk} disabled={!pdfOk} onChange={(e) => setAdjuntarPdf(e.target.checked)} />
+          {pdfOk
+            ? `Adjuntar el PDF de este albarán (${nombrePdfConsulta(grupo.albaran, grupo.pedido)})`
+            : grupo.pdfBase64
+              ? "El PDF pesa más de 3 MB y no se puede adjuntar a este correo."
+              : "Este albarán no tiene PDF para adjuntar."}
+        </label>
+
+        <div className="text-xs font-semibold text-slate-500 mb-1">Vista previa del correo</div>
+        <div className="border border-slate-200 rounded-md p-3 bg-slate-50 max-h-52 overflow-y-auto text-[13px]" dangerouslySetInnerHTML={{ __html: html }} />
+        {remitente && <div className="text-[10px] text-slate-400 mt-1">Se enviará desde {remitente}.</div>}
+
+        {error && <div className="mt-3 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded p-2">✗ {error}</div>}
+
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onClose} className="text-sm border border-slate-300 rounded-md px-4 py-2 hover:bg-slate-50">Cancelar</button>
+          <button onClick={enviar} disabled={enviando} className="flex items-center gap-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-md px-4 py-2">
+            {enviando ? <RefreshCw size={14} className="animate-spin" /> : <Send size={14} />} Enviar consulta
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function textoConsultaResponsable({ proveedor, albaran, pedido, ot, lineas }) {
+  const alb = albaran ? `el albarán ${albaran}` : "un albarán";
+  const deQuien = proveedor ? ` de ${proveedor}` : "";
+  const otTxt = ot
+    ? `En el pedido figura la OT ${ot}.`
+    : "En el pedido no figura ninguna OT.";
+  const filas = (lineas || [])
+    .filter((l) => l.descripcion)
+    .map((l) => `· ${l.descripcion}${l.cantidad != null && l.cantidad !== "" ? ` — cantidad ${l.cantidad}` : ""}`);
+  const bloque = filas.length ? `\n\nMaterial leído en el albarán:\n${filas.join("\n")}` : "";
+  return `Buenos días,\n\nHemos recibido ${alb}${deQuien}. En el documento figura el pedido de compra ${pedido || "(sin número)"}.\n\n${otTxt}\n\n¿Nos podéis confirmar si este pedido es correcto y a qué OT corresponde?${bloque}`;
+}
+
+function asuntoConsultaResponsable({ pedido, albaran }) {
+  const cual = pedido ? `Pedido ${pedido}` : `Albarán ${albaran || "sin número"}`;
+  return `${cual} — ¿es correcto y a qué OT corresponde? – ${razonEmpresaFirma()}`;
+}
+
+function destinosResponsable(codigo, emailRemitente) {
+  const depto = codigoDepartamentoDesdeUnidad(codigo);
+  if (!depto) return { para: [], cc: copiasAdministracion(emailRemitente) };
+  const listas = listasCorreoDepartamento(depto);
+  return aplicarRemitente(listas.para, listas.cc, emailRemitente);
+}
+
+// Pregunta al responsable del departamento, sin enviar al primer clic,
+// si el pedido de esta recepción es correcto y a qué OT corresponde.
+function ModalConsultaResponsable({ grupo, onClose, onEnviado }) {
+  const deptoInicial = codigoDepartamentoDesdeUnidad(grupo.departamento) || "";
+  const [depto, setDepto] = useState(deptoInicial);
+  const [para, setPara] = useState("");
+  const paraTocado = useRef(false);
+  const [remitente, setRemitente] = useState("");
+  const ccTocado = useRef(false);
+  const [cc, setCc] = useState("");
+  const cierreTocado = useRef(false);
+  const [cierre, setCierre] = useState(() => textoCierre(""));
+  const [intro, setIntro] = useState(() => textoConsultaResponsable(grupo));
+  const [asunto, setAsunto] = useState(() => asuntoConsultaResponsable(grupo));
+  const pdfBytes = bytesDeBase64(grupo.pdfBase64);
+  const pdfOk = pdfBytes > 0 && pdfBytes <= TOPE_FICHERO;
+  const [adjuntarPdf, setAdjuntarPdf] = useState(pdfOk);
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState(null);
+  const deptoRef = useRef(deptoInicial);
+
+  const aplicarDestinos = (codigo, emailRemitente, forzarPara, forzarCc) => {
+    const d = destinosResponsable(codigo, emailRemitente);
+    if (forzarPara || !paraTocado.current) setPara(d.para.join("; "));
+    if (forzarCc || !ccTocado.current) setCc(d.cc.join("; "));
+  };
+
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.email) setRemitente(d.email);
+        if (!cierreTocado.current) setCierre(textoCierre(d.nombre));
+        aplicarDestinos(deptoRef.current, d.email, false, false);
+      })
+      .catch(() => {});
+  }, []);
+
+  const elegirDepto = (codigo) => {
+    deptoRef.current = codigo;
+    setDepto(codigo);
+    paraTocado.current = false;
+    ccTocado.current = false;
+    aplicarDestinos(codigo, remitente, true, true);
+  };
+
+  const html = useMemo(() => htmlConsultaPc(intro, cierre), [intro, cierre]);
+  const etiqueta = etiquetaDepartamento(depto);
+
+  const enviar = async () => {
+    const dest = partirEmails(para);
+    if (!dest.length) {
+      setError(depto ? "Escribe al menos un destinatario en Para." : "Elige el departamento del responsable, o escribe el correo en Para.");
+      return;
+    }
+    if (!(asunto || "").trim()) { setError("El asunto está vacío."); return; }
+    setEnviando(true);
+    setError(null);
+    try {
+      const adjuntos = adjuntarPdf && pdfOk
+        ? [{ nombre: nombrePdfConsulta(grupo.albaran, grupo.pedido), base64: grupo.pdfBase64, mime: "application/pdf" }]
+        : [];
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: dest,
+          cc: partirEmails(cc),
+          asunto: asunto.trim(),
+          cuerpoHtml: html,
+          adjuntos,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      onEnviado({ pedido: grupo.pedido, para: dest.join("; "), depto: etiqueta });
+    } catch (err) {
+      setError(err.message || String(err));
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[92vh] overflow-y-auto p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Mail size={18} /> Preguntar al responsable</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+        <p className="text-[12px] text-slate-500 mb-3">
+          Pregunta si el pedido {grupo.pedido || "de este albarán"} es correcto y a qué OT corresponde.
+          Revisa destinatario y texto. No se envía hasta que pulses Enviar.
+          {grupo.ot ? ` OT en el pedido: ${grupo.ot}.` : " Este pedido no tiene OT en BC."}
+        </p>
+
+        <div className="mb-3">
+          <div className="text-xs font-semibold text-slate-500 mb-1">Responsable del departamento</div>
+          <div className="flex flex-wrap gap-1.5">
+            {DEPTOS_RESPONSABLE.map((d) => (
+              <button
+                key={d.codigo}
+                type="button"
+                onClick={() => elegirDepto(d.codigo)}
+                className={`text-[12px] font-semibold rounded-full px-3 py-1 border ${
+                  depto === d.codigo
+                    ? "bg-blue-600 text-white border-blue-600"
+                    : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
+                }`}
+              >
+                {d.nombre}
+              </button>
+            ))}
+          </div>
+          <div className="text-[10px] text-slate-400 mt-1">
+            {depto
+              ? `Responsables: ${(emailsPorCodigoDepartamento(depto) || []).join(", ") || "sin correos de este departamento"}`
+              : "El pedido no tiene departamento en BC. Elige a quién preguntar."}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-2 items-center text-[13px] mb-3">
+          <label className="text-xs font-semibold text-slate-500">Para</label>
+          <input value={para} onChange={(e) => { paraTocado.current = true; setPara(e.target.value); }} placeholder="correo del responsable" className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500">CC</label>
+          <input value={cc} onChange={(e) => { ccTocado.current = true; setCc(e.target.value); }} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500">Asunto</label>
+          <input value={asunto} onChange={(e) => setAsunto(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Texto</label>
+          <textarea value={intro} onChange={(e) => setIntro(e.target.value)} rows={9} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Despedida</label>
+          <textarea value={cierre} onChange={(e) => { cierreTocado.current = true; setCierre(e.target.value); }} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
+        </div>
+
+        <label className="flex items-center gap-2 text-[12px] text-slate-600 mb-3">
+          <input type="checkbox" checked={adjuntarPdf && pdfOk} disabled={!pdfOk} onChange={(e) => setAdjuntarPdf(e.target.checked)} />
+          {pdfOk
+            ? `Adjuntar el PDF de este albarán (${nombrePdfConsulta(grupo.albaran, grupo.pedido)})`
+            : grupo.pdfBase64
+              ? "El PDF pesa más de 3 MB y no se puede adjuntar a este correo."
+              : "Este albarán no tiene PDF para adjuntar."}
+        </label>
+
+        <div className="text-xs font-semibold text-slate-500 mb-1">Vista previa del correo</div>
+        <div className="border border-slate-200 rounded-md p-3 bg-slate-50 max-h-52 overflow-y-auto text-[13px]" dangerouslySetInnerHTML={{ __html: html }} />
+        {remitente && <div className="text-[10px] text-slate-400 mt-1">Se enviará desde {remitente}.</div>}
+
+        {error && <div className="mt-3 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded p-2">✗ {error}</div>}
+
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onClose} className="text-sm border border-slate-300 rounded-md px-4 py-2 hover:bg-slate-50">Cancelar</button>
+          <button onClick={enviar} disabled={enviando} className="flex items-center gap-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-md px-4 py-2">
+            {enviando ? <RefreshCw size={14} className="animate-spin" /> : <Send size={14} />} Enviar al responsable
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function textoPedidoIncorrecto({ proveedor, albaran, pedido, lineas }) {
+  const empresa = razonEmpresaFirma();
+  const alb = albaran ? `el albarán ${albaran}` : "un albarán";
+  const deQuien = proveedor ? ` de ${proveedor}` : "";
+  const num = pedido
+    ? `En el documento figura el número de pedido ${pedido}. Ese número no es correcto: no corresponde a un pedido de compra de ${empresa}.`
+    : `En el documento no figura un número de pedido de compra correcto de ${empresa}.`;
+  const filas = (lineas || [])
+    .filter((l) => l.descripcion)
+    .map((l) => `· ${l.descripcion}${l.cantidad != null && l.cantidad !== "" ? ` — cantidad ${l.cantidad}` : ""}`);
+  const bloque = filas.length ? `\n\nMaterial leído en el albarán:\n${filas.join("\n")}` : "";
+  return `Buenos días,\n\nHemos recibido ${alb}${deQuien}.\n\n${num}\n\n¿Nos podéis indicar el número de pedido de compra correcto de esta entrega?${bloque}`;
+}
+
+function asuntoPedidoIncorrecto({ pedido, albaran }) {
+  const empresa = razonEmpresaFirma();
+  const alb = albaran ? `Albarán ${albaran}` : "Albarán sin número";
+  if (pedido) return `${alb} — el nº de pedido ${pedido} es incorrecto – ${empresa}`;
+  return `${alb} — el nº de pedido es incorrecto – ${empresa}`;
+}
+
+// Avisa, sin enviar al primer clic, de que el nº de pedido del albarán no es correcto.
+// Destino: responsable del departamento o proveedor.
+function ModalPedidoIncorrecto({ grupo, emailsProveedor, onClose, onEnviado }) {
+  const inicial = grupo.noEncontrado ? "proveedor" : "responsable";
+  const [tipo, setTipo] = useState(inicial);
+  const tipoRef = useRef(inicial);
+  const deptoInicial = codigoDepartamentoDesdeUnidad(grupo.departamento) || "";
+  const [depto, setDepto] = useState(deptoInicial);
+  const deptoRef = useRef(deptoInicial);
+  const [proveedor, setProveedor] = useState(grupo.proveedor || "");
+  const [para, setPara] = useState("");
+  const paraTocado = useRef(false);
+  const [emailBC, setEmailBC] = useState(null);
+  const emailProveedorRef = useRef(emailRecordadoProveedor(emailsProveedor, grupo.proveedor));
+  const [remitente, setRemitente] = useState("");
+  const ccTocado = useRef(false);
+  const [cc, setCc] = useState("");
+  const cierreTocado = useRef(false);
+  const [cierre, setCierre] = useState(() => textoCierre(""));
+  const introTocado = useRef(false);
+  const [intro, setIntro] = useState(() => textoPedidoIncorrecto(grupo));
+  const [asunto, setAsunto] = useState(() => asuntoPedidoIncorrecto(grupo));
+  const pdfBytes = bytesDeBase64(grupo.pdfBase64);
+  const pdfOk = pdfBytes > 0 && pdfBytes <= TOPE_FICHERO;
+  const [adjuntarPdf, setAdjuntarPdf] = useState(pdfOk);
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState(null);
+
+  const aplicarResponsable = (codigo, emailRemitente, forzar) => {
+    const d = destinosResponsable(codigo, emailRemitente);
+    if (forzar || !paraTocado.current) setPara(d.para.join("; "));
+    if (forzar || !ccTocado.current) setCc(d.cc.join("; "));
+  };
+
+  const aplicarProveedor = (emailRemitente, emailPara, forzarPara) => {
+    if (forzarPara || !paraTocado.current) setPara(emailPara || "");
+    if (!ccTocado.current) setCc(copiasAdministracion(emailRemitente).join("; "));
+  };
+
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.email) setRemitente(d.email);
+        if (!cierreTocado.current) setCierre(textoCierre(d.nombre));
+        if (tipoRef.current === "responsable") aplicarResponsable(deptoRef.current, d.email, false);
+        else aplicarProveedor(d.email, emailProveedorRef.current, false);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const nombre = proveedor.trim();
+    if (!nombre) { setEmailBC(""); return; }
+    let vivo = true;
+    setEmailBC(null);
+    const qs = new URLSearchParams({ nombre });
+    fetch(`/api/bc/proveedor-email?${qs}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (!vivo) return;
+        const e = (d && d.email) || "";
+        setEmailBC(e);
+        emailProveedorRef.current = e || emailRecordadoProveedor(emailsProveedor, nombre);
+        if (tipoRef.current === "proveedor") aplicarProveedor(remitente, emailProveedorRef.current, false);
+      })
+      .catch(() => { if (vivo) setEmailBC(""); });
+    return () => { vivo = false; };
+  }, [proveedor, emailsProveedor, remitente]);
+
+  useEffect(() => {
+    if (introTocado.current) return;
+    setIntro(textoPedidoIncorrecto({ ...grupo, proveedor: proveedor.trim() }));
+  }, [proveedor, grupo]);
+
+  const elegirTipo = (t) => {
+    tipoRef.current = t;
+    setTipo(t);
+    paraTocado.current = false;
+    ccTocado.current = false;
+    if (t === "responsable") aplicarResponsable(deptoRef.current, remitente, true);
+    else aplicarProveedor(remitente, emailProveedorRef.current, true);
+  };
+
+  const elegirDepto = (codigo) => {
+    deptoRef.current = codigo;
+    setDepto(codigo);
+    if (tipoRef.current !== "responsable") return;
+    paraTocado.current = false;
+    ccTocado.current = false;
+    aplicarResponsable(codigo, remitente, true);
+  };
+
+  const html = useMemo(() => htmlConsultaPc(intro, cierre), [intro, cierre]);
+  const etiqueta = etiquetaDepartamento(depto);
+
+  const enviar = async () => {
+    const dest = partirEmails(para);
+    if (!dest.length) {
+      setError(tipo === "proveedor"
+        ? "Escribe el correo del proveedor en Para."
+        : (depto ? "Escribe al menos un destinatario en Para." : "Elige el departamento del responsable, o escribe el correo en Para."));
+      return;
+    }
+    if (!(asunto || "").trim()) { setError("El asunto está vacío."); return; }
+    setEnviando(true);
+    setError(null);
+    try {
+      const adjuntos = adjuntarPdf && pdfOk
+        ? [{ nombre: nombrePdfConsulta(grupo.albaran, grupo.pedido), base64: grupo.pdfBase64, mime: "application/pdf" }]
+        : [];
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: dest,
+          cc: partirEmails(cc),
+          asunto: asunto.trim(),
+          cuerpoHtml: html,
+          adjuntos,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      const escrito = dest.join("; ");
+      onEnviado({
+        pedido: grupo.pedido,
+        para: escrito,
+        tipo,
+        depto: tipo === "responsable" ? etiqueta : "",
+        proveedor: proveedor.trim(),
+        recordarEmail: tipo === "proveedor" && proveedor.trim() && escrito !== (emailBC || "") ? escrito : null,
+      });
+    } catch (err) {
+      setError(err.message || String(err));
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[92vh] overflow-y-auto p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Mail size={18} /> Nº de pedido incorrecto</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+        <p className="text-[12px] text-slate-500 mb-3">
+          Avisa de que el número de pedido del albarán no es correcto y pide el bueno.
+          Revisa destinatario y texto. No se envía hasta que pulses Enviar.
+          {grupo.pedido ? ` Número leído: ${grupo.pedido}.` : ""}
+          {grupo.albaran ? ` Albarán ${grupo.albaran}.` : ""}
+        </p>
+
+        <div className="flex flex-wrap gap-1.5 mb-3">
+          <button
+            type="button"
+            onClick={() => elegirTipo("responsable")}
+            className={`text-[12px] font-semibold rounded-full px-3 py-1 border ${tipo === "responsable" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+          >
+            Al responsable
+          </button>
+          <button
+            type="button"
+            onClick={() => elegirTipo("proveedor")}
+            className={`text-[12px] font-semibold rounded-full px-3 py-1 border ${tipo === "proveedor" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+          >
+            Al proveedor
+          </button>
+        </div>
+
+        {tipo === "responsable" ? (
+          <div className="mb-3">
+            <div className="text-xs font-semibold text-slate-500 mb-1">Responsable del departamento</div>
+            <div className="flex flex-wrap gap-1.5">
+              {DEPTOS_RESPONSABLE.map((d) => (
+                <button
+                  key={d.codigo}
+                  type="button"
+                  onClick={() => elegirDepto(d.codigo)}
+                  className={`text-[12px] font-semibold rounded-full px-3 py-1 border ${
+                    depto === d.codigo ? "bg-slate-800 text-white border-slate-800" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
+                  }`}
+                >
+                  {d.nombre}
+                </button>
+              ))}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">
+              {depto
+                ? `Responsables: ${(emailsPorCodigoDepartamento(depto) || []).join(", ") || "sin correos de este departamento"}`
+                : "Elige el departamento. Si el pedido no está en BC, no hay departamento asignado."}
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-1 items-center text-[13px] mb-3">
+            <label className="text-xs font-semibold text-slate-500">Proveedor</label>
+            <div>
+              <input value={proveedor} onChange={(e) => setProveedor(e.target.value)} placeholder="Nombre tal como está en la ficha de BC" className="w-full border border-slate-300 rounded px-2 py-1" />
+              <div className="text-[10px] text-slate-400 mt-0.5">
+                {!proveedor.trim()
+                  ? "Escribe el proveedor para buscar su email, o pon el correo directamente en Para."
+                  : emailBC === null
+                    ? "Consultando la ficha del proveedor en BC…"
+                    : emailBC
+                      ? `Ficha BC: ${emailBC}`
+                      : "La ficha del proveedor en BC no tiene email con ese nombre. Escríbelo en Para y se recordará."}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-2 items-center text-[13px] mb-3">
+          <label className="text-xs font-semibold text-slate-500">Para</label>
+          <input value={para} onChange={(e) => { paraTocado.current = true; setPara(e.target.value); }} placeholder={tipo === "proveedor" ? "email del proveedor" : "correo del responsable"} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500">CC</label>
+          <input value={cc} onChange={(e) => { ccTocado.current = true; setCc(e.target.value); }} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500">Asunto</label>
+          <input value={asunto} onChange={(e) => setAsunto(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Texto</label>
+          <textarea value={intro} onChange={(e) => { introTocado.current = true; setIntro(e.target.value); }} rows={9} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Despedida</label>
+          <textarea value={cierre} onChange={(e) => { cierreTocado.current = true; setCierre(e.target.value); }} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
+        </div>
+
+        <label className="flex items-center gap-2 text-[12px] text-slate-600 mb-3">
+          <input type="checkbox" checked={adjuntarPdf && pdfOk} disabled={!pdfOk} onChange={(e) => setAdjuntarPdf(e.target.checked)} />
+          {pdfOk
+            ? `Adjuntar el PDF de este albarán (${nombrePdfConsulta(grupo.albaran, grupo.pedido)})`
+            : grupo.pdfBase64
+              ? "El PDF pesa más de 3 MB y no se puede adjuntar a este correo."
+              : "Este albarán no tiene PDF para adjuntar."}
+        </label>
+
+        <div className="text-xs font-semibold text-slate-500 mb-1">Vista previa del correo</div>
+        <div className="border border-slate-200 rounded-md p-3 bg-slate-50 max-h-52 overflow-y-auto text-[13px]" dangerouslySetInnerHTML={{ __html: html }} />
+        {remitente && <div className="text-[10px] text-slate-400 mt-1">Se enviará desde {remitente}.</div>}
+
+        {error && <div className="mt-3 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded p-2">✗ {error}</div>}
+
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onClose} className="text-sm border border-slate-300 rounded-md px-4 py-2 hover:bg-slate-50">Cancelar</button>
+          <button onClick={enviar} disabled={enviando} className="flex items-center gap-2 text-sm font-semibold text-white bg-amber-700 hover:bg-amber-800 disabled:opacity-60 rounded-md px-4 py-2">
+            {enviando ? <RefreshCw size={14} className="animate-spin" /> : <Send size={14} />} {tipo === "proveedor" ? "Enviar al proveedor" : "Enviar al responsable"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function sugerirCargo(texto) {
   const t = String(texto || "").toUpperCase();
   if (/TASA|RESIDU|ECOTASA|RAEE|ECO-?RAEE/.test(t)) return "TASARES";
@@ -782,13 +1528,919 @@ function NotasPedido({ pedido, notas, onCambio }) {
   );
 }
 
-export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizando }) {
+function ajustesPedidoDe(g) {
+  const porId = new Map();
+  const errores = [];
+  for (const l of g.lineas || []) {
+    if (!l.lineaBC?.id) continue;
+    const cantTxt = l.cantidadPedidoEdit !== undefined ? l.cantidadPedidoEdit : l.lineaBC.cantidadPedida;
+    const precioTxt = l.precioEdit !== undefined ? l.precioEdit : (l.lineaBC.precio ?? "");
+    if (cantTxt === "" || cantTxt == null) {
+      errores.push("La cantidad del pedido no puede quedar vacía.");
+      continue;
+    }
+    const cantNueva = Number(cantTxt);
+    const cantOrig = Number(l.lineaBC.cantidadPedida) || 0;
+    const recibida = Number(l.lineaBC.cantidadRecibida) || 0;
+    if (!Number.isFinite(cantNueva) || cantNueva < 0) {
+      errores.push("La cantidad del pedido no es un número válido.");
+      continue;
+    }
+    if (cantNueva + 1e-9 < recibida) {
+      errores.push(`No se puede dejar la cantidad del pedido en ${cantNueva}: en esta línea ya hay ${recibida} recibida.`);
+      continue;
+    }
+    const cambiaCant = Math.abs(cantNueva - cantOrig) > 1e-6;
+    let precioNueva = null;
+    let cambiaPrecio = false;
+    if (precioTxt !== "" && precioTxt != null) {
+      precioNueva = Number(precioTxt);
+      if (!Number.isFinite(precioNueva) || precioNueva < 0) {
+        errores.push("El coste directo no es un número válido.");
+        continue;
+      }
+      const precioOrig = l.lineaBC.precio == null || l.lineaBC.precio === "" ? null : Number(l.lineaBC.precio);
+      cambiaPrecio = precioOrig == null || Math.abs(precioNueva - precioOrig) > 0.0001;
+    }
+    if (!cambiaCant && !cambiaPrecio) continue;
+    const item = { lineaId: l.lineaBC.id };
+    if (cambiaCant) item.cantidad = cantNueva;
+    if (cambiaPrecio) item.precio = precioNueva;
+    const prev = porId.get(item.lineaId);
+    if (prev) {
+      if (prev.cantidad != null && item.cantidad != null && Math.abs(prev.cantidad - item.cantidad) > 1e-6) {
+        errores.push("Dos líneas del albarán cambian la cantidad de la misma línea del pedido de forma distinta.");
+      }
+      if (prev.precio != null && item.precio != null && Math.abs(prev.precio - item.precio) > 0.0001) {
+        errores.push("Dos líneas del albarán cambian el precio de la misma línea del pedido de forma distinta.");
+      }
+      porId.set(item.lineaId, { ...prev, ...item });
+    } else {
+      porId.set(item.lineaId, item);
+    }
+  }
+  return { ajustes: [...porId.values()], errores: [...new Set(errores)] };
+}
+
+function normDoc(v) {
+  return String(v || "").replace(/\W/g, "").toLowerCase();
+}
+
+/** Control opcional y discreto: quién ha recogido el material (firma). */
+function QuienHaRecogido({ albaran, pedido, proveedor, pdfVista }) {
+  const [abierto, setAbierto] = useState(false);
+  const [asignado, setAsignado] = useState(null);
+  const [sugerido, setSugerido] = useState(null);
+  const [recursos, setRecursos] = useState([]);
+  const [filtro, setFiltro] = useState("");
+  const [descripcion, setDescripcion] = useState("");
+  const [cargando, setCargando] = useState(false);
+  const [guardando, setGuardando] = useState(false);
+  const [aviso, setAviso] = useState("");
+  const claveUi = `${albaran || ""}|${pedido || ""}|${proveedor || ""}`;
+
+  useEffect(() => {
+    setAsignado(null);
+    setSugerido(null);
+    setDescripcion("");
+    setAviso("");
+    setAbierto(false);
+    if (!albaran && !pedido) return;
+    let cancel = false;
+    const q = new URLSearchParams();
+    if (albaran) q.set("albaran", albaran);
+    if (pedido) q.set("pedido", pedido);
+    if (proveedor) q.set("proveedor", proveedor);
+    fetch(`/api/recepcion/firmas?${q}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (cancel) return;
+        if (j.asignado) setAsignado(j.asignado);
+        if (j.sugerido) setSugerido(j.sugerido);
+      })
+      .catch(() => {});
+    return () => { cancel = true; };
+  }, [claveUi]);
+
+  const abrir = async () => {
+    setAbierto(true);
+    setAviso("");
+    setCargando(true);
+    try {
+      const rRec = await fetch("/api/recepcion/recursos");
+      const jRec = await rRec.json();
+      if (!rRec.ok) throw new Error(jRec.error || "No se han podido cargar los trabajadores.");
+      setRecursos(jRec.recursos || []);
+
+      if (pdfVista) {
+        const rDesc = await fetch("/api/recepcion/firmas/describir", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pdfVista, albaran, pedido, proveedor }),
+        });
+        const jDesc = await rDesc.json();
+        if (rDesc.ok) {
+          if (jDesc.firmaDescripcion) setDescripcion(jDesc.firmaDescripcion);
+          if (jDesc.asignado) setAsignado(jDesc.asignado);
+          if (jDesc.sugerido) setSugerido(jDesc.sugerido);
+          if (!jDesc.firmaVisible) setAviso("No se ve una firma clara en el PDF; puedes asignar la persona igual.");
+        }
+      }
+    } catch (e) {
+      setAviso(String(e.message || e));
+    } finally {
+      setCargando(false);
+    }
+  };
+
+  const guardar = async (recurso) => {
+    if (!recurso?.no) return;
+    setGuardando(true);
+    setAviso("");
+    try {
+      const r = await fetch("/api/recepcion/firmas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          albaran,
+          pedido,
+          proveedor,
+          recursoNo: recurso.no,
+          nombre: recurso.nombre,
+          descripcion,
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "No se ha podido guardar.");
+      setAsignado(j.asignado || { recursoNo: recurso.no, nombre: recurso.nombre });
+      setSugerido(null);
+      setAbierto(false);
+    } catch (e) {
+      setAviso(String(e.message || e));
+    } finally {
+      setGuardando(false);
+    }
+  };
+
+  const quitar = async () => {
+    setGuardando(true);
+    setAviso("");
+    try {
+      const r = await fetch("/api/recepcion/firmas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ albaran, pedido, proveedor, borrar: true }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "No se ha podido quitar.");
+      setAsignado(null);
+      setAbierto(false);
+    } catch (e) {
+      setAviso(String(e.message || e));
+    } finally {
+      setGuardando(false);
+    }
+  };
+
+  const lista = useMemo(() => {
+    const f = filtro.trim().toLowerCase();
+    if (!f) return recursos;
+    return recursos.filter((x) =>
+      String(x.nombre || "").toLowerCase().includes(f) || String(x.no || "").toLowerCase().includes(f)
+    );
+  }, [recursos, filtro]);
+
+  if (!albaran && !pedido) return null;
+
+  if (!abierto) {
+    return (
+      <button
+        type="button"
+        onClick={abrir}
+        title="Opcional: anotar quién ha recogido el material según la firma"
+        className="inline-flex items-center gap-1 text-[10px] text-slate-400 hover:text-slate-600 underline decoration-dotted"
+      >
+        <User size={10} className="opacity-70" />
+        {asignado?.nombre ? `Recogido: ${asignado.nombre}` : "Quién ha recogido"}
+      </button>
+    );
+  }
+
+  return (
+    <div className="mt-1 max-w-sm rounded border border-slate-200 bg-slate-50/80 px-2 py-1.5 text-[11px] text-slate-600">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <span className="font-semibold text-slate-500">Quién ha recogido (opcional)</span>
+        <button type="button" onClick={() => setAbierto(false)} className="text-slate-400 hover:text-slate-600" title="Cerrar">
+          <X size={12} />
+        </button>
+      </div>
+      {cargando ? (
+        <div className="text-slate-400">Mirando la firma…</div>
+      ) : (
+        <>
+          {sugerido && !asignado && (
+            <div className="mb-1.5 flex flex-wrap items-center gap-2">
+              <span className="text-slate-500">¿Es {sugerido.nombre}?</span>
+              <button
+                type="button"
+                disabled={guardando}
+                onClick={() => guardar({ no: sugerido.recursoNo, nombre: sugerido.nombre })}
+                className="font-semibold text-indigo-700 hover:underline disabled:opacity-50"
+              >
+                Sí
+              </button>
+            </div>
+          )}
+          {asignado && (
+            <div className="mb-1.5 flex flex-wrap items-center gap-2">
+              <span>Guardado: <span className="font-semibold text-slate-800">{asignado.nombre}</span></span>
+              <button type="button" disabled={guardando} onClick={quitar} className="text-slate-500 hover:text-red-600 hover:underline disabled:opacity-50">
+                Quitar
+              </button>
+            </div>
+          )}
+          <input
+            value={filtro}
+            onChange={(e) => setFiltro(e.target.value)}
+            placeholder="Buscar trabajador…"
+            className="w-full border border-slate-300 rounded px-1.5 py-0.5 mb-1 bg-white"
+          />
+          <div className="max-h-36 overflow-y-auto border border-slate-200 rounded bg-white">
+            {lista.length === 0 ? (
+              <div className="px-2 py-1.5 text-slate-400">Sin coincidencias</div>
+            ) : (
+              lista.slice(0, 80).map((r) => (
+                <button
+                  key={r.no}
+                  type="button"
+                  disabled={guardando}
+                  onClick={() => guardar(r)}
+                  className={`block w-full text-left px-2 py-1 hover:bg-indigo-50 disabled:opacity-50 ${asignado?.recursoNo === r.no ? "bg-indigo-50 text-indigo-800" : ""}`}
+                >
+                  <span className="font-medium">{r.nombre}</span>
+                  <span className="text-slate-400 ml-1 font-mono text-[10px]">{r.no}</span>
+                </button>
+              ))
+            )}
+          </div>
+          {aviso ? <div className="mt-1 text-amber-700">{aviso}</div> : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+function DatoLeido({ etiqueta, valor, aviso, editable, onChange, tipo = "text", extra, placeholder, children, className = "" }) {
+  return (
+    <div className={`rounded border px-2 py-1.5 min-w-0 ${aviso ? "border-amber-300 bg-amber-50" : editable || children ? "border-slate-300 bg-white" : "border-slate-200 bg-slate-50"} ${className}`}>
+      <div className="text-[10px] text-slate-500">{etiqueta}</div>
+      {children || (editable ? (
+        <input
+          type={tipo}
+          value={valor ?? ""}
+          placeholder={placeholder || ""}
+          onChange={(e) => onChange(e.target.value)}
+          onMouseDown={(e) => e.stopPropagation()}
+          className={`mt-0.5 w-full rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[12px] text-slate-800 focus:border-indigo-400 focus:outline-none ${aviso ? "text-amber-900" : ""}`}
+        />
+      ) : (
+        <div className={`text-[12px] break-words ${aviso ? "text-amber-900" : "text-slate-800"}`}>{valor ? String(valor) : "—"}</div>
+      ))}
+      {extra || null}
+    </div>
+  );
+}
+
+function DesplegableProveedor({ numero, nombre, onElegir }) {
+  const [lista, setLista] = useState(null);
+  const [error, setError] = useState(null);
+  const [texto, setTexto] = useState(nombre || "");
+  const [abierto, setAbierto] = useState(false);
+  const cajaRef = useRef(null);
+  const [pos, setPos] = useState(null);
+  useEffect(() => { setTexto(nombre || ""); }, [nombre, numero]);
+  useEffect(() => {
+    let vivo = true;
+    fetch("/api/bc/proveedores")
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || `Error ${r.status}`);
+        return j;
+      })
+      .then((j) => {
+        if (!vivo) return;
+        setLista(Array.isArray(j.proveedores) ? j.proveedores : []);
+      })
+      .catch((e) => { if (vivo) { setError(e.message || String(e)); setLista([]); } });
+    return () => { vivo = false; };
+  }, []);
+  useLayoutEffect(() => {
+    if (!abierto || !cajaRef.current) { setPos(null); return undefined; }
+    const colocar = () => {
+      if (!cajaRef.current) return;
+      const r = cajaRef.current.getBoundingClientRect();
+      const ancho = Math.max(r.width, 320);
+      let left = r.left;
+      if (left + ancho > window.innerWidth - 8) left = Math.max(8, window.innerWidth - ancho - 8);
+      setPos({ top: r.bottom + 4, left, width: ancho });
+    };
+    colocar();
+    window.addEventListener("scroll", colocar, true);
+    window.addEventListener("resize", colocar);
+    return () => {
+      window.removeEventListener("scroll", colocar, true);
+      window.removeEventListener("resize", colocar);
+    };
+  }, [abierto, texto]);
+  const q = texto.trim().toLowerCase();
+  const sugeridos = useMemo(() => {
+    if (!lista) return [];
+    if (!q) return lista.slice(0, 120);
+    const palabras = q.split(/\s+/).filter(Boolean);
+    const fil = lista.filter((p) => {
+      const n = String(p.nombre || "").toLowerCase();
+      const c = String(p.cif || "").toLowerCase();
+      const num = String(p.numero || "").toLowerCase();
+      const hay = `${n} ${c} ${num}`;
+      if (hay.includes(q)) return true;
+      return palabras.every((w) => hay.includes(w));
+    });
+    // Con filtro no cortamos: si escribes SALTO deben salir todos los Saltoki.
+    return fil.length ? fil : lista.filter((p) => String(p.nombre || "").toLowerCase().includes(palabras[0] || q));
+  }, [lista, q]);
+  const elegir = (p) => {
+    onElegir(p);
+    setTexto(p.nombre || "");
+    setAbierto(false);
+  };
+  const listaUi = abierto && pos ? createPortal(
+    <div
+      style={{ position: "fixed", top: pos.top, left: pos.left, width: pos.width, zIndex: 9999 }}
+      className="max-h-72 overflow-y-auto bg-white border border-indigo-300 rounded-md shadow-xl"
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      {!lista && <div className="px-2 py-2 text-[11px] text-slate-400">Cargando proveedores…</div>}
+      {lista && sugeridos.length === 0 && (
+        <div className="px-2 py-2 text-[11px] text-slate-400">Ningún proveedor con «{texto}»</div>
+      )}
+      {sugeridos.map((p) => (
+        <button
+          key={p.numero}
+          type="button"
+          onClick={() => elegir(p)}
+          className={`block w-full text-left px-2 py-1.5 text-[12px] hover:bg-indigo-50 border-b border-slate-100 last:border-0 ${p.numero === numero ? "bg-indigo-50 font-semibold" : "text-slate-800"}`}
+        >
+          {p.nombre}
+          <span className="text-slate-500"> · {p.cif || p.numero}</span>
+        </button>
+      ))}
+    </div>,
+    document.body
+  ) : null;
+  return (
+    <div ref={cajaRef} className="relative">
+      <div className="mt-0.5 flex items-center gap-1">
+        <input
+          value={texto}
+          placeholder={lista ? "Escribe para filtrar…" : "Cargando proveedores…"}
+          onChange={(e) => { setTexto(e.target.value); setAbierto(true); }}
+          onFocus={() => setAbierto(true)}
+          onBlur={() => setTimeout(() => setAbierto(false), 200)}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="min-w-0 flex-1 rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[12px] text-slate-800 focus:border-indigo-400 focus:outline-none"
+        />
+        <button
+          type="button"
+          title="Ver proveedores"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setAbierto((v) => !v)}
+          className="shrink-0 rounded border border-slate-200 bg-white p-1 text-slate-600 hover:bg-indigo-50 hover:text-indigo-700"
+        >
+          <ChevronDown size={14} />
+        </button>
+      </div>
+      {listaUi}
+      {error ? <div className="text-[10px] text-red-600 mt-0.5">{error}</div> : null}
+      {lista && !error ? <div className="text-[10px] text-slate-400 mt-0.5">{lista.length} proveedores</div> : null}
+    </div>
+  );
+}
+
+function leerImagenProducto(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !/^image\//.test(file.type || "")) {
+      reject(new Error("Pega una foto del producto (imagen)."));
+      return;
+    }
+    const lector = new FileReader();
+    lector.onerror = () => reject(new Error("No se pudo leer la imagen."));
+    lector.onload = () => {
+      const original = String(lector.result || "");
+      const img = new Image();
+      img.onload = () => {
+        const lado = Math.max(img.width, img.height);
+        if (lado <= 1600 && file.size <= 1.5 * 1024 * 1024 && /^image\/(png|jpeg|jpg|webp|gif)$/i.test(file.type || "")) {
+          resolve(original);
+          return;
+        }
+        const k = Math.min(1, 1600 / lado);
+        const c = document.createElement("canvas");
+        c.width = Math.max(1, Math.round(img.width * k));
+        c.height = Math.max(1, Math.round(img.height * k));
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+        resolve(c.toDataURL("image/jpeg", 0.85));
+      };
+      img.onerror = () => reject(new Error("No se pudo leer la imagen."));
+      img.src = original;
+    };
+    lector.readAsDataURL(file);
+  });
+}
+
+function useFamiliasAlta(nivel, padre, abuelo, activo) {
+  const [items, setItems] = useState([]);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!activo || (nivel > 1 && !padre)) {
+      setItems([]);
+      setError("");
+      setCargando(false);
+      return;
+    }
+    let vivo = true;
+    setCargando(true);
+    const q = new URLSearchParams({ nivel: String(nivel) });
+    if (padre) q.set("padre", padre);
+    if (abuelo) q.set("abuelo", abuelo);
+    fetch(`/api/recepcion/preparar/familias?${q}`)
+      .then((r) => r.json().then((j) => ({ ok: r.ok, j })))
+      .then(({ ok, j }) => {
+        if (!vivo) return;
+        if (!ok) throw new Error(j.error || "No se han podido cargar las familias.");
+        const lista = [...(j.items || [])].sort((a, b) => String(a.name).localeCompare(String(b.name), "es"));
+        setItems(lista);
+        setError("");
+      })
+      .catch((e) => { if (vivo) { setItems([]); setError(e.message || String(e)); } })
+      .finally(() => { if (vivo) setCargando(false); });
+    return () => { vivo = false; };
+  }, [nivel, padre, abuelo, activo]);
+  return { items, cargando, error };
+}
+
+function FormAltaArticulo({ descripcionInicial, ocupado, onCancelar, onCrear }) {
+  const [descripcion, setDescripcion] = useState(descripcionInicial || "");
+  const [cat1, setCat1] = useState("");
+  const [cat2, setCat2] = useState("");
+  const [cat3, setCat3] = useState("");
+  const [imagen, setImagen] = useState("");
+  const [aviso, setAviso] = useState("");
+  const f1 = useFamiliasAlta(1, "", "", true);
+  const f2 = useFamiliasAlta(2, cat1, "", !!cat1);
+  const f3 = useFamiliasAlta(3, cat2, cat1, !!cat1 && !!cat2);
+  const errorFamilias = f1.error || f2.error || f3.error;
+  const onPegar = async (e) => {
+    const file = [...(e.clipboardData?.items || [])]
+      .filter((it) => it.kind === "file")
+      .map((it) => it.getAsFile())
+      .find((f) => f && /^image\//.test(f.type || ""));
+    if (!file) return;
+    e.preventDefault();
+    try {
+      setImagen(await leerImagenProducto(file));
+      setAviso("");
+    } catch (err) {
+      setAviso(err.message || String(err));
+    }
+  };
+  const crear = async () => {
+    if (!descripcion.trim()) { setAviso("Falta la descripción."); return; }
+    if (!cat1 || !cat2 || !cat3) { setAviso("Elige las tres familias."); return; }
+    setAviso("");
+    try {
+      await onCrear({ descripcion: descripcion.trim(), cat1, cat2, cat3, imagen: imagen || null });
+    } catch (err) {
+      setAviso(err.message || String(err));
+    }
+  };
+  const selectClase = "mt-0.5 w-full border border-slate-300 rounded px-1.5 py-1 text-[12px] bg-white";
+  return (
+    <div className="mt-2 p-2 border border-indigo-200 bg-indigo-50/40 rounded" onPaste={onPegar}>
+      <label className="block text-[11px] text-slate-600">
+        Descripción
+        <input
+          value={descripcion}
+          onChange={(e) => setDescripcion(e.target.value)}
+          className="mt-0.5 w-full border border-slate-300 rounded px-1.5 py-1 text-[12px] bg-white"
+        />
+      </label>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
+        <label className="block text-[11px] text-slate-600">
+          Familia 1
+          <select value={cat1} onChange={(e) => { setCat1(e.target.value); setCat2(""); setCat3(""); }} className={selectClase} disabled={f1.cargando}>
+            <option value="">{f1.cargando ? "Cargando…" : "Elige…"}</option>
+            {f1.items.map((x) => <option key={x.code} value={x.code}>{x.name}</option>)}
+          </select>
+        </label>
+        <label className="block text-[11px] text-slate-600">
+          Familia 2
+          <select value={cat2} onChange={(e) => { setCat2(e.target.value); setCat3(""); }} className={selectClase} disabled={!cat1 || f2.cargando}>
+            <option value="">{!cat1 ? "Primero la 1" : f2.cargando ? "Cargando…" : "Elige…"}</option>
+            {f2.items.map((x) => <option key={x.code} value={x.code}>{x.name}</option>)}
+          </select>
+        </label>
+        <label className="block text-[11px] text-slate-600">
+          Familia 3
+          <select value={cat3} onChange={(e) => setCat3(e.target.value)} className={selectClase} disabled={!cat2 || f3.cargando}>
+            <option value="">{!cat2 ? "Primero la 2" : f3.cargando ? "Cargando…" : "Elige…"}</option>
+            {f3.items.map((x) => <option key={x.code} value={x.code}>{x.name}</option>)}
+          </select>
+        </label>
+      </div>
+      <div
+        tabIndex={0}
+        className="mt-2 border border-dashed border-slate-300 bg-white rounded px-2 py-2 text-[11px] text-slate-500 outline-none focus:border-indigo-400"
+      >
+        {imagen ? (
+          <div className="flex items-center gap-2">
+            <img src={imagen} alt="" className="h-12 rounded border border-slate-200" />
+            <button type="button" onClick={() => setImagen("")} className="text-slate-500 hover:text-red-600">Quitar foto</button>
+          </div>
+        ) : (
+          "Pega aquí la foto del producto con Ctrl+V. Si no hay foto, se puede crear igual."
+        )}
+      </div>
+      {(aviso || errorFamilias) && <div className="mt-1 text-[11px] text-red-700">{aviso || errorFamilias}</div>}
+      <div className="mt-2 flex gap-2">
+        <button
+          type="button"
+          onClick={crear}
+          disabled={ocupado}
+          className="text-[12px] font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded px-2.5 py-1"
+        >
+          {ocupado ? "Creando…" : "Crear artículo"}
+        </button>
+        <button type="button" onClick={onCancelar} disabled={ocupado} className="text-[12px] text-slate-600 hover:underline disabled:opacity-50">
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function textoPrecioPreparar(p) {
+  if (p.precio == null) return "sin precio";
+  const origen = p.origenPrecio ? ` (${p.origenPrecio})` : "";
+  const dto = p.descuento != null && Number(p.descuento) > 0 ? ` · dto. ${p.descuento} %` : " · dto. 0 %";
+  return `${fmtEur(Number(p.precio))}${dto}${origen}`;
+}
+
+function PanelPrepararPedido({ panel, ot, onOt, onBuscar, buscando, onCrear, creando, onCerrar, onElegir, onCrearArticulo, creandoArticulo, onCambiarDato, docActivo, onDocActivo }) {
+  const [busca, setBusca] = useState(null);
+  const [altaClave, setAltaClave] = useState(null);
+  const docs = panel.documentos || [];
+  const idx = Math.min(Math.max(0, docActivo || 0), Math.max(0, docs.length - 1));
+  const doc = docs[idx];
+  const pdfId = doc?.pdfVista || panel.pdfVista || null;
+  const pendientes = docs.filter((d) => !d.resultado || (d.accion !== "ninguna" && (d.propuestas || []).some((p) => p.articulo && !p.enPedido))).length;
+  useEffect(() => { setAltaClave(null); }, [idx, panel.archivo]);
+  return (
+    <div className="mt-4 bg-white border border-indigo-200 rounded-lg p-4">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div>
+          <div className="text-sm font-semibold text-slate-800">Preparar pedido · {panel.archivo}</div>
+          <p className="text-[11px] text-slate-500 mt-1">
+            {docs.length > 1
+              ? `Hay ${docs.length} albaranes en este PDF. Trabaja uno y pasa al siguiente.`
+              : "Busca si el pedido de este proveedor y esta OT ya existe. Si no, deja las líneas preparadas. No se escribe nada hasta que confirmes."}
+          </p>
+        </div>
+        <button onClick={onCerrar} className="text-slate-400 hover:text-slate-600"><X size={16} /></button>
+      </div>
+      {docs.length > 1 && (
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          {docs.map((d, i) => {
+            const hecho = !!d.resultado && d.accion === "ninguna";
+            return (
+              <button
+                key={i}
+                type="button"
+                onClick={() => onDocActivo(i)}
+                className={`text-[11px] font-semibold rounded px-2.5 py-1 border ${i === idx ? "bg-indigo-600 text-white border-indigo-600" : hecho ? "bg-emerald-50 text-emerald-800 border-emerald-200" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+              >
+                Albarán {i + 1}{d.lectura?.pagina ? ` · pág. ${d.lectura.pagina}` : ""}{hecho ? " · hecho" : ""}
+              </button>
+            );
+          })}
+          <span className="text-[11px] text-slate-500">{pendientes} pendiente(s)</span>
+        </div>
+      )}
+      <div className="flex flex-wrap items-end gap-2 mb-3">
+        <label className="text-[11px] text-slate-600">
+          OT
+          <input
+            value={ot}
+            onChange={(e) => onOt(e.target.value)}
+            placeholder="15407"
+            className="mt-1 block border border-slate-300 rounded px-2 py-1 text-sm w-40"
+          />
+        </label>
+        <button
+          onClick={onBuscar}
+          disabled={buscando || creando}
+          className="text-sm font-semibold text-indigo-700 border border-indigo-300 bg-white hover:bg-indigo-50 disabled:opacity-50 rounded px-3 py-1.5"
+        >
+          {buscando ? "Buscando…" : "Buscar con esta OT"}
+        </button>
+      </div>
+      {!doc ? (
+        <div className="text-sm text-slate-500">No hay albaranes leídos.</div>
+      ) : (
+      <div className={`grid grid-cols-1 ${pdfId ? "lg:grid-cols-2" : ""} gap-4`}>
+      {pdfId && (
+        <div>
+          <div className="text-[11px] text-slate-500 mb-1 flex justify-between gap-2">
+            <span>{docs.length > 1 ? `Vista previa · albarán ${idx + 1}${doc.lectura?.pagina ? ` (pág. ${doc.lectura.pagina})` : ""}` : "Vista previa"}</span>
+            <a href={`/api/recepcion/vista.pdf?id=${encodeURIComponent(pdfId)}`} target="_blank" rel="noopener noreferrer" className="font-semibold text-blue-700 hover:underline">Abrir PDF</a>
+          </div>
+          <iframe
+            key={pdfId}
+            src={`/api/recepcion/vista.pdf?id=${encodeURIComponent(pdfId)}`}
+            title="Albarán"
+            className="w-full border border-slate-200 rounded-md bg-white"
+            style={{ height: 640 }}
+          />
+        </div>
+      )}
+      <div>
+      {(() => {
+        const i = idx;
+        const falta = (doc.propuestas || []).filter((p) => p.articulo && !p.enPedido);
+        return (
+          <div key={i} className="border border-slate-200 rounded-md p-3 mb-3">
+            <div className="text-[11px] font-semibold text-slate-500 mb-1">
+              Datos leídos · puedes corregirlos
+              {docs.length > 1 ? ` · albarán ${idx + 1} de ${docs.length}` : ""}
+            </div>
+            <div className="mb-2">
+              <QuienHaRecogido
+                albaran={doc.lectura?.albaran || ""}
+                pedido={doc.pedido?.numero || doc.lectura?.pedido || ""}
+                proveedor={doc.proveedor?.nombre || doc.lectura?.proveedor || ""}
+                pdfVista={pdfId}
+              />
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <DatoLeido etiqueta="Proveedor">
+                <DesplegableProveedor
+                  numero={doc.proveedor?.numero ?? doc.pedido?.vendorNumber ?? ""}
+                  nombre={doc.proveedor?.nombre ?? doc.lectura?.proveedor ?? ""}
+                  onElegir={(p) => onCambiarDato(i, "proveedorElegido", p)}
+                />
+              </DatoLeido>
+              <DatoLeido
+                etiqueta="Nº proveedor / CIF"
+                valor={doc.proveedor?.cif || doc.proveedor?.numero || doc.pedido?.vendorNumber || ""}
+                editable
+                onChange={(v) => onCambiarDato(i, "proveedorNumero", v)}
+              />
+              <DatoLeido etiqueta="Albarán" valor={doc.lectura?.albaran ?? ""} editable onChange={(v) => onCambiarDato(i, "albaran", v)} />
+              <DatoLeido etiqueta="Fecha" valor={doc.lectura?.fecha ?? ""} editable tipo="date" onChange={(v) => onCambiarDato(i, "fecha", v)} />
+              <DatoLeido etiqueta="OT" valor={doc.ot?.codigo ?? doc.lectura?.ot ?? ""} editable onChange={(v) => onCambiarDato(i, "ot", v)} />
+              <DatoLeido etiqueta="Departamento" valor={doc.ot?.departamento ?? doc.pedido?.departamento ?? ""} editable onChange={(v) => onCambiarDato(i, "departamento", v)} />
+              <DatoLeido etiqueta="Cliente" valor={doc.ot?.cliente ?? ""} editable onChange={(v) => onCambiarDato(i, "cliente", v)} />
+              <DatoLeido
+                etiqueta="Pedido"
+                valor={doc.pedido?.numero ?? ""}
+                editable
+                placeholder="Vacío = crear pedido nuevo"
+                onChange={(v) => onCambiarDato(i, "pedido", v)}
+                extra={(
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    {doc.pedido?.estado ? <span className="text-[10px] text-slate-500">({doc.pedido.estado})</span> : null}
+                    {doc.pedido?.numero ? (
+                      <button
+                        type="button"
+                        onClick={() => onCambiarDato(i, "pedido", "")}
+                        className="text-[10px] font-semibold text-indigo-700 hover:underline"
+                      >
+                        Vaciar y crear pedido nuevo
+                      </button>
+                    ) : (
+                      <span className="text-[10px] text-emerald-700">Se creará un pedido nuevo</span>
+                    )}
+                  </div>
+                )}
+              />
+              <DatoLeido etiqueta="Fecha pedido" valor={doc.pedido?.fecha ? fmtFecha(doc.pedido.fecha) : ""} />
+              <DatoLeido
+                etiqueta="Albarán en el pedido"
+                valor={doc.pedido?.albaran || ""}
+                aviso={!!(doc.lectura?.albaran && doc.pedido?.albaran && normDoc(doc.lectura.albaran) !== normDoc(doc.pedido.albaran))}
+              />
+            </div>
+            {(doc.avisos || []).map((a, ai) => (
+              <div key={ai} className="mt-1 text-[11px] text-amber-800">{a}</div>
+            ))}
+            <table className="w-full text-[11px] mt-2">
+              <thead>
+                <tr className="text-left text-slate-500">
+                  <th className="py-1 pr-2">Albarán</th>
+                  <th className="py-1 pr-2">Artículo propuesto</th>
+                  <th className="py-1 pr-2 text-right">Cant.</th>
+                  <th className="py-1">Precio</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(doc.propuestas || []).map((p, pi) => (
+                  <tr key={pi} className="border-t border-slate-100 align-top">
+                    <td className="py-1 pr-2">
+                      {p.descripcion}
+                      {p.codigoProveedor ? <div className="text-slate-400">cód. proveedor {p.codigoProveedor}</div> : null}
+                    </td>
+                    <td className="py-1 pr-2">
+                      {p.articulo ? (
+                        <>
+                          <span className="font-mono">{p.articulo.numero}</span> {p.articulo.descripcion}
+                          {p.elegido ? (
+                            <div className="flex items-center gap-1 text-indigo-700">
+                              <span>Elegido por ti</span>
+                              <button
+                                type="button"
+                                title="Buscar otro artículo"
+                                onClick={() => setBusca(busca === `${i}-${pi}` ? null : `${i}-${pi}`)}
+                                className="text-slate-500 hover:text-indigo-700"
+                              >
+                                <Search size={13} />
+                              </button>
+                            </div>
+                          ) : null}
+                          {p.elegido && busca === `${i}-${pi}` && (
+                            <div className="mt-1">
+                              <BuscadorArticulo
+                                onElegir={(a) => {
+                                  onElegir(i, pi, a);
+                                  setBusca(null);
+                                }}
+                              />
+                            </div>
+                          )}
+                          {p.enPedido ? <div className="text-emerald-700">Ya está en el pedido{p.enPedido.recibida > 0 ? ` · recibida ${fmtCant(p.enPedido.recibida)}` : ""}{p.enPedido.precio != null ? ` · ${fmtEur(p.enPedido.precio)}` : ""}</div> : null}
+                        </>
+                      ) : (
+                        <div>
+                          <div className="flex items-center gap-1 text-amber-700">
+                            <span>No encuentro un artículo claro</span>
+                            <button
+                              type="button"
+                              title="Buscar artículo"
+                              onClick={() => setBusca(busca === `${i}-${pi}` ? null : `${i}-${pi}`)}
+                              className="text-slate-500 hover:text-indigo-700"
+                            >
+                              <Search size={13} />
+                            </button>
+                            <button
+                              type="button"
+                              title="Crear artículo"
+                              disabled={creandoArticulo === `${i}-${pi}`}
+                              onClick={() => setAltaClave((c) => (c === `${i}-${pi}` ? null : `${i}-${pi}`))}
+                              className="text-slate-500 hover:text-indigo-700 disabled:opacity-40"
+                            >
+                              <Plus size={13} />
+                            </button>
+                          </div>
+                          {altaClave === `${i}-${pi}` && (
+                            <FormAltaArticulo
+                              descripcionInicial={p.descripcion || ""}
+                              ocupado={creandoArticulo === `${i}-${pi}`}
+                              onCancelar={() => setAltaClave(null)}
+                              onCrear={(datos) => onCrearArticulo(i, pi, datos)}
+                            />
+                          )}
+                          {busca === `${i}-${pi}` && (
+                            <div className="mt-1">
+                              <BuscadorArticulo
+                                onElegir={(a) => {
+                                  onElegir(i, pi, a);
+                                  setBusca(null);
+                                }}
+                              />
+                            </div>
+                          )}
+                          {(p.alternativas || []).map((a) => (
+                            <div key={a.numero} className="mt-1.5 border-t border-slate-100 pt-1">
+                              <div><span className="font-mono">{a.numero}</span> {a.descripcion}</div>
+                              <button
+                                type="button"
+                                onClick={() => onElegir(i, pi, a)}
+                                className="text-indigo-700 font-semibold hover:underline"
+                              >
+                                Usar este
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {p.articulo && (p.alternativas || []).length > 0 && (
+                        <div className="text-slate-400">Otras: {p.alternativas.map((a) => a.numero).join(", ")}</div>
+                      )}
+                    </td>
+                    <td className="py-1 pr-2 text-right">{fmtCant(p.cantidad)}</td>
+                    <td className="py-1">{textoPrecioPreparar(p)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {doc.resultado ? (
+              <div className="mt-2 text-[12px] text-emerald-800">
+                {doc.resultado.numero ? `Pedido ${doc.resultado.numero}. ` : ""}
+                {(doc.resultado.avisos || []).join(" ")}
+                {(doc.resultado.lineas || []).map((l, li) => (
+                  <div key={li} className={l.ok ? "text-emerald-700" : "text-red-600"}>
+                    {l.ok ? `Línea ${l.codigo} creada` : `${l.codigo}: ${l.error}`}
+                    {l.aviso ? ` · ${l.aviso}` : ""}
+                  </div>
+                ))}
+                {doc.resultado.adjunto ? (
+                  <div className={doc.resultado.adjunto.ok ? "text-emerald-700" : "text-amber-700"}>
+                    {doc.resultado.adjunto.ok
+                      ? "PDF adjuntado al pedido en Business Central."
+                      : `PDF no adjuntado: ${doc.resultado.adjunto.error || "error"}`}
+                  </div>
+                ) : null}
+                {doc.resultado.numero ? (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <a
+                      href={doc.resultado.enlace || `/api/recepcion/enlace-pedido?n=${encodeURIComponent(doc.resultado.numero)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded px-3 py-1.5"
+                    >
+                      Abrir pedido creado
+                    </a>
+                    {docs.length > 1 && idx < docs.length - 1 && (
+                      <button
+                        type="button"
+                        onClick={() => onDocActivo(idx + 1)}
+                        className="inline-flex items-center gap-1 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded px-3 py-1.5"
+                      >
+                        Seguir con el siguiente albarán
+                      </button>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {doc.accion === "crear" && (
+              <button
+                onClick={() => onCrear(i)}
+                disabled={creando || !doc.ot || !doc.proveedor || !falta.length}
+                className="mt-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded px-3 py-1.5"
+              >
+                {creando ? "Creando…" : "Crear este pedido"}
+              </button>
+            )}
+            {doc.accion === "anadir" && (
+              <button
+                onClick={() => onCrear(i)}
+                disabled={creando || !doc.ot || !falta.length}
+                className="mt-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded px-3 py-1.5"
+              >
+                {creando ? "Añadiendo…" : `Añadir ${falta.length} línea(s) al pedido`}
+              </button>
+            )}
+            {doc.accion === "ninguna" && doc.pedido && !doc.resultado && (
+              <div className="mt-2 text-[12px] text-emerald-700">No se crea otro pedido: las líneas del albarán ya están en {doc.pedido.numero}.</div>
+            )}
+            {docs.length > 1 && idx < docs.length - 1 && (doc.resultado || doc.accion === "ninguna") && (
+              <button
+                type="button"
+                onClick={() => onDocActivo(idx + 1)}
+                className="mt-2 text-sm font-semibold text-indigo-700 border border-indigo-300 bg-white hover:bg-indigo-50 rounded px-3 py-1.5"
+              >
+                Seguir con el albarán {idx + 2}
+              </button>
+            )}
+          </div>
+        );
+      })()}
+      </div>
+      </div>
+      )}
+    </div>
+  );
+}
+
+export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizando, documentoEntrante = null }) {
   const [recep, setRecep] = useState({ revisados: {}, fechas: {}, reclamados: {}, emailsProveedor: {}, notas: {} });
   const [abiertos, setAbiertos] = useState(() => new Set()); // pedidos con el detalle de líneas desplegado
   const [verTodasLineas, setVerTodasLineas] = useState(false); // detalle: también las líneas ya recibidas
   const [reclamo, setReclamo] = useState(null); // { proveedor, provNum, inicial: [nums] } | null
   const [fReclamo, setFReclamo] = useState(""); // "" | "si" | "no"
   const [avisoEnvio, setAvisoEnvio] = useState(null);
+  const [consultaResp, setConsultaResp] = useState(null);
+  const [avisoPedido, setAvisoPedido] = useState(null);
   const [buscandoCorreos, setBuscandoCorreos] = useState(false);
   const [verYaRecibidos, setVerYaRecibidos] = useState(false); // lista de «ya recibidos» del documento subido
   const [q, setQ] = useState("");
@@ -800,6 +2452,10 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
   const [fDesde, setFDesde] = useState("");
   const [fHasta, setFHasta] = useState("");
   const [ocultarRevisados, setOcultarRevisados] = useState(false);
+  const [ordenTabla, setOrdenTabla] = useState(null); // { col, dir: "asc"|"desc" } | null = prioridad + importe
+  const [cantReg, setCantReg] = useState({}); // "pedido|lineNo" → cantidad a recibir escrita a mano
+  const [registroUi, setRegistroUi] = useState(null); // { num, fase: "confirmar"|"registrando"|"error", error }
+  const [recibidoLocal, setRecibidoLocal] = useState({}); // pedido → { lineNo → ud ya recibidas en esta sesión }
 
   // "Subir Documento" — PDF con muchas páginas y muchos pedidos/proveedores.
   // Se lee, se agrupa por entrega (Nº de pedido + Nº de albarán; el mismo
@@ -815,6 +2471,13 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
   const [panelDoc, setPanelDoc] = useState(null); // { archivo, paginasTotal, gruposId: [...], gruposSinId: [...] } | null
   const [indiceActual, setIndiceActual] = useState(0);
   const [subidaBC, setSubidaBC] = useState({}); // id de grupo → { subiendo, resultado, error }
+  const inputPrepararRef = useRef(null);
+  const [preparando, setPreparando] = useState(false);
+  const [panelPreparar, setPanelPreparar] = useState(null);
+  const [otPreparar, setOtPreparar] = useState("");
+  const [docActivoPreparar, setDocActivoPreparar] = useState(0);
+  const [creandoPreparar, setCreandoPreparar] = useState(false);
+  const [creandoArticulo, setCreandoArticulo] = useState(null);
 
   const numerosPedidoConocidos = useMemo(() => {
     if (!pedidos?.headers?.length) return new Set();
@@ -823,8 +2486,8 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
   }, [pedidos]);
 
   // Líneas devueltas por /api/recepcion/extraer → estado de revisión
-  const mapearLineas = (lineasEmparejadas, prefijo) =>
-    (lineasEmparejadas || []).map((l, j) => ({
+  const mapearLineas = (lineasEmparejadas, prefijo, disponibles) => {
+    const leidas = (lineasEmparejadas || []).map((l, j) => ({
       id: `${prefijo}-${j}`,
       descripcionAlbaran: l.descripcionAlbaran,
       cantidadAlbaran: l.cantidadAlbaran,
@@ -833,14 +2496,38 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
       lineaBC: l.lineaBC,
       coincidencia: l.coincidencia,
       cantidadARegistrar: l.cantidadARegistrar,
+      cantidadPedidoEdit: l.lineaBC ? l.lineaBC.cantidadPedida : "",
+      precioEdit: l.lineaBC && l.lineaBC.precio != null ? l.lineaBC.precio : "",
       incluir: l.coincidencia !== "sin_match",
     }));
+    const usadas = new Set(leidas.map((l) => l.lineaBC?.id).filter(Boolean));
+    const resto = (disponibles || [])
+      .filter((lb) => lb?.id && !usadas.has(lb.id) && Number(lb.cantidadPedida) > 0)
+      .map((lb, j) => ({
+        id: `${prefijo}-bc-${j}`,
+        descripcionAlbaran: "",
+        cantidadAlbaran: "",
+        precioAlbaran: null,
+        descuentoAlbaran: null,
+        lineaBC: lb,
+        coincidencia: "pedido",
+        cantidadARegistrar: 0,
+        cantidadPedidoEdit: lb.cantidadPedida,
+        precioEdit: lb.precio != null ? lb.precio : "",
+        incluir: false,
+        soloPedido: true,
+      }));
+    return [...leidas, ...resto];
+  };
 
   const [cargosProd, setCargosProd] = useState(CARGOS_PROD_RESPALDO);
   useEffect(() => {
     fetch("/api/bc/cargos").then((r) => r.json()).then((d) => { if (d?.cargos?.length) setCargosProd(d.cargos); }).catch(() => {});
   }, []);
   const ultimoArchivoRef = useRef(null); // el PDF completo, para «Volver a cargar documento»
+  const ultimoPdfRef = useRef(null); // { nombre, base64 } cuando el PDF llega desde Validación de facturas
+  const procesarPdfRef = useRef(null);
+  const genPdfRef = useRef(0);
   const [releyendo, setReleyendo] = useState(null); // id del grupo que se está releyendo
 
   const onSeleccionArchivo = async (e) => {
@@ -854,9 +2541,12 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
   // «Volver a cargar documento»: vuelve a leer TODO el PDF desde el principio
   const recargarDocumento = async () => {
     const file = ultimoArchivoRef.current;
-    if (!file) return;
-    if (!window.confirm(`¿Volver a leer «${file.name}» entero? Se perderá lo que hayas corregido en los pedidos aún sin confirmar (los ya subidos a BC no se tocan).`)) return;
-    await procesarArchivo(file);
+    const pdf = ultimoPdfRef.current;
+    if (!file && !pdf?.base64) return;
+    const nombre = file?.name || pdf?.nombre || "documento.pdf";
+    if (!window.confirm(`¿Volver a leer «${nombre}» entero? Se perderá lo que hayas corregido en los pedidos aún sin confirmar (los ya subidos a BC no se tocan).`)) return;
+    if (file) await procesarArchivo(file);
+    else await procesarPdf(pdf);
   };
 
   // «Volver a leer este pedido»: vuelve a leer SOLO sus páginas con la IA
@@ -876,25 +2566,38 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
       const json = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error([json.error || `Error ${r.status}`, json.detalle].filter(Boolean).join(" — "));
       const gs = json.grupos || [];
-      const n = gs.find((x) => x.pedido && x.pedido.toUpperCase() === (g.pedido || "").toUpperCase()) || gs.find((x) => x.pedido) || gs[0];
+      const claveAlb = (a) => String(a || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const mismoPedido = (x) => (x.pedido || "").toUpperCase() === (g.pedido || "").toUpperCase();
+      const n = gs.find((x) => mismoPedido(x) && claveAlb(x.albaran) === claveAlb(g.albaran))
+        || gs.find((x) => mismoPedido(x))
+        || gs[0];
       if (!n) throw new Error("La IA no ha devuelto nada al releer estas páginas.");
-      setPanelDoc((prev) => ({
-        ...prev,
-        gruposId: prev.gruposId.map((x, i) =>
+      setPanelDoc((prev) => {
+        const ya = new Set(prev.gruposId.map((x) => `${(x.pedido || "").toUpperCase()}|${claveAlb(x.albaran)}`));
+        const nuevos = gs
+          .filter((x) => x !== n && !ya.has(`${(x.pedido || "").toUpperCase()}|${claveAlb(x.albaran)}`))
+          .map((x, k) => grupoDesdeExtraccion(x, `r${Date.now()}-${k}`));
+        const gruposId = prev.gruposId.map((x, i) => (
           i !== idx
             ? x
             : {
                 ...x,
-                pedido: n.pedido || x.pedido,
+                pedido: n.pedido || "",
+                oferta: n.oferta || null,
+                ofertaAviso: n.ofertaAviso || null,
                 albaran: n.albaran || "",
                 vendorName: n.vendorName || x.vendorName,
+                departamento: n.departamento || x.departamento || "",
+                ot: n.ot || x.ot || "",
                 bcError: n.bcError || null,
                 lineasDisponiblesBC: n.lineasDisponiblesBC || [],
-                lineas: mapearLineas(n.lineasEmparejadas, `${x.id}-r${Date.now()}`),
-                lineasPdf: n.lineas || x.lineasPdf || [],
+                lineas: mapearLineas(n.lineasEmparejadas, `${x.id}-r${Date.now()}`, n.lineasDisponiblesBC),
+                lineasPdf: n.lineas || [],
               }
-        ),
-      }));
+        ));
+        if (nuevos.length) gruposId.splice(idx + 1, 0, ...nuevos);
+        return { ...prev, gruposId };
+      });
     } catch (err) {
       setErrorDoc(`Al releer el pedido: ${err.message || String(err)}`);
     }
@@ -927,12 +2630,16 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
             ? x
             : {
                 ...x,
-                pedido: json.pedido || x.pedido,
-                vendorName: json.vendorName || null,
+                pedido: json.pedido || (json.oferta ? "" : x.pedido),
+                oferta: json.oferta ?? x.oferta ?? null,
+                ofertaAviso: json.ofertaAviso || null,
+                vendorName: json.pedido ? (json.vendorName || null) : x.vendorName,
+                departamento: json.pedido ? (json.departamento || "") : x.departamento,
+                ot: json.pedido ? (json.ot || "") : x.ot,
                 bcError: json.bcError || null,
-                lineasDisponiblesBC: json.lineasDisponiblesBC || [],
+                lineasDisponiblesBC: json.pedido ? (json.lineasDisponiblesBC || []) : x.lineasDisponiblesBC,
                 lineasPdf,
-                lineas: mapearLineas(json.lineasEmparejadas, `${x.id}-m${Date.now()}`),
+                lineas: json.pedido ? mapearLineas(json.lineasEmparejadas, `${x.id}-m${Date.now()}`, json.lineasDisponiblesBC) : x.lineas,
               }
         ),
       }));
@@ -942,46 +2649,50 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
     setCruzando(null);
   };
 
-  const procesarArchivo = async (file) => {
+  const grupoDesdeExtraccion = (g, id) => ({
+    id,
+    pedido: g.pedido || "",
+    oferta: g.oferta || null,
+    ofertaAviso: g.ofertaAviso || null,
+    albaran: g.albaran || "",
+    paginas: g.paginas || [],
+    pdfBase64: g.pdfBase64 || null,
+    pdfVista: g.pdfVista || null,
+    vendorName: g.vendorName || null,
+    departamento: g.departamento || "",
+    ot: g.ot || "",
+    bcError: g.bcError || null,
+    incluir: !!g.pedido,
+    lineasDisponiblesBC: g.lineasDisponiblesBC || [],
+    nuevasLineas: [],
+    lineas: mapearLineas(g.lineasEmparejadas, id, g.lineasDisponiblesBC),
+    lineasPdf: g.lineas || [],
+    albaranPartido: !!g.albaranPartido,
+  });
+
+  const procesarPdf = async ({ nombre, base64 }) => {
+    const gen = ++genPdfRef.current;
+    ultimoPdfRef.current = { nombre, base64 };
     setSubiendoDoc(true);
     setErrorDoc(null);
     setPanelDoc(null);
     setSubidaBC({});
     setIndiceActual(0);
     try {
-      const base64 = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result.split(",")[1]);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
       const r = await fetch("/api/recepcion/extraer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nombre: file.name, base64 }),
+        body: JSON.stringify({ nombre, base64 }),
       });
       // Registros hechos desde la app (compartidos) — frescos, por si otro equipo ha registrado
       let registrados = {};
       try { registrados = (await (await fetch("/api/recepcion")).json()).registrados || {}; } catch {}
       const json = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error([json.error || `Error ${r.status}`, json.detalle].filter(Boolean).join(" — "));
-      const grupos = (json.grupos || []).map((g, i) => ({
-        id: `${i}-${g.pedido || "sin-pedido"}`,
-        pedido: g.pedido || "",
-        albaran: g.albaran || "",
-        paginas: g.paginas || [],
-        pdfBase64: g.pdfBase64 || null,
-        vendorName: g.vendorName || null,
-        bcError: g.bcError || null,
-        incluir: !!g.pedido,
-        lineasDisponiblesBC: g.lineasDisponiblesBC || [],
-        nuevasLineas: [], // cargos a AÑADIR al pedido en BC (p.ej. TRANSPORTE)
-        lineas: mapearLineas(g.lineasEmparejadas, i),
-        lineasPdf: g.lineas || [], // líneas tal cual leídas del albarán (para volver a cruzar con otro pedido)
-      }));
+      const grupos = (json.grupos || []).map((g, i) => grupoDesdeExtraccion(g, `${i}-${g.pedido || "sin-pedido"}`));
       const esRevision = (g) => !!(g.pedido || g.albaran || (g.lineasPdf && g.lineasPdf.length));
-      setPanelDoc({
-        archivo: file.name,
+      const panel = {
+        archivo: nombre,
         paginasTotal: json.paginas,
         // Los ya recibidos/registrados se apartan (se pueden volver a mostrar).
         // Un albarán separado sin Nº de pedido también se revisa: el pedido
@@ -990,12 +2701,279 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
         gruposYaRecibidos: grupos.filter((g) => g.pedido && motivoYaRecibido(g, registrados)).map((g) => ({ ...g, motivo: motivoYaRecibido(g, registrados) })),
         gruposSinId: grupos.filter((g) => !esRevision(g)),
         avisos: json.avisos || [], // páginas que la IA no pudo leer (el resto sí)
+      };
+      if (gen !== genPdfRef.current) return panel;
+      setPanelDoc(panel);
+      return panel;
+    } catch (err) {
+      if (gen === genPdfRef.current) setErrorDoc(err.message || String(err));
+      return null;
+    } finally {
+      if (gen === genPdfRef.current) setSubiendoDoc(false);
+    }
+  };
+  procesarPdfRef.current = procesarPdf;
+
+  const procesarArchivo = async (file) => {
+    ultimoArchivoRef.current = file;
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(",")[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    await procesarPdf({ nombre: file.name, base64 });
+  };
+
+  const leerPreparar = async (file) => {
+    setPreparando(true);
+    setErrorDoc(null);
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || "").split(",")[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      const r = await fetch("/api/recepcion/preparar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nombre: file.name, base64, ot: otPreparar || undefined }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error([json.error || `Error ${r.status}`, json.detalle].filter(Boolean).join(" — "));
+      const docs = json.documentos || [];
+      const otLeida = docs[0]?.ot?.codigo || docs[0]?.lectura?.ot || "";
+      if (otLeida && !otPreparar) setOtPreparar(otLeida);
+      setDocActivoPreparar(0);
+      setPanelPreparar({ archivo: file.name, documentos: docs, pdfVista: json.pdfVista || null });
+    } catch (err) {
+      setErrorDoc(err.message || String(err));
+    } finally {
+      setPreparando(false);
+    }
+  };
+
+  const buscarPrepararConOt = async () => {
+    if (!panelPreparar?.documentos?.length) return;
+    setPreparando(true);
+    setErrorDoc(null);
+    try {
+      const r = await fetch("/api/recepcion/preparar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lecturas: panelPreparar.documentos.map((d) => d.lectura), ot: otPreparar }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error([json.error || `Error ${r.status}`, json.detalle].filter(Boolean).join(" — "));
+      setPanelPreparar((prev) => ({ ...prev, pdfVista: prev.pdfVista, documentos: json.documentos || [] }));
+    } catch (err) {
+      setErrorDoc(err.message || String(err));
+    } finally {
+      setPreparando(false);
+    }
+  };
+
+  const accionPrepararDoc = (d, propuestas) => {
+    const conArticulo = (propuestas || d.propuestas || []).filter((p) => p.articulo);
+    if (!conArticulo.length) return "ninguna";
+    if (d.pedido?.numero) return conArticulo.some((p) => !p.enPedido) ? "anadir" : "ninguna";
+    return d.proveedor?.numero ? "crear" : "ninguna";
+  };
+
+  const cambiarDatoPreparar = (indice, campo, valor) => {
+    if (campo === "ot") setOtPreparar(String(valor ?? "").trim());
+    setPanelPreparar((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        documentos: (prev.documentos || []).map((d, i) => {
+          if (i !== indice) return d;
+          const lectura = { ...(d.lectura || {}) };
+          const proveedor = { ...(d.proveedor || {}) };
+          const otObj = { ...(d.ot || {}) };
+          let pedido = d.pedido ? { ...d.pedido } : null;
+          let propuestas = d.propuestas;
+          if (campo === "proveedorElegido") {
+            const p = valor && typeof valor === "object" ? valor : null;
+            if (p) {
+              proveedor.nombre = String(p.nombre || "").trim();
+              proveedor.numero = String(p.numero || "").trim();
+              proveedor.cif = String(p.cif || p.numero || "").trim();
+              lectura.proveedor = proveedor.nombre;
+              if (pedido) pedido.vendorNumber = proveedor.numero;
+            }
+          } else {
+            const v = String(valor ?? "");
+            if (campo === "proveedorNombre") {
+              proveedor.nombre = v;
+              lectura.proveedor = v;
+            } else if (campo === "proveedorNumero") {
+              proveedor.numero = v.trim();
+              proveedor.cif = v.trim();
+              if (pedido) pedido.vendorNumber = v.trim();
+            } else if (campo === "albaran") {
+              lectura.albaran = v.trim();
+            } else if (campo === "fecha") {
+              lectura.fecha = /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : (v ? lectura.fecha : null);
+            } else if (campo === "ot") {
+              const codigo = v.trim();
+              otObj.codigo = codigo;
+              lectura.ot = codigo || null;
+            } else if (campo === "departamento") {
+              otObj.departamento = v.trim();
+              if (pedido) pedido.departamento = v.trim();
+            } else if (campo === "cliente") {
+              otObj.cliente = v;
+            } else if (campo === "pedido") {
+              const numero = v.trim().toUpperCase();
+              if (!numero) {
+                pedido = null;
+                propuestas = (d.propuestas || []).map((p) => ({ ...p, enPedido: null }));
+              } else if (pedido) pedido = { ...pedido, numero, estado: pedido.numero === numero ? pedido.estado : "" };
+              else pedido = { numero, estado: "", vendorNumber: proveedor.numero || "", fecha: null, albaran: "", departamento: otObj.departamento || "" };
+            }
+          }
+          const next = {
+            ...d,
+            lectura,
+            proveedor: (proveedor.numero != null || proveedor.nombre) ? proveedor : d.proveedor,
+            ot: (otObj.codigo || otObj.departamento || otObj.cliente) ? otObj : (campo === "ot" && !String(valor ?? "").trim() ? null : d.ot),
+            pedido,
+            propuestas,
+          };
+          next.accion = accionPrepararDoc(next);
+          return next;
+        }),
+      };
+    });
+  };
+
+  const elegirArticuloPreparar = (indice, linea, articulo) => {
+    if (!articulo?.numero) return;
+    setPanelPreparar((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        documentos: (prev.documentos || []).map((d, i) => {
+          if (i !== indice) return d;
+          const propuestas = (d.propuestas || []).map((p, pi) => (
+            pi === linea
+              ? { ...p, articulo: { numero: articulo.numero, descripcion: articulo.descripcion || "" }, elegido: true, enPedido: null }
+              : p
+          ));
+          return { ...d, propuestas, accion: accionPrepararDoc({ ...d, propuestas }, propuestas) };
+        }),
+      };
+    });
+  };
+
+  const crearArticuloPreparar = async (indice, linea, datos) => {
+    const doc = panelPreparar?.documentos?.[indice];
+    const p = doc?.propuestas?.[linea];
+    if (!p || p.articulo || !datos) return;
+    const texto = String(datos.descripcion || "").trim();
+    if (!texto || !datos.cat1 || !datos.cat2 || !datos.cat3) {
+      throw new Error("Faltan la descripción o las tres familias.");
+    }
+    if (!window.confirm(`¿Crear el artículo «${texto}»? Unidad UD. La línea del pedido no se escribe hasta que pulses Añadir.`)) return;
+    setCreandoArticulo(`${indice}-${linea}`);
+    setErrorDoc(null);
+    try {
+      const r = await fetch("/api/recepcion/preparar/articulo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          descripcion: texto,
+          codigoProveedor: p.codigoProveedor || null,
+          cat1: datos.cat1,
+          cat2: datos.cat2,
+          cat3: datos.cat3,
+          imagenBase64: datos.imagen || null,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.error || `Error ${r.status}`);
+      elegirArticuloPreparar(indice, linea, { numero: json.numero, descripcion: json.descripcion || texto });
+    } catch (err) {
+      setErrorDoc(err.message || String(err));
+      throw err;
+    } finally {
+      setCreandoArticulo(null);
+    }
+  };
+
+  const crearPreparar = async (indice) => {
+    const doc = panelPreparar?.documentos?.[indice];
+    if (!doc) return;
+    const lineas = (doc.propuestas || []).filter((p) => p.articulo && !p.enPedido).map((p) => ({
+      codigo: p.articulo.numero,
+      descripcion: p.articulo.descripcion,
+      cantidad: p.cantidad,
+      precio: p.precio,
+      descuento: p.descuento,
+    }));
+    if (!lineas.length) return;
+    const verbo = doc.accion === "anadir" ? `añadir ${lineas.length} línea(s) al pedido ${doc.pedido?.numero}` : "crear el pedido de compra";
+    if (!window.confirm(`¿${verbo.charAt(0).toUpperCase()}${verbo.slice(1)} en Business Central para ${doc.proveedor?.nombre || "el proveedor"}, OT ${doc.ot?.codigo}?`)) return;
+    setCreandoPreparar(true);
+    setErrorDoc(null);
+    try {
+      const r = await fetch("/api/recepcion/preparar/crear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          vendorNumber: doc.proveedor?.numero || doc.pedido?.vendorNumber,
+          ot: doc.ot?.codigo,
+          departamento: doc.ot?.departamento || null,
+          fecha: doc.lectura?.fecha,
+          albaran: doc.accion === "crear" ? doc.lectura?.albaran : null,
+          pedidoExistente: doc.accion === "anadir" ? doc.pedido?.numero : null,
+          pdfVista: doc.pdfVista || panelPreparar.pdfVista || null,
+          nombreArchivo: panelPreparar.archivo || (doc.lectura?.albaran ? `Albaran_${doc.lectura.albaran}.pdf` : "albaran.pdf"),
+          lineas,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.error || `Error ${r.status}`);
+      const todasOk = !json.lineas?.length || json.lineas.every((l) => l.ok);
+      setPanelPreparar((prev) => {
+        const documentos = prev.documentos.map((d, i) => (i === indice ? { ...d, resultado: json, accion: todasOk ? "ninguna" : d.accion } : d));
+        if (todasOk) {
+          const siguiente = documentos.findIndex((d, i) => i > indice && !(d.resultado && d.accion === "ninguna"));
+          if (siguiente >= 0) setDocActivoPreparar(siguiente);
+        }
+        return { ...prev, documentos };
       });
     } catch (err) {
       setErrorDoc(err.message || String(err));
+    } finally {
+      setCreandoPreparar(false);
     }
-    setSubiendoDoc(false);
   };
+
+  useEffect(() => {
+    const doc = documentoEntrante;
+    if (!doc?.id || !doc.base64) return;
+    let vivo = true;
+    ultimoArchivoRef.current = null;
+    const pdf = { nombre: doc.nombre || "documento.pdf", base64: doc.base64 };
+    ultimoPdfRef.current = pdf;
+    if (extraccionDesdeFactura.id !== doc.id || !extraccionDesdeFactura.promesa) {
+      extraccionDesdeFactura.id = doc.id;
+      extraccionDesdeFactura.pdf = pdf;
+      extraccionDesdeFactura.promesa = procesarPdfRef.current(pdf);
+    } else {
+      setSubiendoDoc(true);
+      setErrorDoc(null);
+      extraccionDesdeFactura.promesa.then((panel) => {
+        if (!vivo) return;
+        if (panel) setPanelDoc(panel);
+        setSubiendoDoc(false);
+      });
+    }
+    return () => { vivo = false; };
+  }, [documentoEntrante]);
 
   const mostrarIgualmente = (id) => {
     setPanelDoc((prev) => {
@@ -1033,7 +3011,15 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
           lineas: g.lineas.map((l, j) => {
             if (j !== idxLinea) return l;
             const cantidadARegistrar = elegida ? Math.min(Number(l.cantidadAlbaran) || 0, elegida.cantidadPendiente) : 0;
-            return { ...l, lineaBC: elegida || null, coincidencia: elegida ? "manual" : "sin_match", incluir: !!elegida, cantidadARegistrar };
+            return {
+              ...l,
+              lineaBC: elegida || null,
+              coincidencia: elegida ? "manual" : "sin_match",
+              incluir: !!elegida,
+              cantidadARegistrar,
+              cantidadPedidoEdit: elegida ? elegida.cantidadPedida : "",
+              precioEdit: elegida && elegida.precio != null ? elegida.precio : "",
+            };
           }),
         };
       }),
@@ -1095,6 +3081,11 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
     }
     setSubidaBC((prev) => ({ ...prev, [g.id]: { subiendo: true } }));
     try {
+      const { ajustes, errores } = ajustesPedidoDe(g);
+      if (errores.length) {
+        setSubidaBC((prev) => ({ ...prev, [g.id]: { subiendo: false, error: errores[0] } }));
+        return;
+      }
       const lineasConfirmadas = g.lineas
         .filter((l) => l.incluir && l.lineaBC && Number(l.cantidadARegistrar) > 0)
         .map((l) => ({ lineaId: l.lineaBC.id, cantidad: l.cantidadARegistrar }));
@@ -1107,6 +3098,7 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
           albaran: g.albaran || null,
           pdfBase64: g.pdfBase64,
           nombreArchivo: `${g.pedido}.pdf`,
+          ajustesPedido: ajustes,
           lineas: lineasConfirmadas,
           // Solo las que aún no se han creado en BC (evita duplicarlas si se vuelve a confirmar)
           nuevasLineas: (g.nuevasLineas || [])
@@ -1120,10 +3112,31 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
       const pendientes = (g.nuevasLineas || []).filter((n) => !n.creadaId);
       const creadas = {};
       (json.nuevasLineas || []).forEach((res, k) => { if (res.ok && pendientes[k]) creadas[pendientes[k].id] = res.lineaId || "ok"; });
-      if (Object.keys(creadas).length) {
+      const okAjustes = new Map((json.ajustesPedido || []).filter((a) => a.ok && !a.sinCambio).map((a) => [a.lineaId, a]));
+      if (Object.keys(creadas).length || okAjustes.size) {
         setPanelDoc((prev) => ({
           ...prev,
-          gruposId: prev.gruposId.map((x, i) => (i !== idx ? x : { ...x, nuevasLineas: x.nuevasLineas.map((n) => (creadas[n.id] ? { ...n, creadaId: creadas[n.id] } : n)) })),
+          gruposId: prev.gruposId.map((x, i) => {
+            if (i !== idx) return x;
+            const aplicar = (lb) => {
+              const a = lb && okAjustes.get(lb.id);
+              if (!a) return lb;
+              const cantidadPedida = a.cantidad != null ? a.cantidad : lb.cantidadPedida;
+              const precio = a.precio != null ? a.precio : lb.precio;
+              const cantidadRecibida = Number(lb.cantidadRecibida) || 0;
+              return { ...lb, cantidadPedida, precio, cantidadPendiente: Math.max(0, cantidadPedida - cantidadRecibida) };
+            };
+            return {
+              ...x,
+              lineasDisponiblesBC: (x.lineasDisponiblesBC || []).map(aplicar),
+              nuevasLineas: x.nuevasLineas.map((n) => (creadas[n.id] ? { ...n, creadaId: creadas[n.id] } : n)),
+              lineas: x.lineas.map((l) => {
+                const lb = aplicar(l.lineaBC);
+                if (!lb || lb === l.lineaBC) return l;
+                return { ...l, lineaBC: lb, cantidadPedidoEdit: lb.cantidadPedida, precioEdit: lb.precio ?? "" };
+              }),
+            };
+          }),
         }));
       }
       setSubidaBC((prev) => ({ ...prev, [g.id]: { subiendo: false, resultado: json } }));
@@ -1153,7 +3166,35 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
     }).catch(() => {});
   }, []);
 
-  const datos = useMemo(() => getRecepData(pedidos, lineas, recep.fechas), [pedidos, lineas, recep.fechas]);
+  const lineasParaDatos = useMemo(() => {
+    if (!lineas?.headers?.length || !Object.keys(recibidoLocal).length) return lineas;
+    const lc = colsLineas(lineas.headers);
+    if (!lc.doc || !lc.pend) return lineas;
+    const rows = lineas.rows.map((r) => {
+      const doc = String(r[lc.doc] || "").trim().toUpperCase();
+      const extra = recibidoLocal[doc];
+      if (!extra) return r;
+      const ln = lc.lineNo ? String(Number(r[lc.lineNo]) || 0) : "";
+      const qty = Number(extra[ln]);
+      if (!(qty > 0)) return r;
+      const pend = parseNum(r[lc.pend]);
+      const next = { ...r, [lc.pend]: Math.max(0, (Number.isFinite(pend) ? pend : 0) - qty) };
+      if (lc.recib) {
+        const rec = parseNum(r[lc.recib]);
+        next[lc.recib] = (Number.isFinite(rec) ? rec : 0) + qty;
+      }
+      return next;
+    });
+    return { ...lineas, rows };
+  }, [lineas, recibidoLocal]);
+
+  const datos = useMemo(() => getRecepData(pedidos, lineasParaDatos, recep.fechas), [pedidos, lineasParaDatos, recep.fechas]);
+
+  const fichaPedido = (num) => {
+    const n = String(num || "").trim().toUpperCase();
+    if (!n || !datos) return null;
+    return [...(datos.pendientes || []), ...(datos.excluidos || [])].find((p) => String(p.num || "").toUpperCase() === n) || null;
+  };
 
   const proveedores = useMemo(() => {
     if (!datos) return [];
@@ -1190,6 +3231,68 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
       return true;
     });
   }, [datos, q, fProv, fOT, fPrio, fTipo, fAlianza, fDesde, fHasta, ocultarRevisados, recep.revisados, fReclamo, recep.reclamados, recep.notas]);
+
+  const pulsarOrden = (col) => {
+    setOrdenTabla((prev) => {
+      if (!prev || prev.col !== col) return { col, dir: "asc" };
+      if (prev.dir === "asc") return { col, dir: "desc" };
+      return null;
+    });
+  };
+
+  const cantARegistrar = (num, l) => {
+    const k = `${num}|${l.lineNo}`;
+    if (Object.prototype.hasOwnProperty.call(cantReg, k)) return cantReg[k];
+    return l.pend > 0 ? String(l.pend) : "";
+  };
+
+  const registrarPedidoTabla = async (p) => {
+    const lineasEnvio = (p.lineas || [])
+      .filter((l) => l.pend > 0 && l.lineNo)
+      .map((l) => ({ lineNo: l.lineNo, cantidad: Number(String(cantARegistrar(p.num, l)).replace(",", ".")) }))
+      .filter((l) => l.cantidad > 0);
+    if (!lineasEnvio.length) {
+      setRegistroUi({ num: p.num, fase: "error", error: "Indica una cantidad mayor que 0 en alguna línea pendiente." });
+      return;
+    }
+    setRegistroUi({ num: p.num, fase: "registrando" });
+    try {
+      const r = await fetch("/api/recepcion/registrar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pedido: p.num, lineas: lineasEnvio }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) throw new Error(j.error || j.detalle || `Error ${r.status}`);
+      const doc = p.num.toUpperCase();
+      setRecibidoLocal((prev) => {
+        const actual = { ...(prev[doc] || {}) };
+        for (const l of j.lineas || lineasEnvio) {
+          const k = String(Number(l.lineNo) || 0);
+          actual[k] = (Number(actual[k]) || 0) + Number(l.cantidad);
+        }
+        return { ...prev, [doc]: actual };
+      });
+      setCantReg((prev) => {
+        const next = { ...prev };
+        for (const l of p.lineas || []) delete next[`${p.num}|${l.lineNo}`];
+        return next;
+      });
+      const uds = (j.lineas || lineasEnvio).reduce((a, l) => a + (Number(l.cantidad) || 0), 0);
+      setRegistroUi(null);
+      setAvisoEnvio(`✓ Recepción registrada en BC: ${p.num} · ${fmtCant(uds)} ud. No se ha creado la factura.`);
+    } catch (e) {
+      setRegistroUi({ num: p.num, fase: "error", error: e.message || String(e) });
+    }
+  };
+
+  const filasTabla = useMemo(() => {
+    if (!ordenTabla) return filtradas;
+    const { col, dir } = ordenTabla;
+    return [...filtradas].sort((a, b) => {
+      return compararOrden(valorOrdenRecepcion(a, col, recep), valorOrdenRecepcion(b, col, recep), dir);
+    });
+  }, [filtradas, ordenTabla, recep]);
 
   // Correos de tu buzón (recibidos y enviados) que mencionan un PC → notas del pedido (25/09/2026)
   // Se lanza con el botón, al abrir la pantalla, cada 10 minutos y ~30 s después de enviar una reclamación.
@@ -1240,6 +3343,67 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
   // Pedidos pendientes (con importe > 0) de un proveedor — para la reclamación
   const pendientesDe = (prov) => (datos?.pendientes || []).filter((p) => p.prov === prov && p.impPend > 0);
 
+  const abrirConsultaResponsable = (g) => {
+    const ficha = fichaPedido(g.pedido);
+    setConsultaResp({
+      pedido: g.pedido || "",
+      albaran: g.albaran || "",
+      proveedor: g.vendorName || ficha?.prov || "",
+      departamento: g.departamento || ficha?.depto || "",
+      ot: g.ot || ficha?.ot || "",
+      pdfBase64: g.pdfBase64 || "",
+      lineas: lineasParaConsulta(g),
+    });
+  };
+
+  const abrirAvisoPedidoIncorrecto = (g) => {
+    const ficha = fichaPedido(g.pedido);
+    const conocido = g.pedido && numerosPedidoConocidos.has(String(g.pedido).toUpperCase());
+    setAvisoPedido({
+      pedido: g.pedido || "",
+      albaran: g.albaran || "",
+      proveedor: g.vendorName || ficha?.prov || "",
+      departamento: g.departamento || ficha?.depto || "",
+      pdfBase64: g.pdfBase64 || "",
+      lineas: lineasParaConsulta(g),
+      noEncontrado: !!(g.bcError || (g.pedido && !conocido)),
+    });
+  };
+
+  const onAvisoPedidoEnviado = async ({ pedido, para, tipo, depto, proveedor, recordarEmail }) => {
+    setAvisoPedido(null);
+    const quien = tipo === "proveedor"
+      ? (proveedor ? `${proveedor}: ${para}` : para)
+      : (depto ? `${depto}: ${para}` : para);
+    setAvisoEnvio(`✓ Aviso de nº de pedido incorrecto enviado a ${quien}`);
+    if (recordarEmail && proveedor) guardar({ emailsProveedor: { [proveedor]: recordarEmail } });
+    if (!pedido) return;
+    const destino = tipo === "proveedor" ? "al proveedor" : "al responsable";
+    const texto = `Avisado ${destino}${depto ? ` de ${depto}` : ""}${proveedor && tipo === "proveedor" ? ` ${proveedor}` : ""} de que el nº de pedido ${pedido} es incorrecto. Enviado a ${para}`;
+    await fetch("/api/recepcion/nota", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pedido, texto, autor: "📧 Correo" }),
+    }).catch(() => {});
+    const d = await fetch("/api/recepcion").then((x) => x.json()).catch(() => null);
+    if (d?.notas) setRecep((prev) => ({ ...prev, notas: d.notas }));
+  };
+
+  const onConsultaResponsableEnviada = async ({ pedido, para, depto }) => {
+    setConsultaResp(null);
+    const quien = depto ? `${depto}: ${para}` : para;
+    setAvisoEnvio(`✓ Pregunta enviada al responsable (${quien})`);
+    if (!pedido) return;
+    const texto = `Preguntado al responsable${depto ? ` de ${depto}` : ""} si el pedido ${pedido} es correcto y a qué OT corresponde. Enviado a ${para}`;
+    await fetch("/api/recepcion/nota", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pedido, texto, autor: "📧 Correo" }),
+    }).catch(() => {});
+    const d = await fetch("/api/recepcion").then((x) => x.json()).catch(() => null);
+    if (d?.notas) setRecep((prev) => ({ ...prev, notas: d.notas }));
+  };
+
   const onReclamacionEnviada = ({ pedidos: nums, para, recordarEmail }) => {
     const ts = new Date().toISOString();
     const reclamados = {};
@@ -1280,7 +3444,7 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
             Pedidos con material pendiente de recibir. Cruza cabeceras de pedido con sus líneas por Nº de documento.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <button
             onClick={onActualizarBC}
             disabled={actualizando}
@@ -1305,6 +3469,25 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
             <Upload size={15} className={subiendoDoc ? "animate-pulse" : ""} /> {subiendoDoc ? "Leyendo documento…" : "Subir Documento"}
           </button>
           <input ref={inputDocRef} type="file" accept="application/pdf" className="hidden" onChange={onSeleccionArchivo} />
+          <button
+            onClick={() => inputPrepararRef.current?.click()}
+            disabled={preparando}
+            title="Lee el albarán, busca el pedido de ese proveedor y esa OT, y propone artículos, cantidades, precios y descuentos. No escribe nada hasta que confirmes."
+            className="flex items-center gap-2 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 rounded-md px-4 py-2"
+          >
+            <Search size={15} className={preparando ? "animate-pulse" : ""} /> {preparando ? "Preparando…" : "Preparar pedido"}
+          </button>
+          <input
+            ref={inputPrepararRef}
+            type="file"
+            accept="application/pdf"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (file) leerPreparar(file);
+            }}
+          />
         </div>
       </div>
 
@@ -1312,6 +3495,25 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
         <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
           Error leyendo el documento: {errorDoc}
         </div>
+      )}
+
+      {panelPreparar && (
+        <PanelPrepararPedido
+          panel={panelPreparar}
+          ot={otPreparar}
+          onOt={setOtPreparar}
+          onBuscar={buscarPrepararConOt}
+          buscando={preparando}
+          onCrear={crearPreparar}
+          creando={creandoPreparar}
+          onElegir={elegirArticuloPreparar}
+          onCrearArticulo={crearArticuloPreparar}
+          creandoArticulo={creandoArticulo}
+          onCambiarDato={cambiarDatoPreparar}
+          docActivo={docActivoPreparar}
+          onDocActivo={setDocActivoPreparar}
+          onCerrar={() => { setPanelPreparar(null); setDocActivoPreparar(0); }}
+        />
       )}
 
       {panelDoc && (
@@ -1410,14 +3612,25 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                     {/* Vista previa del PDF de ESTE pedido (solo sus páginas) */}
                     <div>
-                      <div className="text-[11px] text-slate-500 mb-1">
-                        Páginas {g.paginas.join(", ")} del documento{g.vendorName ? ` · proveedor en BC: ${g.vendorName}` : ""}
+                      <div className="text-[11px] text-slate-500 mb-1 flex items-center justify-between gap-2">
+                        <span>Páginas {g.paginas.join(", ")} del documento{g.vendorName ? ` · proveedor en BC: ${g.vendorName}` : ""}</span>
+                        {g.pdfVista && (
+                          <a
+                            href={`/api/recepcion/vista.pdf?id=${encodeURIComponent(g.pdfVista)}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="font-semibold text-blue-700 hover:underline shrink-0"
+                          >
+                            Abrir PDF
+                          </a>
+                        )}
                       </div>
-                      {g.pdfBase64 ? (
+                      {g.pdfVista ? (
                         <iframe
-                          src={`data:application/pdf;base64,${g.pdfBase64}`}
-                          title={`pedido-${g.pedido}`}
-                          className="w-full border border-slate-200 rounded-md"
+                          key={g.pdfVista}
+                          src={`/api/recepcion/vista.pdf?id=${encodeURIComponent(g.pdfVista)}`}
+                          title={`pedido-${g.pedido || "albaran"}`}
+                          className="w-full border border-slate-200 rounded-md bg-white"
                           style={{ height: 440 }}
                         />
                       ) : (
@@ -1439,15 +3652,51 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                           onClick={() => cargarPedidoManual(indiceActual)}
                           disabled={cruzando === g.id || !g.pedido}
                           className="flex items-center gap-1 text-[11px] font-semibold text-blue-700 border border-blue-300 bg-white hover:bg-blue-50 disabled:opacity-50 rounded px-2 py-1"
-                          title="Carga de BC el pedido escrito a mano y vuelve a cruzar las líneas del albarán (acepta PC26-3403, PC-3403 o 3403)"
+                          title="Carga el pedido de BC y vuelve a cruzar las líneas. Acepta un PC (PC26-004152) o un Nº de oferta (OCAC26-004443)"
                         >
                           <RefreshCw size={12} className={cruzando === g.id ? "animate-spin" : ""} />
                           {cruzando === g.id ? "Cargando…" : "Cargar pedido"}
                         </button>
                         {g.pedido && !existe && <span title="No aparece en la lista de pedidos cargada — revisar" className="text-amber-600 text-[11px]">⚠ no está en la lista</span>}
-                        {!g.pedido && <span className="text-amber-700 text-[11px]">Albarán aparte: escribe su Nº de pedido y pulsa Cargar pedido</span>}
+                        {!g.pedido && !g.oferta && (
+                          <span className="inline-flex flex-wrap items-center gap-2 text-amber-700 text-[11px]">
+                            <span>Albarán aparte: en el documento no hay un PC. Escríbelo o avisa de que el nº es incorrecto.</span>
+                            <button
+                              type="button"
+                              onClick={() => abrirAvisoPedidoIncorrecto(g)}
+                              className="inline-flex items-center gap-1 font-semibold text-amber-900 border border-amber-400 bg-amber-50 hover:bg-amber-100 rounded px-2 py-1"
+                              title="Abre un correo al responsable o al proveedor. No se envía hasta que lo confirmes."
+                            >
+                              <Mail size={12} /> Nº de pedido incorrecto
+                            </button>
+                          </span>
+                        )}
                       </div>
-                      <div className="flex items-center gap-2 mb-3">
+                      {(() => {
+                        const claveAlb = (a) => String(a || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+                        const hermanos = g.albaran
+                          ? panelDoc.gruposId.filter((x) => claveAlb(x.albaran) && claveAlb(x.albaran) === claveAlb(g.albaran))
+                          : [];
+                        if (hermanos.length < 2) return null;
+                        const cual = g.pedido ? `las de ${g.pedido}` : "las que no tienen Nº de pedido";
+                        return (
+                          <div className="text-[11px] text-slate-600 mb-2 pl-[5.5rem]">
+                            Este albarán {g.albaran} está repartido en {hermanos.length} pedidos. Aquí solo van {cual}. Cada pedido se confirma y se sube a BC por separado.
+                            {!g.pedido && " Estas líneas no traían PC: escríbelo y pulsa Cargar pedido."}
+                          </div>
+                        );
+                      })()}
+                      {(g.oferta || g.ofertaAviso) && (
+                        <div className="text-[11px] mb-2 pl-[5.5rem]">
+                          {g.oferta && (
+                            <div className={g.pedido ? "text-slate-600" : "text-amber-800"}>
+                              Nº oferta {g.oferta}{g.pedido ? ` · pedido ${g.pedido}` : ""}
+                            </div>
+                          )}
+                          {g.ofertaAviso && <div className="text-amber-700">{g.ofertaAviso}</div>}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2 mb-1">
                         <label className="text-xs font-semibold text-slate-500 w-20">Nº albarán</label>
                         <input
                           value={g.albaran}
@@ -1456,30 +3705,49 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                           className="border border-slate-300 rounded px-2 py-1 text-sm w-40"
                         />
                       </div>
+                      <div className="mb-3 pl-[5.5rem]">
+                        <QuienHaRecogido
+                          albaran={g.albaran || ""}
+                          pedido={g.pedido || ""}
+                          proveedor={g.vendorName || ""}
+                          pdfVista={g.pdfVista || null}
+                        />
+                      </div>
 
                       {g.bcError && (
                         <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-3">
-                          No se han podido cruzar las líneas de material con BC: {g.bcError}. Puedes subir igualmente el albarán y el adjunto; las cantidades las registrarás a mano.
+                          <div>No se han podido cruzar las líneas de material con BC: {g.bcError}. Puedes subir igualmente el albarán y el adjunto; las cantidades las registrarás a mano.</div>
+                          <button
+                            type="button"
+                            onClick={() => abrirAvisoPedidoIncorrecto(g)}
+                            className="mt-2 inline-flex items-center gap-1 font-semibold text-amber-900 border border-amber-300 bg-white hover:bg-amber-100 rounded px-2 py-1"
+                          >
+                            <Mail size={12} /> Avisar de que el nº de pedido es incorrecto
+                          </button>
                         </div>
                       )}
 
                       {g.lineas.length > 0 && (
                         <div className="mb-3">
-                          <div className="text-xs font-semibold text-slate-500 mb-1">Líneas de material leídas en el PDF, cruzadas con las del pedido en BC:</div>
+                          <div className="text-xs font-semibold text-slate-500 mb-1">Líneas del pedido en BC, con lo leído en este albarán:</div>
+                          <p className="text-[10px] text-slate-500 mb-1">
+                            Salen todas las líneas del pedido. Las que este albarán no trae quedan con cantidad a registrar 0 y sin marcar. Puedes corregir la cantidad y el coste directo antes de confirmar: se guardan en BC al pulsar Confirmar, antes de recibir.
+                          </p>
                           <table className="w-full text-[11px] border border-slate-200 rounded overflow-hidden">
                             <thead>
                               <tr className="bg-slate-50 text-slate-600 text-left">
                                 <th className="px-1.5 py-1">Inc.</th>
                                 <th className="px-1.5 py-1">Leído en el albarán</th>
                                 <th className="px-1.5 py-1">Línea del pedido en BC</th>
-                                <th className="px-1.5 py-1 text-right" title="Cantidad del pedido original en Business Central">Cant. pedido (BC)</th>
+                                <th className="px-1.5 py-1 text-right" title="Cantidad del pedido en Business Central. Si la cambias, se escribe en el pedido al confirmar, antes de recibir.">Cant. pedido (BC)</th>
+                                <th className="px-1.5 py-1 text-right" title="Coste directo de la línea en BC (directUnitCost), antes del descuento. Si lo cambias, se escribe en el pedido al confirmar.">Coste directo</th>
                                 <th className="px-1.5 py-1 text-right" title="Cantidad tal como la ha leído la IA en el PDF — revisa que coincida con el papel">Cant. leída (PDF)</th>
                                 <th className="px-1.5 py-1">Cant. a registrar</th>
                               </tr>
                             </thead>
                             <tbody>
                               {g.lineas.map((l, li) => {
-                                const discrepancia = l.lineaBC && Number(l.cantidadAlbaran) !== Number(l.lineaBC.cantidadPedida);
+                                const discrepancia = !l.soloPedido && l.lineaBC && l.cantidadAlbaran !== "" && Number(l.cantidadAlbaran) !== Number(l.lineaBC.cantidadPedida);
                                 return (
                                 <tr key={l.id} className="border-t border-slate-100">
                                   <td className="px-1.5 py-1 text-center">
@@ -1490,7 +3758,7 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                                       onChange={(e) => editarLinea(indiceActual, li, "incluir", e.target.checked)}
                                     />
                                   </td>
-                                  <td className="px-1.5 py-1">{l.descripcionAlbaran}</td>
+                                  <td className="px-1.5 py-1">{l.soloPedido ? <span className="text-slate-400">— no está en este albarán —</span> : l.descripcionAlbaran}</td>
                                   <td className="px-1.5 py-1">
                                     <select
                                       value={l.lineaBC?.id || ""}
@@ -1526,18 +3794,62 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                                     )}
                                     {l.pasadaACargo && <div className="mt-1 text-[10px] text-amber-700">→ se añade al pedido (abajo)</div>}
                                   </td>
-                                  <td className="px-1.5 py-1 text-right whitespace-nowrap">
-                                    {l.lineaBC ? (
-                                      <>
-                                        {l.lineaBC.cantidadPedida}
-                                        <span className="text-slate-400"> (pendiente {l.lineaBC.cantidadPendiente})</span>
-                                      </>
-                                    ) : (
+                                  <td className="px-1.5 py-1 text-right">
+                                    {l.lineaBC ? (() => {
+                                      const cantTxt = l.cantidadPedidoEdit !== undefined ? l.cantidadPedidoEdit : l.lineaBC.cantidadPedida;
+                                      const cantNueva = Number(cantTxt);
+                                      const cambiada = cantTxt !== "" && Number.isFinite(cantNueva) && Math.abs(cantNueva - (Number(l.lineaBC.cantidadPedida) || 0)) > 1e-6;
+                                      const recibida = Number(l.lineaBC.cantidadRecibida) || 0;
+                                      const pendiente = Number.isFinite(cantNueva) ? Math.max(0, cantNueva - recibida) : l.lineaBC.cantidadPendiente;
+                                      return (
+                                        <div>
+                                          <input
+                                            type="number"
+                                            step="any"
+                                            min={recibida || 0}
+                                            value={cantTxt}
+                                            onChange={(e) => editarLinea(indiceActual, li, "cantidadPedidoEdit", e.target.value)}
+                                            title="Cantidad del pedido en BC. Se guarda al confirmar, antes de recibir."
+                                            className={`border rounded w-20 px-1 py-0.5 text-right ${cambiada ? "border-amber-400 bg-amber-50" : "border-slate-300 bg-white"}`}
+                                          />
+                                          <div className="text-[10px] text-slate-400 mt-0.5">
+                                            {recibida > 0 ? `recibida ${recibida} · ` : ""}
+                                            pendiente {Number.isFinite(pendiente) ? pendiente : "—"}
+                                            {cambiada ? " · se guarda al confirmar" : ""}
+                                          </div>
+                                        </div>
+                                      );
+                                    })() : (
+                                      <span className="text-slate-300">—</span>
+                                    )}
+                                  </td>
+                                  <td className="px-1.5 py-1 text-right">
+                                    {l.lineaBC ? (() => {
+                                      const precioTxt = l.precioEdit !== undefined ? l.precioEdit : (l.lineaBC.precio ?? "");
+                                      const precioNueva = precioTxt === "" || precioTxt == null ? null : Number(precioTxt);
+                                      const precioOrig = l.lineaBC.precio == null || l.lineaBC.precio === "" ? null : Number(l.lineaBC.precio);
+                                      const cambiada = precioNueva != null && Number.isFinite(precioNueva) && (precioOrig == null || Math.abs(precioNueva - precioOrig) > 0.0001);
+                                      return (
+                                        <div>
+                                          <input
+                                            type="number"
+                                            step="0.01"
+                                            min="0"
+                                            value={precioTxt}
+                                            onChange={(e) => editarLinea(indiceActual, li, "precioEdit", e.target.value)}
+                                            placeholder="—"
+                                            title="Coste directo de la línea en BC. Se guarda al confirmar, antes de recibir."
+                                            className={`border rounded w-20 px-1 py-0.5 text-right ${cambiada ? "border-amber-400 bg-amber-50" : "border-slate-300 bg-white"}`}
+                                          />
+                                          {cambiada && <div className="text-[10px] text-amber-700 mt-0.5">se guarda al confirmar</div>}
+                                        </div>
+                                      );
+                                    })() : (
                                       <span className="text-slate-300">—</span>
                                     )}
                                   </td>
                                   <td className={`px-1.5 py-1 text-right font-semibold ${discrepancia ? "text-red-600" : "text-slate-700"}`} title={discrepancia ? "No coincide con la cantidad del pedido en BC — revisa el papel" : ""}>
-                                    {l.cantidadAlbaran}{discrepancia && " ⚠"}
+                                    {l.soloPedido || l.cantidadAlbaran === "" ? "—" : l.cantidadAlbaran}{discrepancia && " ⚠"}
                                   </td>
                                   <td className="px-1.5 py-1">
                                     <input
@@ -1547,6 +3859,9 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                                       onChange={(e) => editarLinea(indiceActual, li, "cantidadARegistrar", Number(e.target.value))}
                                       className="border border-slate-300 rounded w-16 px-1 py-0.5"
                                     />
+                                    {l.lineaBC && Number(l.cantidadARegistrar) > Number(l.cantidadPedidoEdit !== undefined ? l.cantidadPedidoEdit : l.lineaBC.cantidadPedida) + 1e-6 && (
+                                      <div className="text-[10px] text-amber-700 mt-0.5 max-w-[9rem]">Supera la cantidad del pedido. Súbela o BC puede rechazar el exceso.</div>
+                                    )}
                                   </td>
                                 </tr>
                                 );
@@ -1665,23 +3980,41 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                         </div>
                       </div>
 
-                      <button
-                        onClick={() => confirmarGrupo(indiceActual)}
-                        disabled={estado?.subiendo || !g.pedido}
-                        className="inline-flex items-center gap-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-4 py-2"
-                      >
-                        {estado?.subiendo ? <RefreshCw size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
-                        Confirmar y subir este pedido a BC
-                      </button>
-                      <button
-                        onClick={() => confirmarGrupo(indiceActual, { registrar: false })}
-                        disabled={estado?.subiendo || !g.pedido}
-                        title="Sube el Nº de albarán, lo copia en Su/Ntra. ref., adjunta el PDF y rellena las cantidades a recibir, pero NO registra: lo registras tú después desde BC"
-                        className="ml-2 inline-flex items-center gap-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-4 py-2"
-                      >
-                        {estado?.subiendo ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
-                        Subir este pedido en BC
-                      </button>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          onClick={() => confirmarGrupo(indiceActual)}
+                          disabled={estado?.subiendo || !g.pedido}
+                          className="inline-flex items-center gap-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-4 py-2"
+                        >
+                          {estado?.subiendo ? <RefreshCw size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+                          Confirmar y subir este pedido a BC
+                        </button>
+                        <button
+                          onClick={() => confirmarGrupo(indiceActual, { registrar: false })}
+                          disabled={estado?.subiendo || !g.pedido}
+                          title="Sube el Nº de albarán, lo copia en Su/Ntra. ref., adjunta el PDF y rellena las cantidades a recibir, pero NO registra: lo registras tú después desde BC"
+                          className="inline-flex items-center gap-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-md px-4 py-2"
+                        >
+                          {estado?.subiendo ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
+                          Subir este pedido en BC
+                        </button>
+                        <button
+                          onClick={() => abrirConsultaResponsable(g)}
+                          title="Abre un correo al responsable del departamento para preguntar si este pedido es correcto y a qué OT corresponde. También si el albarán no trae PC. No se envía hasta que lo confirmes."
+                          className="inline-flex items-center gap-2 text-sm font-semibold text-blue-700 border border-blue-300 bg-white hover:bg-blue-50 rounded-md px-4 py-2"
+                        >
+                          <Mail size={14} />
+                          Preguntar al responsable
+                        </button>
+                        <button
+                          onClick={() => abrirAvisoPedidoIncorrecto(g)}
+                          title="Abre un correo al responsable del departamento o al proveedor para informar de que el número de pedido del albarán no es correcto. No se envía hasta que lo confirmes."
+                          className="inline-flex items-center gap-2 text-sm font-semibold text-amber-800 border border-amber-300 bg-amber-50 hover:bg-amber-100 rounded-md px-4 py-2"
+                        >
+                          <Mail size={14} />
+                          Nº de pedido incorrecto
+                        </button>
+                      </div>
 
                       {estado?.resultado && (
                         <div className="mt-2 text-[11px] space-y-0.5">
@@ -1702,6 +4035,23 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                               {n.ok ? `✓ Línea nueva ${n.codigo} creada y marcada para recibir` : `✗ Línea nueva ${n.codigo}: ${n.error || "error"}`}
                               {n.ok && n.copiado && Object.keys(n.copiado).length > 0 && <span className="text-slate-500"> · copiado: {Object.entries(n.copiado).map(([k, v]) => `${k}=${v}`).join(", ")}</span>}
                               {(n.avisos || []).map((a, ai) => <div key={ai} className="text-amber-700 pl-3">⚠ {a}</div>)}
+                            </div>
+                          ))}
+                          {estado.resultado.reabierto && (
+                            <div className={estado.resultado.relanzado === false ? "text-amber-700" : "text-slate-600"}>
+                              {estado.resultado.relanzado === false
+                                ? "El pedido estaba lanzado y se ha reabierto para guardar la cantidad. No se ha podido volver a lanzar."
+                                : "El pedido estaba lanzado: se ha reabierto para guardar la cantidad y el coste, y se ha vuelto a lanzar."}
+                            </div>
+                          )}
+                          {estado.resultado.avisoLanzado && estado.resultado.relanzado === false && (
+                            <div className="text-amber-700">{estado.resultado.avisoLanzado}</div>
+                          )}
+                          {(estado.resultado.ajustesPedido || []).map((a, ai) => (
+                            <div key={`aj${ai}`} className={a.ok ? "text-emerald-700" : "text-red-600"}>
+                              {a.ok
+                                ? `✓ Pedido actualizado antes de recibir${a.cantidad != null ? ` · cantidad ${a.cantidad}` : ""}${a.precio != null ? ` · coste directo ${a.precio}` : ""}${a.sinCambio ? " (ya estaba así)" : ""}`
+                                : `✗ Cantidad o precio del pedido: ${a.error || "error"}`}
                             </div>
                           ))}
                           {(estado.resultado.lineas || []).map((l, li) => (
@@ -1846,18 +4196,71 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
             <span className="text-slate-400 ml-auto">{filtradas.length} de {datos?.pendientes.filter((p) => p.impPend > 0).length || 0}</span>
           </div>
 
-          {/* Tabla */}
-          <div className="mt-3 overflow-x-auto bg-white border border-slate-200 rounded-lg">
-            <table className="w-full text-[12px]">
+          {/* Tabla: anchos fijos para que quepan todas las columnas en la página */}
+          <div className="mt-3 bg-white border border-slate-200 rounded-lg">
+            <table className="w-full table-fixed text-[11px]">
+              <colgroup>
+                <col className="w-[2.2%]" />
+                <col className="w-[8.2%]" />
+                <col className="w-[4.2%]" />
+                <col className="w-[5.6%]" />
+                <col className="w-[6.6%]" />
+                <col className="w-[3.2%]" />
+                <col className="w-[12%]" />
+                <col className="w-[5%]" />
+                <col className="w-[5.4%]" />
+                <col className="w-[8.4%]" />
+                <col className="w-[3.2%]" />
+                <col className="w-[6.6%]" />
+                <col className="w-[6.6%]" />
+                <col className="w-[5.6%]" />
+                <col className="w-[5%]" />
+                <col className="w-[3.4%]" />
+                <col className="w-[3.4%]" />
+                <col className="w-[3.4%]" />
+                <col className="w-[2.6%]" />
+              </colgroup>
               <thead>
                 <tr className="bg-slate-50 text-slate-600 text-left">
-                  {["✓", "Pedido", "Tipo", "Fecha", "Recepción prevista", "Días", "Proveedor", "Comprador", "Un. negocio", "OT", "Alianza", "Importe", "Imp. pendiente", "Prioridad", "Alertas", "Revisado", "Notas", "Reclamado", ""].map((h) => (
-                    <th key={h} className="px-2 py-2 font-semibold whitespace-nowrap">{h}</th>
+                  {[
+                    ["✓", ""],
+                    ["Pedido", "Pedido"],
+                    ["Tipo", "Tipo"],
+                    ["Fecha", "Fecha"],
+                    ["Recepción prevista", "Recep. prev."],
+                    ["Días", "Días"],
+                    ["Proveedor", "Proveedor"],
+                    ["Comprador", "Compr."],
+                    ["Un. negocio", "Un. neg."],
+                    ["OT", "OT"],
+                    ["Alianza", "Alz."],
+                    ["Importe", "Importe"],
+                    ["Imp. pendiente", "Imp. pend."],
+                    ["Prioridad", "Prio."],
+                    ["Alertas", "Alertas"],
+                    ["Revisado", "Rev."],
+                    ["Notas", "Notas"],
+                    ["Reclamado", "Recl."],
+                    ["", ""],
+                  ].map(([id, etiqueta]) => (
+                    <th key={id || "accion"} className="px-1 py-1.5 font-semibold overflow-hidden">
+                      {id && id !== "✓" ? (
+                        <button
+                          type="button"
+                          onClick={() => pulsarOrden(id)}
+                          title={`${etiqueta === id ? id : id}${ordenTabla?.col === id ? (ordenTabla.dir === "asc" ? " · ascendente, pulsa para invertir" : " · descendente, pulsa para el orden inicial") : " · ordenar"}`}
+                          className="inline-flex max-w-full items-center gap-0.5 font-semibold hover:text-slate-900"
+                        >
+                          <span className="truncate">{etiqueta}</span>
+                          {ordenTabla?.col === id && <span className="text-[9px] text-slate-400 shrink-0">{ordenTabla.dir === "asc" ? "▲" : "▼"}</span>}
+                        </button>
+                      ) : etiqueta}
+                    </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {filtradas.map((p) => {
+                {filasTabla.map((p) => {
                   const rev = recep.revisados[p.num];
                   const rc = recep.reclamados[p.num];
                   const notasP = recep.notas[p.num] || [];
@@ -1867,63 +4270,66 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                   return (
                     <React.Fragment key={`${p.num}|${p.tipoDoc}`}>
                     <tr className={`border-t border-slate-100 hover:bg-slate-50/60 ${abierto ? "bg-blue-50/40" : ""}`}>
-                      <td className="px-2 py-1.5 text-center">
+                      <td className="px-0.5 py-1 text-center">
                         <input
                           type="checkbox"
                           checked={!!rev}
                           onChange={(e) => guardar({ revisados: { [p.num]: e.target.checked ? { ts: new Date().toISOString() } : null } })}
                         />
                       </td>
-                      <td className="px-2 py-1.5 font-mono font-semibold whitespace-nowrap">
-                        <button onClick={() => toggleAbierto(p.num)} className="flex items-center gap-0.5 hover:text-blue-700" title="Ver líneas del pedido">
-                          {abierto ? <ChevronDown size={13} /> : <ChevronRight size={13} />}{p.num}
+                      <td className="px-1 py-1 font-mono font-semibold overflow-hidden">
+                        <button onClick={() => toggleAbierto(p.num)} className="flex max-w-full items-center gap-0.5 hover:text-blue-700" title={p.num}>
+                          {abierto ? <ChevronDown size={12} className="shrink-0" /> : <ChevronRight size={12} className="shrink-0" />}
+                          <span className="truncate">{p.num}</span>
                         </button>
                       </td>
-                      <td className="px-2 py-1.5 whitespace-nowrap">{p.tipoDoc}</td>
-                      <td className="px-2 py-1.5 whitespace-nowrap">{p.fecha}</td>
-                      <td className="px-2 py-1.5 whitespace-nowrap">
+                      <td className="px-1 py-1 truncate" title={p.tipoDoc}>{p.tipoDoc === "Pedido" ? "Ped." : p.tipoDoc === "Oferta" ? "Ofe." : p.tipoDoc}</td>
+                      <td className="px-1 py-1 whitespace-nowrap" title={fmtFecha(p.fecha) || p.fecha}>{fechaCorta(p.fecha) || "—"}</td>
+                      <td className="px-0.5 py-1 overflow-hidden">
                         <input
                           type="date"
                           value={p.recepPrev && parseFecha(p.recepPrev) ? parseFecha(p.recepPrev).toISOString().slice(0, 10) : ""}
                           onChange={(e) => guardar({ fechas: { [p.num]: e.target.value || null } })}
-                          className="border border-slate-200 rounded px-1 py-0.5 text-[11px]"
+                          title={fmtFecha(p.recepPrev) || "Recepción prevista"}
+                          className="w-full min-w-0 border border-slate-200 rounded px-0 py-0 text-[10px]"
                         />
                       </td>
-                      <td className="px-2 py-1.5 text-right whitespace-nowrap">{p.dias ?? "—"}</td>
-                      <td className="px-2 py-1.5 whitespace-nowrap max-w-[160px] truncate" title={p.prov}>{p.prov}</td>
-                      <td className="px-2 py-1.5 whitespace-nowrap">{p.comprador}</td>
-                      <td className="px-2 py-1.5 whitespace-nowrap">{p.depto}</td>
-                      <td className="px-2 py-1.5 whitespace-nowrap font-mono">{p.ot || "—"}</td>
-                      <td className="px-2 py-1.5 text-center">{p.alianza ? "✓" : ""}</td>
-                      <td className="px-2 py-1.5 text-right whitespace-nowrap">{fmtEur(p.imp)}</td>
-                      <td className="px-2 py-1.5 text-right whitespace-nowrap font-semibold">{fmtEur(p.impPend)}</td>
-                      <td className="px-2 py-1.5">
-                        <span className={`text-[10px] font-bold border rounded px-1.5 py-0.5 ${COLOR_PRIORIDAD[p.prioridad]}`}>{p.prioridad}</span>
+                      <td className="px-1 py-1 text-right whitespace-nowrap">{p.dias ?? "—"}</td>
+                      <td className="px-1 py-1 overflow-hidden" title={p.prov}><div className="truncate">{p.prov}</div></td>
+                      <td className="px-1 py-1 overflow-hidden" title={p.comprador}><div className="truncate">{p.comprador}</div></td>
+                      <td className="px-1 py-1 overflow-hidden" title={p.depto}><div className="truncate">{p.depto}</div></td>
+                      <td className="px-1 py-1 overflow-hidden font-mono" title={p.ot || ""}><div className="truncate">{p.ot || "—"}</div></td>
+                      <td className="px-0.5 py-1 text-center" title={p.alianza ? "Con alianza" : "Sin alianza"}>{p.alianza ? "✓" : ""}</td>
+                      <td className="px-1 py-1 text-right whitespace-nowrap" title={fmtEur(p.imp)}>{fmtEur(p.imp)}</td>
+                      <td className="px-1 py-1 text-right whitespace-nowrap font-semibold" title={fmtEur(p.impPend)}>{fmtEur(p.impPend)}</td>
+                      <td className="px-0.5 py-1 overflow-hidden">
+                        <span className={`inline-block max-w-full truncate text-[10px] font-bold border rounded px-1 py-0 ${COLOR_PRIORIDAD[p.prioridad]}`} title={p.prioridad}>{p.prioridad}</span>
                       </td>
-                      <td className="px-2 py-1.5 whitespace-nowrap text-[10px]">{(p.alertas || []).join(" ")}</td>
-                      <td className="px-2 py-1.5 whitespace-nowrap text-[10px] text-emerald-700">
-                        {rev ? `✓ Revisat OK · ${selloHora(rev.ts)}` : ""}
+                      <td className="px-1 py-1 overflow-hidden text-[10px]" title={(p.alertas || []).join(" ") || "Sin alertas"}>
+                        <div className="truncate">{(p.alertas || []).join(" ")}</div>
                       </td>
-                      <td className="px-2 py-1.5 text-center">
+                      <td className="px-0.5 py-1 text-center text-[10px] text-emerald-700" title={rev ? `Revisado · ${selloHora(rev.ts)}` : "Sin revisar"}>
+                        {rev ? "✓" : ""}
+                      </td>
+                      <td className="px-0.5 py-1 text-center">
                         <button
                           onClick={() => toggleAbierto(p.num)}
-                          className={`flex items-center gap-0.5 text-[10px] ${notasP.length ? "text-amber-700 font-semibold" : "text-slate-300 hover:text-amber-600"}`}
-                          title={ultNota ? `${ultNota.autor} · ${selloHora(ultNota.ts)}
-${ultNota.texto}` : "Añadir nota interna"}
+                          className={`inline-flex items-center text-[10px] ${notasP.length ? "text-amber-700 font-semibold" : "text-slate-300 hover:text-amber-600"}`}
+                          title={ultNota ? `${ultNota.autor} · ${selloHora(ultNota.ts)}\n${ultNota.texto}` : "Añadir nota interna"}
                         >
-                          <StickyNote size={14} />{notasP.length || ""}
+                          <StickyNote size={12} />{notasP.length || ""}
                         </button>
                       </td>
-                      <td className="px-2 py-1.5 whitespace-nowrap text-[10px] text-blue-700" title={rc ? `Enviado a ${rc.para || ""}` : ""}>
-                        {rc ? `✉ ${rc.veces || 1}× · ${selloHora(rc.ts)}` : ""}
+                      <td className="px-0.5 py-1 text-center text-[10px] text-blue-700" title={rc ? `Reclamado ${rc.veces || 1}× · ${selloHora(rc.ts)}${rc.para ? ` · ${rc.para}` : ""}` : "Sin reclamar"}>
+                        {rc ? `✉${rc.veces || 1}` : ""}
                       </td>
-                      <td className="px-2 py-1.5 text-center">
+                      <td className="px-0.5 py-1 text-center">
                         <button
                           onClick={() => setReclamo({ proveedor: p.prov, provNum: p.provNum, inicial: [p.num] })}
                           className="text-slate-400 hover:text-blue-600"
                           title="Reclamar al proveedor"
                         >
-                          <Mail size={15} />
+                          <Mail size={14} />
                         </button>
                       </td>
                     </tr>
@@ -1943,6 +4349,7 @@ ${ultNota.texto}` : "Añadir nota interna"}
                                   <th className="px-2 py-1 text-right">Pedida</th>
                                   <th className="px-2 py-1 text-right">Recibida</th>
                                   <th className="px-2 py-1 text-right">Pendiente</th>
+                                  <th className="px-2 py-1 text-right" title="Cantidad que se recibirá en Business Central al registrar">A registrar</th>
                                   <th className="px-2 py-1">Ud.</th>
                                   <th className="px-2 py-1 text-right">Precio neto</th>
                                   <th className="px-2 py-1 text-right">Imp. pendiente</th>
@@ -1957,6 +4364,20 @@ ${ultNota.texto}` : "Añadir nota interna"}
                                     <td className="px-2 py-1 text-right">{fmtCant(l.cant)}</td>
                                     <td className="px-2 py-1 text-right">{fmtCant(l.recib)}</td>
                                     <td className={`px-2 py-1 text-right font-semibold ${l.pend > 0 ? "text-orange-700" : ""}`}>{fmtCant(l.pend)}</td>
+                                    <td className="px-2 py-1 text-right">
+                                      {l.pend > 0 ? (
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          step="any"
+                                          max={l.pend}
+                                          value={cantARegistrar(p.num, l)}
+                                          onChange={(e) => setCantReg((prev) => ({ ...prev, [`${p.num}|${l.lineNo}`]: e.target.value }))}
+                                          className="w-16 border border-slate-300 rounded px-1 py-0.5 text-right bg-white"
+                                          title="Cantidad a recibir. Por defecto, lo pendiente."
+                                        />
+                                      ) : ""}
+                                    </td>
                                     <td className="px-2 py-1">{l.ud}</td>
                                     <td className="px-2 py-1 text-right whitespace-nowrap">{fmtEur(l.neto)}</td>
                                     <td className="px-2 py-1 text-right whitespace-nowrap">{l.impPend ? fmtEur(l.impPend) : ""}</td>
@@ -1965,6 +4386,42 @@ ${ultNota.texto}` : "Añadir nota interna"}
                                 ))}
                               </tbody>
                             </table>
+                          )}
+                          {p.tipoDoc === "Pedido" && (p.lineas || []).some((l) => l.pend > 0) && (
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                              {registroUi?.num === p.num && registroUi.fase === "confirmar" ? (
+                                <>
+                                  <span className="text-[11px] text-slate-700">Se recibirá este pedido en Business Central, sin crear la factura.</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => registrarPedidoTabla(p)}
+                                    className="text-[11px] font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded px-2 py-1"
+                                  >
+                                    Confirmar registro
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setRegistroUi(null)}
+                                    className="text-[11px] text-slate-500 hover:text-slate-800"
+                                  >
+                                    Cancelar
+                                  </button>
+                                </>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={registroUi?.num === p.num && registroUi.fase === "registrando"}
+                                  onClick={() => setRegistroUi({ num: p.num, fase: "confirmar" })}
+                                  className="text-[11px] font-semibold text-white bg-sky-700 hover:bg-sky-800 disabled:opacity-60 rounded px-2 py-1"
+                                  title="Registra la recepción en Business Central (Recibir). No crea la factura de compra."
+                                >
+                                  {registroUi?.num === p.num && registroUi.fase === "registrando" ? "Registrando…" : "Registrar recepción"}
+                                </button>
+                              )}
+                              {registroUi?.num === p.num && registroUi.fase === "error" && (
+                                <span className="text-[11px] text-red-700">{registroUi.error}</span>
+                              )}
+                            </div>
                           )}
                           <NotasPedido pedido={p.num} notas={notasP} onCambio={onCambioNotas} />
                         </td>
@@ -1987,6 +4444,23 @@ ${ultNota.texto}` : "Añadir nota interna"}
           {avisoEnvio}
           <button onClick={() => setAvisoEnvio(null)} className="text-emerald-500 hover:text-emerald-700"><X size={14} /></button>
         </div>
+      )}
+
+      {consultaResp && (
+        <ModalConsultaResponsable
+          grupo={consultaResp}
+          onClose={() => setConsultaResp(null)}
+          onEnviado={onConsultaResponsableEnviada}
+        />
+      )}
+
+      {avisoPedido && (
+        <ModalPedidoIncorrecto
+          grupo={avisoPedido}
+          emailsProveedor={recep.emailsProveedor || {}}
+          onClose={() => setAvisoPedido(null)}
+          onEnviado={onAvisoPedidoEnviado}
+        />
       )}
 
       {reclamo && (

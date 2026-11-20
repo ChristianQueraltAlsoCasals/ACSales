@@ -980,6 +980,147 @@ function Pizarra({ datos, etiqActual, etiqPrev }) {
   );
 }
 
+const UNIDADES_NEGOCIO = [
+  { cod: "AMT", nombre: "Treballs amb amiant" },
+  { cod: "AUT", nombre: "Automatització" },
+  { cod: "CON", nombre: "Construcció" },
+  { cod: "INS", nombre: "Instal·lacions" },
+  { cod: "LLM", nombre: "Clau en mà" },
+  { cod: "MAN", nombre: "Manteniments" },
+];
+const COD_UNIDAD = new Set(UNIDADES_NEGOCIO.map((u) => u.cod));
+
+function unidadDeLinea(codigo) {
+  const c = String(codigo || "").trim().toUpperCase();
+  if (!c || c.startsWith("_")) return "";
+  const base = c.includes("-") ? c.split("-")[0] : c;
+  return COD_UNIDAD.has(base) ? base : "";
+}
+
+function filtroParaApi(unidades, texto) {
+  const t = String(texto || "").trim();
+  if (unidades.length) return { lineas: unidades, contiene: "" };
+  if (t) return { lineas: [], contiene: t };
+  return { lineas: [], contiene: "" };
+}
+
+function claveFiltro(f) {
+  if (f?.lineas?.length) return `u:${[...f.lineas].map((s) => String(s).toUpperCase()).sort().join(",")}`;
+  if (f?.unidades?.length) return `u:${[...f.unidades].map((s) => String(s).toUpperCase()).sort().join(",")}`;
+  const c = String(f?.contiene || "").trim();
+  return c ? `c:${c.toUpperCase()}` : "";
+}
+
+function resumenFiltro(unidades, texto) {
+  if (unidades.length) return unidades.join(", ");
+  const t = String(texto || "").trim();
+  return t ? `contiene «${t}»` : "Todas";
+}
+
+function FiltroLinea({ unidades, texto, onUnidades, onTexto, lineasVistas, sinLinea }) {
+  const [abierto, setAbierto] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!abierto) return undefined;
+    const onDoc = (ev) => {
+      if (ref.current && !ref.current.contains(ev.target)) setAbierto(false);
+    };
+    const onKey = (ev) => { if (ev.key === "Escape") setAbierto(false); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [abierto]);
+
+  const q = texto.trim().toUpperCase();
+  const pasa = (cod, nombre) => !q || String(cod).toUpperCase().includes(q) || String(nombre || "").toUpperCase().includes(q);
+  const vistas = Array.isArray(lineasVistas) ? lineasVistas : [];
+  const otras = vistas.filter((l) => !unidadDeLinea(l.codigo) && pasa(l.codigo, l.codigo));
+  const activo = unidades.length > 0 || texto.trim().length > 0;
+  const alternar = (cod) => onUnidades(unidades.includes(cod) ? unidades.filter((x) => x !== cod) : [...unidades, cod]);
+
+  const fila = (cod, nombre, sub) => (
+    <label key={cod} className={`flex items-start gap-2 py-1 cursor-pointer ${sub ? "pl-5" : ""}`}>
+      <input type="checkbox" className="mt-0.5" checked={unidades.includes(cod)} onChange={() => alternar(cod)} />
+      <span className="text-sm text-slate-800">
+        <span className="font-medium">{cod}</span>
+        {nombre && nombre !== cod ? <span className="text-slate-500"> · {nombre}</span> : null}
+      </span>
+    </label>
+  );
+
+  return (
+    <div className="relative" ref={ref}>
+      <div className="text-xs font-semibold text-slate-700">Línea de negocio</div>
+      <button
+        type="button"
+        onClick={() => setAbierto((v) => !v)}
+        className={`mt-1 block max-w-[16rem] truncate border rounded px-2 py-1 text-sm text-left ${activo ? "border-blue-700 bg-blue-50 text-blue-900" : "border-slate-300 text-slate-700"}`}
+        title="Marca varias unidades o escribe un texto que el código deba contener"
+      >
+        {resumenFiltro(unidades, unidades.length ? "" : texto)}
+      </button>
+      {abierto && (
+        <div className="absolute z-30 mt-1 w-80 rounded-lg border border-slate-200 bg-white shadow-lg p-3">
+          <label className="block text-xs font-semibold text-slate-700">
+            Contiene
+            <input
+              type="text"
+              value={texto}
+              onChange={(e) => onTexto(e.target.value)}
+              placeholder="INS, EST, INS-P…"
+              className="mt-1 w-full border rounded px-2 py-1 text-sm font-normal"
+              autoFocus
+            />
+          </label>
+          <p className="text-[11px] text-slate-500 mt-1">
+            {unidades.length
+              ? "Con casillas marcadas se usan esas unidades. El texto solo busca en la lista."
+              : texto.trim()
+                ? `Sin casillas, entran las líneas cuyo código contiene «${texto.trim()}».`
+                : "Marca varias unidades, o deja el texto y no marques ninguna."}
+          </p>
+          {unidades.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-2">
+              {unidades.map((cod) => (
+                <button key={cod} type="button" onClick={() => alternar(cod)} className="text-[11px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-900" title="Quitar">
+                  {cod} ✕
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="mt-2 max-h-64 overflow-auto border-t pt-1">
+            {UNIDADES_NEGOCIO.filter((u) => {
+              if (pasa(u.cod, u.nombre)) return true;
+              return vistas.some((l) => unidadDeLinea(l.codigo) === u.cod && pasa(l.codigo, l.codigo));
+            }).map((u) => (
+              <div key={u.cod}>
+                {fila(u.cod, u.nombre)}
+                {vistas.filter((l) => unidadDeLinea(l.codigo) === u.cod && l.codigo.toUpperCase() !== u.cod && pasa(l.codigo, l.codigo)).map((l) => fila(l.codigo, `${Number(l.movimientos || 0).toLocaleString("es-ES")} movs.`, true))}
+              </div>
+            ))}
+            {otras.length > 0 && (
+              <div className="mt-1">
+                <div className="text-[11px] font-semibold text-slate-500 px-0.5">Otras líneas</div>
+                {otras.map((l) => fila(l.codigo, `${Number(l.movimientos || 0).toLocaleString("es-ES")} movs.`))}
+              </div>
+            )}
+            {!vistas.length && <p className="text-[11px] text-slate-400 px-0.5 py-1">Los códigos concretos (INS-P, _EST…) aparecen aquí después de actualizar con un filtro.</p>}
+          </div>
+          {sinLinea > 0 && <p className="text-[11px] text-slate-500 mt-2">{sinLinea.toLocaleString("es-ES")} movimientos sin línea de negocio. No entran en el filtro.</p>}
+          {activo && (
+            <button type="button" onClick={() => { onUnidades([]); onTexto(""); }} className="mt-2 text-xs text-slate-600 underline">
+              Quitar filtro
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Ratios({ recursos = [] }) {
   const [hasta, setHasta] = useState(hoy());
   const [desde, setDesde] = useState(inicioAnio(hoy()));
@@ -992,6 +1133,10 @@ export default function Ratios({ recursos = [] }) {
   const [vista, setVista] = useState("direccion");
   const [explic, setExplic] = useState({});
   const [stockTxt, setStockTxt] = useState({ actual: null, anterior: null });
+  const [unidadesLN, setUnidadesLN] = useState([]);
+  const [textoLN, setTextoLN] = useState("");
+  const [lineasVistas, setLineasVistas] = useState([]);
+  const [sinLinea, setSinLinea] = useState(0);
 
   const fijarStock = (lado, valor) => {
     setStockTxt((s) => {
@@ -1062,10 +1207,21 @@ export default function Ratios({ recursos = [] }) {
     try {
       if (desde > hasta) throw new Error("En el periodo a analizar, la fecha inicial no puede ser posterior a la final.");
       if (desdeComp > hastaComp) throw new Error("En la comparación, la fecha inicial no puede ser posterior a la final.");
-      const r = await fetch(`/api/contabilidad/ratios?desde=${desde}&hasta=${hasta}&desdePrev=${desdeComp}&hastaPrev=${hastaComp}&refrescar=1`);
+      const filtro = filtroParaApi(unidadesLN, textoLN);
+      const params = new URLSearchParams({ desde, hasta, desdePrev: desdeComp, hastaPrev: hastaComp });
+      if (filtro.lineas.length) params.set("lineas", filtro.lineas.join(","));
+      if (filtro.contiene) params.set("contiene", filtro.contiene);
+      const mismasFechas = datos && datos.desde === desde && datos.hasta === hasta && datos.desdePrev === desdeComp && datos.hastaPrev === hastaComp;
+      const soloCambiaFiltro = Boolean(mismasFechas && Array.isArray(datos.lineasDisponibles) && claveFiltro(filtro) !== claveFiltro(datos.filtroLinea));
+      if (!soloCambiaFiltro) params.set("refrescar", "1");
+      const r = await fetch(`/api/contabilidad/ratios?${params}`);
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error([j.error, j.detalle].filter(Boolean).join(" — ") || `Error ${r.status}`);
       setDatos(j);
+      if (Array.isArray(j.lineasDisponibles)) {
+        setLineasVistas(j.lineasDisponibles);
+        setSinLinea(Number(j.sinLinea) || 0);
+      }
       aplicarFechas(j);
     } catch (e) {
       setError(String(e.message || e).includes("Failed to fetch") ? "No se pudo conectar con el backend. ¿Está arrancado (INICIAR.bat)?" : String(e.message || e));
@@ -1082,6 +1238,12 @@ export default function Ratios({ recursos = [] }) {
   const gp = datos ? grupos(bpVista, datos.anterior.resultados, datos.anterior.dias) : [];
   const etiqActual = datos ? `${fmtF(datos.desde)} – ${fmtF(datos.hasta)}` : "Actual";
   const etiqPrev = datos ? `${fmtF(datos.desdePrev)} – ${fmtF(datos.hastaPrev)}` : "Año anterior";
+  const filtroLocal = filtroParaApi(unidadesLN, textoLN);
+  const fechasDistintas = Boolean(datos && (desde !== datos.desde || hasta !== datos.hasta || desdeComp !== datos.desdePrev || hastaComp !== datos.hastaPrev));
+  const filtroDistinto = Boolean(datos && claveFiltro(filtroLocal) !== claveFiltro(datos.filtroLinea));
+  const textoFiltroDatos = datos?.filtroLinea
+    ? resumenFiltro(datos.filtroLinea.unidades || [], datos.filtroLinea.unidades?.length ? "" : datos.filtroLinea.contiene)
+    : "";
 
   return (
     <div className={pestana === "ratios" ? "w-full" : "max-w-[1400px]"}>
@@ -1119,19 +1281,27 @@ export default function Ratios({ recursos = [] }) {
             </label>
           </div>
         </div>
-        <button onClick={actualizar} disabled={cargando} className="px-4 py-2 rounded bg-blue-700 text-white text-sm disabled:opacity-50" title="Vuelve a leer los movimientos de contabilidad y guarda el resultado">
+        <FiltroLinea unidades={unidadesLN} texto={textoLN} onUnidades={setUnidadesLN} onTexto={setTextoLN} lineasVistas={lineasVistas} sinLinea={sinLinea} />
+        <button onClick={actualizar} disabled={cargando} className="px-4 py-2 rounded bg-blue-700 text-white text-sm disabled:opacity-50" title="Vuelve a leer los movimientos de contabilidad. Con línea de negocio, la primera vez tarda más porque lee la dimensión.">
           {cargando && datos ? "Actualizando…" : cargando ? "Leyendo…" : "Actualizar"}
         </button>
         {datos && (
           <span className="text-xs text-slate-400 ml-2">
-            Guardado{datos.calculado ? ` el ${new Date(datos.calculado).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" })}` : ""}.
-            {" "}{datos.movimientos.toLocaleString("es-ES")} movimientos
+            {datos.filtroLinea
+              ? <>Filtro {textoFiltroDatos}. {datos.movimientos.toLocaleString("es-ES")} movimientos{datos.movimientosLeidos ? ` de ${datos.movimientosLeidos.toLocaleString("es-ES")} leídos` : ""}{datos.deCache ? ". Sobre la última lectura, sin volver a Business Central" : ""}.</>
+              : <>Guardado{datos.calculado ? ` el ${new Date(datos.calculado).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" })}` : ""}. {datos.movimientos.toLocaleString("es-ES")} movimientos</>}
             {datos.movsCierreExcluidos ? ` · ${datos.movsCierreExcluidos} de regularización/cierre excluidos de la cuenta de resultados` : ""}
           </span>
         )}
       </div>
-      {datos && (desde !== datos.desde || hasta !== datos.hasta || desdeComp !== datos.desdePrev || hastaComp !== datos.hastaPrev) && (
-        <p className="text-sm text-amber-800 mt-3">Las fechas de arriba no son las de las cifras que se ven. Pulsa Actualizar para leer esos periodos y guardarlos.</p>
+      {(fechasDistintas || filtroDistinto) && (
+        <p className="text-sm text-amber-800 mt-3">Las fechas o la línea de negocio de arriba no son las de las cifras que se ven. Pulsa Actualizar para leerlas.</p>
+      )}
+      {datos?.filtroLinea && !filtroDistinto && (
+        <p className="text-sm text-blue-900 bg-blue-50 border border-blue-200 rounded p-3 mt-3">
+          Cifras de {textoFiltroDatos}. Entran los movimientos que llevan esa línea de negocio.
+          Las cuentas sin dimensión (banco, capital, préstamos) pueden no aparecer en el balance.
+        </p>
       )}
       {!datos && !cargando && !error && <p className="text-sm text-slate-500 mt-4">No hay cifras guardadas. Pulsa Actualizar para leer la contabilidad. Puede tardar un par de minutos. Después se quedan guardadas.</p>}
       {cargando && !datos && <p className="text-sm text-slate-500 mt-4">Leyendo las cifras guardadas…</p>}

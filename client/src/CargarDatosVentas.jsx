@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
+import { createPortal } from "react-dom";
 import {
   Database,
   RefreshCw,
@@ -34,6 +35,9 @@ import {
   Users,
   SlidersHorizontal,
   Calendar,
+  Shirt,
+  Briefcase,
+  LayoutDashboard,
 } from "lucide-react";
 import TeamsPendentsCampana from "./teamsPendents.jsx";
 import SimuladorTarifas2027 from "./simuladorTarifas2027.jsx";
@@ -73,18 +77,22 @@ import { excelValoracionPresupuesto as generarExcelValoracion } from "./excelVal
 import Recepcion from "./recepcion.jsx";
 import FacturasCompra from "./facturasCompra.jsx";
 import FacturasVenta from "./facturasVenta.jsx";
+import PanelInicial from "./panelInicial.jsx";
 import AnalisisCliente from "./analisisCliente.jsx";
 import Precios from "./precios.jsx";
 import { EMAILS_DEPARTAMENTO, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
 import Correo from "./correo.jsx";
+import Comercial from "./comercial.jsx";
 import Tareas from "./tareas.jsx";
 import Calendario from "./calendario.jsx";
 import ChatIA from "./chatIA.jsx";
 import Ratios from "./ratios.jsx";
 import IAFlotante from "./iaFlotante.jsx";
 import ControlHoras from "./horas.jsx";
-import { SelectorEmpresa, empresaGuardada } from "./empresa.jsx";
+import Ropa from "./ropa.jsx";
+import { SelectorEmpresa, empresaGuardada, esEmpresaQuimlab } from "./empresa.jsx";
 import { soloControlHoras } from "./permisos.js";
+import VistaPartesPendents, { construirInformePartes, resumenCorreoOT } from "./partesPendentsFacturar.jsx";
 import Papa from "papaparse";
 
 /**
@@ -256,12 +264,33 @@ const fmt = (iso) => {
   return `${d}/${m}/${y}`;
 };
 const addDays = (iso, n) => {
-  const d = new Date(iso + "T00:00:00");
-  d.setDate(d.getDate() + n);
-  return d.toISOString().slice(0, 10);
+  const [y, m, d] = String(iso).split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  dt.setDate(dt.getDate() + n);
+  const mm = String(dt.getMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getDate()).padStart(2, "0");
+  return `${dt.getFullYear()}-${mm}-${dd}`;
 };
 const isBefore = (a, b) => a < b;
 const isAfter = (a, b) => a > b;
+
+// BC no responde a un filtro de muchos años en una sola llamada (la conexión
+// se corta y la pantalla lo muestra como «backend no disponible»).
+const DIAS_POR_LLAMADA = 31;
+function trocearRango(from, to, maxDias = DIAS_POR_LLAMADA) {
+  if (!from || !to || isAfter(from, to)) return [];
+  const out = [];
+  let cur = from;
+  for (let i = 0; i < 400 && !isAfter(cur, to); i++) {
+    let end = addDays(cur, maxDias - 1);
+    if (isAfter(end, to)) end = to;
+    out.push({ from: cur, to: end });
+    const next = addDays(end, 1);
+    if (!isAfter(next, cur)) break;
+    cur = next;
+  }
+  return out;
+}
 
 // Mediana de una lista de números (usada para cantidades/costes de material)
 const mediana = (arr) => {
@@ -343,17 +372,23 @@ async function fetchFromBC(sourceId, from, to) {
       detalle: json.pistas?.join(" · ") || json.detalle || json.intentos?.join(" · ") || "",
     };
   } catch {
-    /* backend no arrancado */
+    /* sin respuesta: servidor parado o la conexión se cortó a medias */
   }
   return {
     rows: 0,
     data: [],
     simulado: false,
-    error: "Backend no disponible. Arranca la aplicación con INICIAR.bat (la ventana negra debe mostrar [api] escuchando en :3000) y reintenta.",
+    error: "No se pudo conectar con el servidor. Abre http://localhost:8102 (la aplicación tiene que estar arrancada) y reintenta.",
   };
 }
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+const todayISO = () =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 
 function InfoTooltip({ origin }) {
   const [open, setOpen] = useState(false);
@@ -478,35 +513,56 @@ function SourceCard({ source, state, onLoad, onClear, onEnriquecerExcel }) {
     }
 
     let newRows = 0;
-    let newData = [];
     let algunaSimulada = false;
     let errorBC = null;
     let sinFecha = false;
-    for (const range of pending) {
-      const res = await fetchFromBC(source.id, range.from, range.to);
+    // Un rango de años en una sola llamada deja a BC sin responder y el
+    // navegador corta la conexión. Se pide mes a mes y se guarda cada mes.
+    const trozos = pending.flatMap((r) => trocearRango(r.from, r.to));
+    for (let i = 0; i < trozos.length; i++) {
+      const range = trozos[i];
+      setLastAction({
+        type: "cache",
+        msg: `Cargando ${fmt(range.from)} – ${fmt(range.to)} (${i + 1}/${trozos.length})…`,
+      });
+      let res = await fetchFromBC(source.id, range.from, range.to);
+      for (let n429 = 0; res.error && /429|Too many/i.test(`${res.error} ${res.detalle || ""}`) && n429 < 3; n429++) {
+        const seg = 20 * (n429 + 1);
+        setLastAction({
+          type: "cache",
+          msg: `Business Central pide una pausa. Se reintenta ${fmt(range.from)} – ${fmt(range.to)} en ${seg} s…`,
+        });
+        await new Promise((resuelta) => setTimeout(resuelta, seg * 1000));
+        res = await fetchFromBC(source.id, range.from, range.to);
+      }
       if (res.error) { errorBC = res; break; }
       newRows += res.rows;
-      if (res.data?.length) newData = newData.concat(res.data);
       if (res.simulado) algunaSimulada = true;
-      if (res.sinFecha) { sinFecha = true; break; } // ya viene TODO: no pedir más rangos
+      if (res.sinFecha) {
+        sinFecha = true;
+        onClear(source.id);
+        onLoad(source.id, { from, to }, res.rows, res.data || []);
+        break;
+      }
+      const ultimo = i === trozos.length - 1;
+      onLoad(source.id, range, res.rows, res.data || [], { persist: ultimo || i % 6 === 5 });
     }
 
     if (errorBC) {
-      // No cachear el rango: así se puede reintentar tras corregir
+      const parcial = newRows > 0
+        ? ` Quedan cargadas ${newRows.toLocaleString()} líneas de los meses ya pedidos; al reintentar solo se pide lo que falta.`
+        : "";
+      const esConexion = /No se pudo conectar con el servidor/.test(errorBC.error || "");
       setLastAction({
         type: "cache",
-        msg: `⚠ Business Central respondió con error: ${errorBC.error}${errorBC.detalle ? ` — ${errorBC.detalle}` : ""}`,
+        msg: esConexion
+          ? `⚠ ${errorBC.error}${parcial}`
+          : `⚠ Business Central respondió con error: ${errorBC.error}${errorBC.detalle ? ` — ${errorBC.detalle}` : ""}${parcial}`,
       });
       setLoading(false);
       return;
     }
 
-    if (sinFecha) {
-      // La entidad no tiene fecha filtrable: llega completa. Reemplazar
-      // lo cacheado para no duplicar filas entre recargas.
-      onClear(source.id);
-    }
-    onLoad(source.id, { from, to }, newRows, newData);
     const skipped = daysCount(from, to) - pending.reduce((a, r) => a + daysCount(r.from, r.to), 0);
     const base = sinFecha
       ? `Cargados ${newRows.toLocaleString()} registros (la fuente no tiene fecha a nivel de línea: se carga COMPLETA; recargar reemplaza, no duplica).`
@@ -2039,13 +2095,9 @@ const COLOR_ESTADO_APP = {
 };
 
 // =====================================================================
-// PEDIDOS DE VENTA PENDIENTES DE FACTURAR
-// No depende de "Pedidos de Venta"/"Líneas de Pedido de Venta" de BC
-// (ese cruce por Nº de documento daba problemas). En vez de eso reusa
-// la MISMA memoria de OTs que ya funciona en Explorador de OTs:
-//   · Gasto asociado = materiales (compras reales) + mano de obra a coste
-//   · Estat App = campo Motivo_cancelación_PR, coloreado igual que allí
-// Se listan las OTs con Gasto asociado > 0,01 € y Estat App ≠ FACTURAT.
+// PARTS PENDENTS DE FACTURAR
+// La pantalla (partesPendentsFacturar.jsx) suma el importe enviado y no
+// facturado de las líneas de pedido de venta, agrupado por unidad y OT.
 // =====================================================================
 function gastoAsociadoDeFicha(f) {
   const materiales = Number(f.compra?.costeRealOT) || 0;
@@ -2243,6 +2295,9 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
   const [enviando, setEnviando] = useState(false);
   const [error, setError] = useState(null);
   const [de, setDe] = useState("");
+  const [logo, setLogo] = useState(null);
+  const logoRef = useRef(null);
+  const logoListo = useRef(!String(borrador.cliente || "").trim());
 
   useEffect(() => {
     let vivo = true;
@@ -2257,8 +2312,33 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
         setCc(aj.cc.join("; "));
       })
       .catch(() => {});
+    const nombreLogo = String(borrador.cliente || "").trim();
+    if (nombreLogo) {
+      const qs = new URLSearchParams({ nombre: nombreLogo });
+      fetch(`/api/bc/cliente-logo?${qs}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          const listo = d?.base64 ? d : null;
+          logoRef.current = listo;
+          logoListo.current = true;
+          if (vivo && listo) setLogo(listo);
+        })
+        .catch(() => { logoListo.current = true; });
+    }
     return () => { vivo = false; };
   }, []); // el borrador es el de al abrir; no reescribir si el padre se repinta
+
+  // Bloqueja el scroll del fons perquè les taules de la OT no es pintin per sobre.
+  useEffect(() => {
+    const prevBody = document.body.style.overflow;
+    const prevHtml = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevBody;
+      document.documentElement.style.overflow = prevHtml;
+    };
+  }, []);
 
   const enviar = async () => {
     const destinatarios = emailsDeCampo(para);
@@ -2268,13 +2348,25 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
     setEnviando(true);
     setError(null);
     try {
+      if (!logoListo.current) {
+        await new Promise((resolve) => {
+          const t = setInterval(() => {
+            if (logoListo.current) { clearInterval(t); resolve(); }
+          }, 40);
+          setTimeout(() => { clearInterval(t); resolve(); }, 4000);
+        });
+      }
+      const logoEnvio = logoRef.current;
       const intro = cuerpo
         .split(/\r?\n/)
         .map((l) => (l ? l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "<br/>"))
         .join("<br/>");
-      const cuerpoHtml = borrador.htmlRevision
-        ? `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;">${intro}</div>${borrador.htmlRevision}`
-        : intro;
+      const logoHtml = logoEnvio?.base64
+        ? `<p style="margin:0 0 12px 0;"><img src="cid:logo-cliente" alt="" width="${logoEnvio.ancho}" height="${logoEnvio.alto}" style="width:${logoEnvio.ancho}px;height:${logoEnvio.alto}px;border:0;display:block;"></p>`
+        : "";
+      const cuerpoHtml = (borrador.htmlRevision
+        ? `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;">${logoHtml}${intro}</div>${borrador.htmlRevision}`
+        : `${logoHtml}${intro}`);
       const ficheros = [
         ...((borrador.adjuntosExtra || []).filter((a) => a?.base64)),
         ...(borrador.adjunto?.base64 ? [borrador.adjunto] : []),
@@ -2287,6 +2379,7 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
           cc: copias,
           asunto: asunto.trim(),
           cuerpoHtml,
+          ...(logoEnvio?.base64 ? { logoCliente: { base64: logoEnvio.base64, mime: logoEnvio.mime } } : {}),
           ...(ficheros.length > 1 ? { adjuntos: ficheros } : { adjunto: ficheros[0] || null }),
         }),
       });
@@ -2299,26 +2392,46 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onCerrar}>
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 flex items-center justify-center p-4"
+      style={{ zIndex: 2147483000, background: "rgba(15, 23, 42, 0.55)" }}
+      onClick={onCerrar}
+    >
       <div
-        className={`bg-white rounded-lg shadow-xl w-full max-h-[90vh] overflow-y-auto ${borrador.htmlRevision ? "max-w-4xl" : "max-w-xl"}`}
+        className={`bg-white rounded-lg shadow-2xl w-full max-h-[90vh] flex flex-col min-h-0 relative ${borrador.htmlRevision ? "max-w-4xl" : "max-w-xl"}`}
+        style={{ zIndex: 2147483001 }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 flex-shrink-0 bg-white rounded-t-lg">
           <div>
             <div className="text-sm font-semibold text-slate-800">{titulo || "Correo al responsable"} · OT {borrador.num}</div>
-            <div className="text-[11px] text-slate-500">
-              {borrador.noBC}{borrador.cliente ? ` · ${borrador.cliente}` : ""}
-              {borrador.departamento ? ` · dpto. ${borrador.departamento}` : ""}
-              {de ? ` · desde ${de}` : ""}
+            <div className="text-[11px] text-slate-500 flex items-center gap-2">
+              {logo?.base64 && (
+                <img
+                  src={`data:${logo.mime};base64,${logo.base64}`}
+                  alt=""
+                  width={logo.ancho}
+                  height={logo.alto}
+                  title="Este logo se añade arriba del correo"
+                  className="inline-block rounded bg-white"
+                  style={{ height: logo.alto, width: logo.ancho }}
+                />
+              )}
+              <span>
+                {borrador.noBC}{borrador.cliente ? ` · ${borrador.cliente}` : ""}
+                {borrador.departamento ? ` · dpto. ${borrador.departamento}` : ""}
+                {de ? ` · desde ${de}` : ""}
+              </span>
             </div>
           </div>
           <button type="button" onClick={onCerrar} className="p-1 text-slate-400 hover:text-slate-700" aria-label="Cerrar">
             <X size={18} />
           </button>
         </div>
-        <div className="px-4 py-3 space-y-3 text-sm">
+        <div className="px-4 py-3 space-y-3 text-sm overflow-y-auto flex-1 min-h-0 bg-white">
           <label className="block">
             <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Para</span>
             <input
@@ -2358,7 +2471,8 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
             <div>
               <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Revisión de material</span>
               <div
-                className="mt-1 max-h-64 overflow-auto border border-slate-200 rounded-md p-2 bg-white"
+                className="mt-1 max-h-48 overflow-auto border border-slate-200 rounded-md p-2 bg-white relative"
+                style={{ isolation: "isolate" }}
                 dangerouslySetInnerHTML={{ __html: borrador.htmlRevision }}
               />
             </div>
@@ -2383,7 +2497,7 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
           )}
           {error && <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
         </div>
-        <div className="flex justify-end gap-2 px-4 py-3 border-t border-slate-200 bg-slate-50">
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-slate-200 bg-slate-50 flex-shrink-0 rounded-b-lg relative" style={{ zIndex: 2 }}>
           <button type="button" onClick={onCerrar} disabled={enviando} className="text-sm px-3 py-1.5 rounded-md border border-slate-300 text-slate-700 hover:bg-white">
             Cancelar
           </button>
@@ -2398,7 +2512,8 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -2507,6 +2622,183 @@ function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = 
         />
       )}
     </span>
+  );
+}
+
+function fechaCorreoEnviado(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function listaDestinatarios(arr) {
+  const lista = (arr || []).filter(Boolean);
+  if (!lista.length) return "—";
+  if (lista.length <= 2) return lista.join(", ");
+  return `${lista.slice(0, 2).join(", ")} +${lista.length - 2}`;
+}
+
+function PanelCorreosEnviadosOT({ ficha, onCerrar }) {
+  const codigo = codigoOTParaBC(ficha);
+  const [mensajes, setMensajes] = useState(null);
+  const [buzon, setBuzon] = useState("");
+  const [error, setError] = useState(null);
+  const [hayMas, setHayMas] = useState(false);
+  const [detalle, setDetalle] = useState(null);
+  const [cargandoDetalle, setCargandoDetalle] = useState(false);
+
+  useEffect(() => {
+    const prevBody = document.body.style.overflow;
+    const prevHtml = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevBody;
+      document.documentElement.style.overflow = prevHtml;
+    };
+  }, []);
+
+  useEffect(() => {
+    let vivo = true;
+    const qs = new URLSearchParams({ codigo, numero: String(ficha.numeroOT || "") });
+    fetch(`/api/correo/ot-enviados?${qs}`)
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detalle || d.error || `Error ${r.status}`);
+        return d;
+      })
+      .then((d) => {
+        if (!vivo) return;
+        setMensajes(d.mensajes || []);
+        setBuzon(d.buzon || "");
+        setHayMas(!!d.hayMas);
+      })
+      .catch((e) => { if (vivo) setError(e.message || String(e)); });
+    return () => { vivo = false; };
+  }, [codigo, ficha.numeroOT]);
+
+  const abrirMensaje = async (id) => {
+    setCargandoDetalle(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/buzon/mensaje/${encodeURIComponent(id)}`);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detalle || d.error || `Error ${r.status}`);
+      setDetalle(d);
+    } catch (e) {
+      setError(e.message || String(e));
+    }
+    setCargandoDetalle(false);
+  };
+
+  const cuerpoHtml = detalle
+    ? (/html/i.test(detalle.tipoCuerpo || "") || /<[a-z!]/i.test(detalle.cuerpo || "")
+      ? detalle.cuerpo
+      : `<pre style="font-family:Calibri,sans-serif;white-space:pre-wrap">${String(detalle.cuerpo || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`)
+    : "";
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 flex items-center justify-center p-4"
+      style={{ zIndex: 2147482000, background: "rgba(15, 23, 42, 0.55)" }}
+      onClick={onCerrar}
+    >
+      <div
+        className="bg-white rounded-lg shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col min-h-0"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3 px-4 py-3 border-b border-slate-200">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-slate-800">Correos enviados · {codigo || ficha.numeroOT}</div>
+            <div className="text-[11px] text-slate-500 truncate">
+              {buzon ? `Desde ${buzon}` : "Desde tu buzón"}
+              {ficha.general?.cliente ? ` · ${ficha.general.cliente}` : ""}
+              {mensajes ? ` · ${mensajes.length}${hayMas ? "+" : ""}` : ""}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <BotonCorreoFacturacion
+              ficha={ficha}
+              className="text-[12px] font-semibold text-white bg-purple-600 hover:bg-purple-700 rounded px-3 py-1.5 inline-flex items-center gap-1.5"
+              title="Escribir un correo nuevo sobre esta OT"
+            >
+              <Send size={13} /> Escribir correo
+            </BotonCorreoFacturacion>
+            <button type="button" onClick={onCerrar} className="p-1 text-slate-400 hover:text-slate-700" aria-label="Cerrar">
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+        <div className="overflow-y-auto flex-1 min-h-0">
+          {error && <div className="m-3 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
+          {detalle ? (
+            <div className="p-4">
+              <button type="button" onClick={() => setDetalle(null)} className="text-[12px] text-blue-700 hover:underline mb-2">← Volver a la lista</button>
+              <div className="text-sm font-semibold text-slate-800">{detalle.asunto}</div>
+              <div className="text-[12px] text-slate-500 mt-1">
+                {fechaCorreoEnviado(detalle.fecha)}
+                {detalle.para?.length ? ` · Para ${listaDestinatarios(detalle.para)}` : ""}
+              </div>
+              {detalle.cc?.length > 0 && <div className="text-[12px] text-slate-500">Copia: {listaDestinatarios(detalle.cc)}</div>}
+              <iframe
+                title={detalle.asunto}
+                sandbox=""
+                srcDoc={cuerpoHtml}
+                className="w-full mt-3 border border-slate-200 rounded bg-white"
+                style={{ height: "50vh" }}
+              />
+            </div>
+          ) : mensajes == null && !error ? (
+            <div className="px-4 py-10 text-center text-sm text-slate-400">Buscando en enviados…</div>
+          ) : mensajes?.length === 0 ? (
+            <div className="px-4 py-10 text-center text-sm text-slate-500">No hay correos enviados desde tu buzón que mencionen esta OT.</div>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {(mensajes || []).map((m) => (
+                <li key={m.id} className="px-4 py-2.5 hover:bg-blue-50/60">
+                  <button type="button" onClick={() => abrirMensaje(m.id)} className="w-full text-left">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[12px] font-semibold text-slate-800 truncate flex-1">{m.asunto}</span>
+                      {m.adjuntos && <Paperclip size={12} className="text-slate-400 shrink-0" />}
+                      <span className="text-[11px] text-slate-400 whitespace-nowrap">{fechaCorreoEnviado(m.fecha)}</span>
+                    </div>
+                    <div className="text-[11px] text-slate-500 truncate">Para {listaDestinatarios(m.para)}{m.cc?.length ? ` · Copia ${listaDestinatarios(m.cc)}` : ""}</div>
+                    {m.preview && <div className="text-[12px] text-slate-400 truncate mt-0.5">{m.preview}</div>}
+                  </button>
+                  {m.enlace && (
+                    <a href={m.enlace} target="_blank" rel="noreferrer" className="text-[11px] text-blue-600 hover:underline">Abrir en Outlook</a>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {cargandoDetalle && <div className="px-4 py-2 text-[12px] text-slate-400">Abriendo correo…</div>}
+          {hayMas && !detalle && <div className="px-4 py-2 text-[11px] text-slate-400">Hay más correos de los que se han podido listar. Afina por la OT en Outlook si falta alguno.</div>}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function BotonCorreosEnviadosOT({ ficha }) {
+  const [abierto, setAbierto] = useState(false);
+  const codigo = codigoOTParaBC(ficha);
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setAbierto(true)}
+        title={`Correos enviados desde tu buzón sobre ${codigo || ficha.numeroOT}`}
+        aria-label={`Correos enviados de ${codigo || ficha.numeroOT}`}
+        className="inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"
+      >
+        <Mail size={14} />
+      </button>
+      {abierto && <PanelCorreosEnviadosOT ficha={ficha} onCerrar={() => setAbierto(false)} />}
+    </>
   );
 }
 
@@ -3131,11 +3423,20 @@ function aliasCorreoOT(f) {
   return { clave, patrones: [...patrones].filter((p) => p.length >= 4) };
 }
 
-function NotasOT({ ot, notas, onCambio }) {
+function NotasOT({ ot, codigo, notas, onCambio }) {
   const [texto, setTexto] = useState("");
   const [autor, setAutor] = useState(leerAutorNota);
   const [guardando, setGuardando] = useState(false);
   const [error, setError] = useState(null);
+  const [verCorreos, setVerCorreos] = useState(false);
+  const resumen = resumenCorreoOT(notas, codigo || ot);
+  const correos = (notas || []).filter((n) => n?.correoId || String(n?.autor || "").includes("Correo"));
+  const manuales = (notas || []).filter((n) => !correos.includes(n));
+  const cajaResumen = resumen?.estado === "no_facturar"
+    ? "bg-red-50 border-red-200 text-red-950"
+    : resumen?.estado === "se_puede"
+      ? "bg-emerald-50 border-emerald-200 text-emerald-950"
+      : "bg-amber-50 border-amber-200 text-amber-950";
 
   const añadir = async () => {
     const t = texto.trim();
@@ -3176,7 +3477,29 @@ function NotasOT({ ot, notas, onCambio }) {
     <div className="mt-2 bg-amber-50/60 border border-amber-200 rounded p-2">
       <div className="text-[11px] font-semibold text-amber-800 mb-1 flex items-center gap-1"><StickyNote size={12} /> Notas internas</div>
       {(notas || []).length === 0 && <div className="text-[11px] text-slate-400 mb-1">Sin notas todavía.</div>}
-      {(notas || []).map((n) => (
+      {resumen?.hayCorreo && (
+        <div className={`mb-2 rounded border px-2 py-1.5 text-[11px] ${cajaResumen}`}>
+          <div className="font-bold">{resumen.titulo}</div>
+          <div className="mt-0.5">{resumen.motivo}</div>
+          {resumen.dichos.length > 1 && (
+            <>
+              <div className="mt-1.5 font-semibold">Resumen de lo dicho</div>
+              <ul className="mt-0.5 space-y-0.5 list-disc pl-4">
+                {resumen.dichos.map((d, i) => (
+                  <li key={i}>
+                    {d.fecha ? <span className="text-slate-500">{d.fecha} · </span> : null}
+                    {d.quien ? <span className="font-semibold">{d.quien}: </span> : null}
+                    {d.texto}
+                  </li>
+                ))}
+              </ul>
+              {resumen.dichosMas > 0 && <div className="mt-0.5 text-slate-500">y {resumen.dichosMas} comentario(s) más en los correos.</div>}
+            </>
+          )}
+          {resumen.listado && <div className="mt-1.5 text-slate-600">{resumen.listado}</div>}
+        </div>
+      )}
+      {manuales.map((n) => (
         <div key={n.id} className="group flex items-start gap-2 text-[11px] py-0.5">
           <span className="text-slate-400 whitespace-nowrap">{selloSeguimiento(n.ts)}</span>
           <span className="font-semibold text-slate-600 whitespace-nowrap">{n.autor}:</span>
@@ -3187,6 +3510,24 @@ function NotasOT({ ot, notas, onCambio }) {
           <button type="button" onClick={() => borrar(n.id)} className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600" title="Borrar nota"><Trash2 size={12} /></button>
         </div>
       ))}
+      {correos.length > 0 && (
+        <div className="mt-1">
+          <button type="button" onClick={() => setVerCorreos((v) => !v)} className="text-[11px] text-blue-700 hover:underline">
+            {verCorreos ? "Ocultar correos" : `Ver correos (${correos.length})`}
+          </button>
+          {verCorreos && correos.map((n) => (
+            <div key={n.id} className="group flex items-start gap-2 text-[11px] py-0.5">
+              <span className="text-slate-400 whitespace-nowrap">{selloSeguimiento(n.ts)}</span>
+              <span className="font-semibold text-slate-600 whitespace-nowrap">{n.autor}:</span>
+              <span className="text-slate-700 whitespace-pre-wrap flex-1">
+                {n.texto}
+                {n.enlace ? <> <a href={n.enlace} target="_blank" rel="noreferrer" className="text-blue-600 underline whitespace-nowrap">Abrir en Outlook</a></> : null}
+              </span>
+              <button type="button" onClick={() => borrar(n.id)} className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600" title="Borrar nota"><Trash2 size={12} /></button>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="flex items-center gap-2 mt-1.5">
         {!leerAutorNota() && (
           <input value={autor} onChange={(e) => setAutor(e.target.value)} placeholder="Tu nombre" className="border border-slate-300 rounded px-2 py-1 text-[11px] w-28 bg-white" />
@@ -3209,14 +3550,7 @@ function NotasOT({ ot, notas, onCambio }) {
 
 function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
   const [fichas, setFichas] = useState(null);
-  const [cargando, setCargando] = useState(true);
   const [error, setError] = useState(null);
-  const [fCliente, setFCliente] = useState("");
-  const [fDepartament, setFDepartament] = useState("");
-  const [fEstats, setFEstats] = useState([]);
-  const [estatsAbiertos, setEstatsAbiertos] = useState(false);
-  const cajaEstats = useRef(null);
-  const [fCorreo, setFCorreo] = useState("");
   const [seg, setSeg] = useState({ notas: {}, enviados: {} });
   const [notasAbiertas, setNotasAbiertas] = useState(() => new Set());
   const [buscandoCorreos, setBuscandoCorreos] = useState(false);
@@ -3231,71 +3565,19 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
         if (!r.ok) throw new Error(`backend ${r.status}`);
         const est = await r.json();
         if (est.fichas?.length) setFichas(new Map(est.fichas));
-        else setError("Aún no hay memoria construida. Ve a «Cargar datos», carga las fuentes y pulsa «Construir memoria histórica».");
+        else setError("Sense memòria d'OT: les descripcions sortiran buides fins que es construeixi la memòria històrica.");
       } catch (err) {
-        setError(`No se pudo cargar la memoria (${err.message}). ¿Está el backend arrancado (npm start)?`);
+        setError(`No s'ha pogut carregar la memòria (${err.message}).`);
       }
-      setCargando(false);
     })();
   }, []);
 
-  useEffect(() => {
-    if (!estatsAbiertos) return;
-    const cerrar = (ev) => {
-      if (cajaEstats.current && !cajaEstats.current.contains(ev.target)) setEstatsAbiertos(false);
-    };
-    document.addEventListener("mousedown", cerrar);
-    return () => document.removeEventListener("mousedown", cerrar);
-  }, [estatsAbiertos]);
-
-  const pendientes = useMemo(() => {
-    if (!fichas) return [];
-    const qC = fCliente.trim().toLowerCase();
-    let arr = [...fichas.values()]
-      .map((f) => ({ f, gasto: gastoAsociadoDeFicha(f) }))
-      .filter(({ f, gasto }) => gasto > 0.01 && !ESTADOS_EXCLUIDOS_PENDIENTES.includes(f.general.estadoApp))
-      .filter(({ f }) => !(f.general.cliente || "").toUpperCase().includes("TALLER"));
-    if (qC) arr = arr.filter(({ f }) => (f.general.cliente || "").toLowerCase().includes(qC));
-    if (fDepartament) arr = arr.filter(({ f }) => f.general.departamento === fDepartament);
-    if (fEstats.length) arr = arr.filter(({ f }) => fEstats.includes(f.general.estadoApp));
-    arr.sort((a, b) => b.gasto - a.gasto);
-    // El análisis Ingresos/Resultado solo se calcula para las filas
-    // visibles tras filtrar (más caro: recorre historial de compra por
-    // artículo de taller), no para las 11k+ fichas antes de filtrar.
-    return arr.map(({ f, gasto }) => ({ f, gasto, ...analisisResultadoFicha(f, fichas) }));
-  }, [fichas, fCliente, fDepartament, fEstats]);
-
-  const departaments = useMemo(() => {
-    if (!fichas) return [];
-    const dep = new Set();
-    for (const f of fichas.values()) if (f.general.departamento) dep.add(f.general.departamento);
-    return [...dep].sort();
-  }, [fichas]);
-
-  const estats = useMemo(() => {
-    if (!fichas) return [];
-    const s = new Set();
-    for (const f of fichas.values()) {
-      if (!f.general.estadoApp || ESTADOS_EXCLUIDOS_PENDIENTES.includes(f.general.estadoApp)) continue;
-      if ((f.general.cliente || "").toUpperCase().includes("TALLER")) continue;
-      if (gastoAsociadoDeFicha(f) <= 0.01) continue;
-      s.add(f.general.estadoApp);
-    }
-    return [...s].sort();
-  }, [fichas]);
-
-  const indicePedidos = useMemo(
-    () => indicePedidosPorOT(pedidosVenta, lineasPedidoVenta),
-    [pedidosVenta, lineasPedidoVenta]
+  const informe = useMemo(
+    () => construirInformePartes({ fichas, pedidosVenta, lineasPedidoVenta }),
+    [fichas, pedidosVenta, lineasPedidoVenta]
   );
-
-  const visibles = useMemo(() => {
-    if (fCorreo === "si") return pendientes.filter(({ f }) => seg.enviados[f.numeroOT]);
-    if (fCorreo === "no") return pendientes.filter(({ f }) => !seg.enviados[f.numeroOT]);
-    return pendientes;
-  }, [pendientes, fCorreo, seg.enviados]);
-
-  const totalVisible = visibles.reduce((acc, { gasto }) => acc + gasto, 0);
+  const informeRef = useRef(informe);
+  informeRef.current = informe;
 
   useEffect(() => {
     fetch("/api/pedidos-venta/seguimiento")
@@ -3304,12 +3586,11 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
       .catch(() => {});
   }, []);
 
-  const pendientesRef = useRef(pendientes);
-  pendientesRef.current = pendientes;
-
   const buscarCorreos = async ({ silencioso = false } = {}) => {
     if (buscandoRef.current) return;
-    const ots = pendientesRef.current.map(({ f }) => aliasCorreoOT(f)).filter((o) => o.clave && o.patrones.length);
+    const ots = (informeRef.current?.ots || [])
+      .map((o) => (o.ficha ? aliasCorreoOT(o.ficha) : null))
+      .filter((o) => o && o.clave && o.patrones.length);
     if (!ots.length) {
       if (!silencioso) setAvisoEnvio("No hay OTs en pantalla para buscar en el correo.");
       return;
@@ -3341,7 +3622,7 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
 
   const buscarRef = useRef(buscarCorreos);
   buscarRef.current = buscarCorreos;
-  const hayOTs = pendientes.length > 0;
+  const hayOTs = (informe?.ots || []).length > 0;
   useEffect(() => {
     if (!hayOTs) return;
     const t0 = setTimeout(() => buscarRef.current({ silencioso: true }), 1500);
@@ -3381,185 +3662,30 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
     return n;
   });
 
-  if (cargando) return <div className="text-sm text-slate-500 p-4">Cargando memoria histórica…</div>;
-  if (error) return <div className="text-sm text-amber-700 bg-amber-50 border border-amber-300 rounded-lg p-3">{error}</div>;
-
   return (
-    <div>
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold text-slate-800 mb-1">Pedidos de venta pendientes de facturar</h1>
-          <p className="text-sm text-slate-500 mb-4">
-            OTs con Gasto asociado (materiales + mano de obra a coste) por encima de 0,01 € y cuyo Estat App no sea <strong>FACTURAT</strong>, <strong>ARCHIVADA</strong> ni <strong>GARANTIA</strong>.
-            Debajo de cada OT está la lista de pedidos de venta. Al pulsar un pedido se abren sus líneas.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={() => buscarCorreos()}
-            disabled={buscandoCorreos}
-            title="Busca en tu correo (recibidos y enviados, últimos 60 días) los mensajes que mencionan una OT y los añade a sus notas"
-            className="flex items-center gap-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700 disabled:opacity-60 rounded-md px-3 py-2"
-          >
-            {buscandoCorreos ? "Buscando correos…" : "📧 Buscar correos"}
-          </button>
-          {estadoCorreo && <span className={`text-[11px] max-w-[140px] ${estadoCorreo.startsWith("✗") ? "text-red-600" : "text-slate-400"}`}>{estadoCorreo}</span>}
-        </div>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2 mb-3">
-        <input
-          value={fCliente}
-          onChange={(e) => setFCliente(e.target.value)}
-          placeholder="Filtrar cliente..."
-          className="border border-slate-300 rounded-md px-3 py-1.5 text-sm w-56"
-        />
-        <select
-          value={fDepartament}
-          onChange={(e) => setFDepartament(e.target.value)}
-          className="border border-slate-300 rounded-md px-2 py-1.5 text-sm"
-        >
-          <option value="">Departaments...</option>
-          {departaments.map((d) => (
-            <option key={d} value={d}>{d}</option>
-          ))}
-        </select>
-        <div className="relative" ref={cajaEstats}>
-          <button
-            type="button"
-            onClick={() => setEstatsAbiertos((v) => !v)}
-            className="border border-slate-300 rounded-md px-2 py-1.5 text-sm bg-white min-w-[150px] text-left"
-          >
-            {fEstats.length === 0 ? "Estat App..." : fEstats.length === 1 ? fEstats[0] : `${fEstats.length} estados`}
-          </button>
-          {estatsAbiertos && (
-            <div className="absolute z-20 mt-1 w-56 max-h-64 overflow-auto bg-white border border-slate-300 rounded-md shadow-lg py-1">
-              {estats.map((estado) => (
-                <label key={estado} className="flex items-center gap-2 px-2 py-1 hover:bg-slate-50 cursor-pointer text-sm">
-                  <input
-                    type="checkbox"
-                    checked={fEstats.includes(estado)}
-                    onChange={() => setFEstats((prev) => prev.includes(estado) ? prev.filter((x) => x !== estado) : [...prev, estado])}
-                  />
-                  {estado}
-                </label>
-              ))}
-            </div>
-          )}
-        </div>
-        <select
-          value={fCorreo}
-          onChange={(e) => setFCorreo(e.target.value)}
-          className="border border-slate-300 rounded-md px-2 py-1.5 text-sm bg-white"
-        >
-          <option value="">Correo</option>
-          <option value="si">Con correo enviado</option>
-          <option value="no">Sin correo</option>
-        </select>
-        {(fCliente || fDepartament || fEstats.length > 0 || fCorreo) && (
-          <button
-            onClick={() => { setFCliente(""); setFDepartament(""); setFEstats([]); setFCorreo(""); setEstatsAbiertos(false); }}
-            className="text-sm text-slate-500 border border-slate-300 rounded-md px-3 py-1.5 bg-white hover:bg-slate-50"
-          >
-            Restablir
-          </button>
-        )}
-        <span className="ml-auto text-sm text-slate-600">
-          {visibles.length.toLocaleString()} OT(s) · <strong>{eur(totalVisible)}</strong> pendientes de facturar
-        </span>
-      </div>
-
-      <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="bg-slate-100 text-slate-600 text-left">
-              <th className="px-3 py-2 font-semibold">OT</th>
-              <th className="px-2 py-2 font-semibold">Estat App</th>
-              <th className="px-2 py-2 font-semibold">Client</th>
-              <th className="px-2 py-2 font-semibold w-[40%]">Descripció</th>
-              <th className="px-2 py-2 font-semibold">Departamento</th>
-              <th className="px-2 py-2 font-semibold text-right" title="Materiales (compras PC) + mano de obra a coste 21,50 €/h">Gasto asociado</th>
-              <th className="px-2 py-2 font-semibold text-right" title="Suma de la cuenta contable 70000000 (Ventas) para esta OT, según Movs. Contabilidad (detalle OT)">Ingresos</th>
-              <th className="px-2 py-2 font-semibold text-right" title="Resultado = margen bruto − estructura (22% de la venta), igual que en el detalle de la OT">Margen</th>
-              <th className="px-2 py-2 font-semibold text-center">Notas</th>
-              <th className="px-2 py-2 font-semibold text-center" title="Correos enviados desde la app">Correo</th>
-              <th className="px-2 py-2 font-semibold text-center">✉</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visibles.length === 0 && (
-              <tr>
-                <td colSpan={11} className="px-3 py-6 text-center text-slate-400">
-                  No hay OTs pendientes de facturar con estos filtros.
-                </td>
-              </tr>
-            )}
-            {visibles.map(({ f, gasto, ingresos, resultado, pct }) => {
-              const pedidos = pedidosDeFicha(f, indicePedidos);
-              const notasP = seg.notas[f.numeroOT] || [];
-              const ultNota = notasP[notasP.length - 1];
-              const rc = seg.enviados[f.numeroOT];
-              const notasAbierta = notasAbiertas.has(f.numeroOT);
-              return (
-                <React.Fragment key={f.numeroOT}>
-                  <tr className="border-t border-slate-200 hover:bg-purple-50/50">
-                    <td className="px-3 py-1.5 font-bold text-slate-800 whitespace-nowrap">{codigoOTParaBC(f) || f.numeroOT}</td>
-                    <td className="px-2 py-1.5 whitespace-nowrap">
-                      {f.general.estadoApp && (
-                        <span className={`text-[10px] font-bold rounded border px-1.5 py-0.5 ${COLOR_ESTADO_APP[f.general.estadoApp] || "bg-slate-50 text-slate-600 border-slate-200"}`}>
-                          {f.general.estadoApp}
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-2 py-1.5 text-slate-600 max-w-[200px] truncate">{f.general.cliente}</td>
-                    <td className="px-2 py-1.5 text-slate-700 max-w-lg truncate" title={f.general.descripcion}>{f.general.descripcion || "—"}</td>
-                    <td className="px-2 py-1.5 whitespace-nowrap">
-                      {f.general.segmento && <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5">{f.general.segmento}</span>}
-                    </td>
-                    <td className="px-2 py-1.5 text-right whitespace-nowrap font-semibold text-slate-700">{eur(gasto)}</td>
-                    <td className="px-2 py-1.5 text-right whitespace-nowrap text-blue-700">{eur(ingresos)}</td>
-                    <td className={`px-2 py-1.5 text-right whitespace-nowrap font-semibold ${resultado < 0 ? "text-red-600" : "text-emerald-600"}`}>
-                      {eur(resultado)}{pct != null && <span className="text-[10px] font-normal ml-1">({pct}%)</span>}
-                    </td>
-                    <td className="px-2 py-1.5 text-center">
-                      <button
-                        type="button"
-                        onClick={() => toggleNotas(f.numeroOT)}
-                        className={`inline-flex items-center gap-0.5 text-[10px] ${notasP.length ? "text-amber-700 font-semibold" : "text-slate-300 hover:text-amber-600"}`}
-                        title={ultNota ? `${ultNota.autor} · ${selloSeguimiento(ultNota.ts)}\n${ultNota.texto}` : "Añadir nota interna"}
-                      >
-                        <StickyNote size={14} />{notasP.length || ""}
-                      </button>
-                    </td>
-                    <td className="px-2 py-1.5 whitespace-nowrap text-[10px] text-blue-700" title={rc ? `Enviado a ${rc.para || ""}` : ""}>
-                      {rc ? `✉ ${rc.veces || 1}× · ${selloSeguimiento(rc.ts)}` : ""}
-                    </td>
-                    <td className="px-2 py-1.5 text-center">
-                      <BotonCorreoFacturacion ficha={f} onRegistrado={(info) => registrarEnvio(f.numeroOT, info?.para)} />
-                    </td>
-                  </tr>
-                  <tr className="bg-slate-50/80">
-                    <td colSpan={11} className="px-3 pt-0 pb-2">
-                      <ListaPedidosOT pedidos={pedidos} />
-                      {notasAbierta && (
-                        <NotasOT ot={f.numeroOT} notas={notasP} onCambio={onCambioNotas} />
-                      )}
-                    </td>
-                  </tr>
-                </React.Fragment>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+    <>
+      <VistaPartesPendents
+        informe={informe}
+        sinLineas={!lineasPedidoVenta?.length}
+        fichasError={error}
+        notas={seg.notas}
+        enviados={seg.enviados}
+        notasAbiertas={notasAbiertas}
+        onToggleNotas={toggleNotas}
+        onCambioNotas={onCambioNotas}
+        onRegistrarEnvio={registrarEnvio}
+        onBuscarCorreos={() => buscarCorreos()}
+        buscandoCorreos={buscandoCorreos}
+        estadoCorreo={estadoCorreo}
+        NotasOT={NotasOT}
+      />
       {avisoEnvio && (
         <div className="fixed bottom-4 right-4 z-40 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm rounded-lg shadow px-4 py-2 flex items-center gap-3 max-w-md">
           {avisoEnvio}
           <button type="button" onClick={() => setAvisoEnvio(null)} className="text-emerald-500 hover:text-emerald-700">✕</button>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -4004,7 +4130,7 @@ function PantallaOTs({ incrustada = false }) {
                     <th className="px-2 py-2 font-semibold w-[40%]">Descripció</th>
                     <th className="px-2 py-2 font-semibold">Departamento</th>
                     <th className="px-2 py-2 font-semibold text-right" title="Materiales (compras PC) + mano de obra a coste 21,50 €/h">Gasto asociado</th>
-                    <th className="px-2 py-2 font-semibold text-center">✉</th>
+                    <th className="px-2 py-2 font-semibold text-center" title="Correos enviados desde tu buzón sobre esta OT">✉</th>
                     <th className="px-2 py-2 font-semibold text-center">Ver Datos</th>
                   </tr>
                 </thead>
@@ -4046,7 +4172,7 @@ function PantallaOTs({ incrustada = false }) {
                         })()}
                       </td>
                       <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}>
-                        <BotonCorreoFacturacion ficha={f} />
+                        <BotonCorreosEnviadosOT ficha={f} />
                       </td>
                       <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}>
                         <button
@@ -4624,6 +4750,54 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     });
   }, [ficha, lineasBC]);
 
+  // Gastos a mano (degradación, imprevistos…) que no vienen de BC.
+  // Se guardan en este navegador, por OT.
+  const LS_GASTOS_MANUAL = "acsales_gastos_manuales_ot_v1";
+  const [gastosManuales, setGastosManuales] = useState([]);
+  useEffect(() => {
+    try {
+      const all = JSON.parse(localStorage.getItem(LS_GASTOS_MANUAL) || "{}");
+      const deOt = all[noBC];
+      setGastosManuales(Array.isArray(deOt) ? deOt : []);
+    } catch {
+      setGastosManuales([]);
+    }
+  }, [noBC]);
+  const persistirGastosManuales = (lista) => {
+    setGastosManuales(lista);
+    try {
+      const all = JSON.parse(localStorage.getItem(LS_GASTOS_MANUAL) || "{}");
+      all[noBC] = lista;
+      localStorage.setItem(LS_GASTOS_MANUAL, JSON.stringify(all));
+    } catch { /* si el navegador no deja guardar, vale para esta visita */ }
+  };
+  const anadirGastoManual = () => {
+    persistirGastosManuales([
+      ...gastosManuales,
+      { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`, descripcion: "", importe: 0 },
+    ]);
+  };
+  const actualizarGastoManual = (id, campo, valor) => {
+    persistirGastosManuales(
+      gastosManuales.map((g) => {
+        if (g.id !== id) return g;
+        if (campo === "importe") {
+          const raw = String(valor);
+          const n = parseFloat(raw.replace(",", "."));
+          return {
+            ...g,
+            importeTxt: raw,
+            importe: Number.isFinite(n) ? n : 0,
+          };
+        }
+        return { ...g, [campo]: valor };
+      })
+    );
+  };
+  const borrarGastoManual = (id) => {
+    persistirGastosManuales(gastosManuales.filter((g) => g.id !== id));
+  };
+
   const valoracionPresupuesto = useMemo(() => {
     if (!esPresupuesto) return null;
     const grupos = tarifaMO?.grupos || {};
@@ -4677,25 +4851,51 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         venta: importe * 1.68,
       };
     });
+    // Líneas a mano → mismo formato que compras para el Excel / totales.
+    const gastosComoCompras = (gastosManuales || [])
+      .filter((g) => (Number(g.importe) || 0) !== 0 || String(g.descripcion || "").trim())
+      .map((g) => {
+        const importe = Number(g.importe) || 0;
+        return {
+          documento: "GASTO MANUAL",
+          numero: "",
+          descripcion: String(g.descripcion || "").trim() || "Gasto manual",
+          proveedor: "",
+          cantidad: 1,
+          importe,
+          costeUnitario: importe,
+          fecha: "",
+          dtos: [0, 0, 0],
+          venta: importe * 1.68,
+          manual: true,
+          idManual: g.id,
+        };
+      });
     const costeMO = horas.reduce((a, h) => a + h.coste, 0);
     const ventaMOConocida = horas.reduce((a, h) => a + (h.venta || 0), 0);
     const sinTarifa = horas.filter((h) => h.venta == null).length;
-    const costeCompras = compras.reduce((a, c) => a + c.importe, 0);
+    const costeComprasBC = compras.reduce((a, c) => a + c.importe, 0);
+    const costeGastosManuales = gastosComoCompras.reduce((a, c) => a + c.importe, 0);
+    const costeCompras = costeComprasBC + costeGastosManuales;
     const ventaCompras = costeCompras * 1.68;
     return {
       horas,
-      compras,
+      compras: [...compras, ...gastosComoCompras],
+      comprasBC: compras,
+      gastosManuales: gastosComoCompras,
       totalHoras: horas.reduce((a, h) => a + (Number(h.cantidad) || 0), 0),
       costeMO,
       ventaMO: sinTarifa ? null : ventaMOConocida,
       ventaMOConocida,
       sinTarifa,
+      costeComprasBC,
+      costeGastosManuales,
       costeCompras,
       ventaCompras,
       costeConjunto: costeMO + costeCompras,
       ventaConjunta: sinTarifa ? null : ventaMOConocida + ventaCompras,
     };
-  }, [esPresupuesto, tarifaMO, movsUso, compraReal]);
+  }, [esPresupuesto, tarifaMO, movsUso, compraReal, gastosManuales]);
 
   const dif = useMemo(() => compararMaterialOT(ventaMaterial, compraReal), [ventaMaterial, compraReal]);
   const costeAplicado = costeNoFacturadoSeleccionado(dif, clavesCosteNF);
@@ -4759,6 +4959,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       });
   }, [dif, fichas, preciosTaller]);
   const costeTaller = materialTaller.reduce((a, l) => a + l.importe, 0);
+  const costeGastosManuales = (gastosManuales || []).reduce((a, g) => a + (Number(g.importe) || 0), 0);
 
   const ESTADO_UI = {
     falta_cobrar: { label: "FALTA COBRAR", cls: "text-red-700 bg-red-50 border-red-300" },
@@ -4790,7 +4991,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
   const horasCab = horasMovsProyecto != null ? horasMovsProyecto : horasVentaCab;
   const materialesCab = compraReal.reduce((a, l) => a + (Number(l.importe ?? l["Importe línea"]) || 0), 0);
   const compradoNoVendidoCab = costeAplicado;
-  const costeMaterialCab = Math.max(0, (materialesCab - compradoNoVendidoCab) + costeTaller);
+  const costeMaterialCab = Math.max(0, (materialesCab - compradoNoVendidoCab) + costeTaller + costeGastosManuales);
   const costeCab = costeMaterialCab + horasCab * TARIFA_COSTE_MO_CAB;
   const facturadoCab = Number(ficha.venta.importeCuentaVentas) || 0;
   const margenCab = facturadoCab > 0 ? (facturadoCab - costeCab) / facturadoCab : null;
@@ -4820,7 +5021,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
     const infoUn = (!taxesProvisionales && tasasEst?.porUn && un) ? tasasEst.porUn[un] : null;
     const ratioPropia = taxesProvisionales ? 0 : (infoUn?.ratio_propia ?? 0);
     const pctGeneral = taxesProvisionales ? PCT_ESTRUCTURA : (tasasEst?.pctGeneral ?? 0);
-    const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller);
+    const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller + costeGastosManuales);
     const costeDirecto = costeMaterial + manoObra;
     const coefVenta = coefVentaPosible(ficha.general?.cliente);
     const vo = calcularVentaObjetivo(costeDirecto, ratioPropia, pctGeneral, MARGEN_OBJETIVO_VENTA, coefVenta);
@@ -4843,7 +5044,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
       pctGeneral,
       un,
     };
-  }, [lineasBC, ficha, compraReal, dif, costeTaller, tasasEst, tasasEstEstado, costeAplicado, horasMovsProyecto]);
+  }, [lineasBC, ficha, compraReal, dif, costeTaller, costeGastosManuales, tasasEst, tasasEstEstado, costeAplicado, horasMovsProyecto]);
 
   const costeNFVista = { filas: [] };
 
@@ -4904,9 +5105,9 @@ function DetalleOT({ ficha, fichas, onVolver }) {
             (botón «Cargar líneas desde BC»); si no, de la memoria (parcial).
           · Mano de obra a COSTE = horas vendidas (líneas Recurso) × 21,50 €/h
           · Estructura = estructura pròpia + estructura general (las dos, sobre Venta Objetivo)
-          · Margen bruto = venta − materiales − mano de obra
+          · Margen bruto = venta − materiales − gastos manuals − mano de obra
           · Barra de venta = el más alto entre Venta Actual y Venta Posible
-          · Resultado de la barra = esa venta − coste (material + mano de obra + estructura) */}
+          · Resultado de la barra = esa venta − coste (material + gastos + mano de obra + estructura) */}
       {(() => {
         const TARIFA_COSTE_MO = 21.5;
         const PCT_ESTRUCTURA = 0.22; // solo fallback provisional (igual que Venda objectiu)
@@ -4936,8 +5137,8 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         const pctGeneral = taxesProvisionales ? PCT_ESTRUCTURA : (tasasEst?.pctGeneral ?? 0);
         const pctEstructura = ratioPropia + pctGeneral;
         const pctTxt = (x) => `${((Number(x) || 0) * 100).toLocaleString("es-ES", { maximumFractionDigits: 1 })} %`;
-        const margenBruto = ingresos - (materiales - compradoNoVendido) - costeTaller - manoObra;
-        const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller);
+        const margenBruto = ingresos - (materiales - compradoNoVendido) - costeTaller - costeGastosManuales - manoObra;
+        const costeMaterial = Math.max(0, (materiales - compradoNoVendido) + costeTaller + costeGastosManuales);
         const costeDirectoBarra = costeMaterial + manoObra;
         const coefBarra = coefVentaPosible(ficha.general?.cliente);
         const voBarra = calcularVentaObjetivo(costeDirectoBarra, ratioPropia, pctGeneral, margenAplicado, coefBarra);
@@ -5245,18 +5446,19 @@ function DetalleOT({ ficha, fichas, onVolver }) {
               <Metrica
                 label="Marge brut S/Despeses d'estructura"
                 valor={eur(margenBruto)}
-                sub={"venta − consumido − taller − m.obra" + clicHint}
+                sub={"venta − consumido − taller − gastos − m.obra" + clicHint}
                 colorClase={col(margenBruto)}
                 title="Marge brut S/Despeses d'estructura"
                 onClick={() => setDesglose({
                   titulo: `Marge brut S/Despeses d'estructura · ${eur(margenBruto)}`,
-                  subtitulo: "Venda − material consumit − taller − mà d'obra",
+                  subtitulo: "Venda − material consumit − taller − gastos manuals − mà d'obra",
                   filas: [],
                   formula: [
                     { label: "Venta Actual", valor: eur(ingresos) },
                     { label: "− Materials PC", valor: eur(materiales) },
                     { label: "+ Coste No Facturado", valor: eur(compradoNoVendido) },
                     { label: "− Material taller", valor: eur(costeTaller) },
+                    { label: "− Gastos manuals", valor: eur(costeGastosManuales) },
                     { label: "− Mà d'obra", valor: eur(manoObra) },
                     { label: "= Marge brut S/Despeses d'estructura", valor: eur(margenBruto), destacado: true },
                   ],
@@ -5314,7 +5516,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                       <Metrica
                         label="Coste directe"
                         valor={eur(costeDirecto)}
-                        sub={`mat. ${eur(materiales)}${compradoNoVendido > 0 ? ` − coste no facturado ${eur(compradoNoVendido)}` : ""}${costeTaller > 0 ? ` + taller ${eur(costeTaller)}` : ""} + MO ${eur(manoObra)}${clicHint}`}
+                        sub={`mat. ${eur(materiales)}${compradoNoVendido > 0 ? ` − coste no facturado ${eur(compradoNoVendido)}` : ""}${costeTaller > 0 ? ` + taller ${eur(costeTaller)}` : ""}${costeGastosManuales > 0 ? ` + gastos ${eur(costeGastosManuales)}` : ""} + MO ${eur(manoObra)}${clicHint}`}
                         title="Desglossar coste directe"
                         onClick={() => setDesglose({
                           titulo: `Coste directe · ${eur(costeDirecto)}`,
@@ -5324,6 +5526,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                             { label: "Materials PC", valor: eur(materiales) },
                             ...(compradoNoVendido > 0 ? [{ label: "− Coste No Facturado", valor: eur(compradoNoVendido) }] : []),
                             ...(costeTaller > 0 ? [{ label: "+ Material taller", valor: eur(costeTaller) }] : []),
+                            ...(costeGastosManuales > 0 ? [{ label: "+ Gastos manuals", valor: eur(costeGastosManuales) }] : []),
                             { label: "+ Mà d'obra (h × 21,50)", valor: eur(manoObra) },
                             { label: "= Coste directe", valor: eur(costeDirecto), destacado: true },
                           ],
@@ -5779,7 +5982,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
         <div className="bg-white border border-indigo-200 rounded-lg p-4 mt-3">
           <div className="flex items-baseline justify-between gap-2 flex-wrap mb-2">
             <div className="text-xs font-bold text-slate-800">Valoració del pressupost {ficha.general.presupuesto}</div>
-            <div className="text-[10px] text-slate-400">Mà d&apos;obra: cost 21,50 €/h · venda segons tarifa ACSales (Excel) i tipus d&apos;hora · Material: cost de les compres × 1,68</div>
+            <div className="text-[10px] text-slate-400">Mà d&apos;obra: cost 21,50 €/h · venda segons tarifa ACSales (Excel) i tipus d&apos;hora · Material / gastos manuals: cost × 1,68</div>
           </div>
           {tarifaMO && !tarifaMO.cargando && !tarifaMO.error && (
             <div className={`text-[11px] rounded px-2 py-1 mb-2 border ${tarifaMO.usaEspecial ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-sky-50 border-sky-200 text-sky-900"}`}>
@@ -5801,8 +6004,11 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                   ["Hores", valoracionPresupuesto.totalHoras.toLocaleString("es-ES", { maximumFractionDigits: 2 })],
                   ["Cost mà d'obra", eur(valoracionPresupuesto.costeMO)],
                   ["Venda mà d'obra", eur(valoracionPresupuesto.ventaMO)],
-                  ["Cost compres", eur(valoracionPresupuesto.costeCompras)],
-                  ["Venda compres", eur(valoracionPresupuesto.ventaCompras)],
+                  ["Cost compres", eur(valoracionPresupuesto.costeComprasBC)],
+                  ...(valoracionPresupuesto.costeGastosManuales
+                    ? [["Cost gastos manuals", eur(valoracionPresupuesto.costeGastosManuales)]]
+                    : []),
+                  ["Venda compres + gastos", eur(valoracionPresupuesto.ventaCompras)],
                   ["Cost conjunt", eur(valoracionPresupuesto.costeConjunto)],
                   ["Venda conjunta", eur(valoracionPresupuesto.ventaConjunta)],
                 ].map(([eti, val]) => (
@@ -5847,8 +6053,8 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                   </tbody>
                 </table>
               </div>
-              <div className="text-[11px] font-semibold text-slate-600 mb-1">Compres ({valoracionPresupuesto.compras.length})</div>
-              <div className="max-h-48 overflow-auto border border-slate-200 rounded">
+              <div className="text-[11px] font-semibold text-slate-600 mb-1">Compres ({(valoracionPresupuesto.comprasBC || []).length})</div>
+              <div className="max-h-48 overflow-auto border border-slate-200 rounded mb-3">
                 <table className="w-full text-[11px]">
                   <thead className="bg-slate-100 text-slate-500 sticky top-0">
                     <tr>
@@ -5859,7 +6065,7 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                     </tr>
                   </thead>
                   <tbody>
-                    {valoracionPresupuesto.compras.map((c, i) => (
+                    {(valoracionPresupuesto.comprasBC || []).map((c, i) => (
                       <tr key={i} className="border-t border-slate-100">
                         <td className="px-2 py-1 whitespace-nowrap">{c.documento}</td>
                         <td className="px-2 py-1 truncate max-w-xs" title={c.descripcion}>{c.descripcion || c.numero || "—"}</td>
@@ -5867,8 +6073,82 @@ function DetalleOT({ ficha, fichas, onVolver }) {
                         <td className="px-2 py-1 text-right tabular-nums font-semibold">{eur(c.venta)}</td>
                       </tr>
                     ))}
-                    {valoracionPresupuesto.compras.length === 0 && (
+                    {(valoracionPresupuesto.comprasBC || []).length === 0 && (
                       <tr><td colSpan={4} className="px-2 py-2 text-slate-400">No hi ha línies de compra en aquesta OT.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <div className="text-[11px] font-semibold text-slate-600">
+                  Gastos manuals ({gastosManuales.length})
+                  <span className="font-normal text-slate-400 ml-1">— degradació, imprevistos… entren al cost/venda × 1,68</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={anadirGastoManual}
+                  className="text-[11px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-md px-2 py-1 hover:bg-indigo-100"
+                >
+                  + Afegir línia
+                </button>
+              </div>
+              <div className="border border-indigo-200 rounded bg-indigo-50/40">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-indigo-50 text-slate-500">
+                    <tr>
+                      <th className="text-left px-2 py-1.5">Descripció</th>
+                      <th className="text-right px-2 py-1.5 w-28">Cost</th>
+                      <th className="text-right px-2 py-1.5 w-28">Venda × 1,68</th>
+                      <th className="w-8" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {gastosManuales.map((g) => {
+                      const importe = Number(g.importe) || 0;
+                      const costeVisible = g.importeTxt != null ? g.importeTxt : (importe ? String(importe) : "");
+                      return (
+                        <tr key={g.id} className="border-t border-indigo-100">
+                          <td className="px-2 py-1">
+                            <input
+                              type="text"
+                              value={g.descripcion || ""}
+                              onChange={(e) => actualizarGastoManual(g.id, "descripcion", e.target.value)}
+                              placeholder="p. ex. Degradació material / Imprevist…"
+                              className="w-full border border-slate-300 rounded px-1.5 py-1 text-[11px] bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                            />
+                          </td>
+                          <td className="px-2 py-1">
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={costeVisible}
+                              onChange={(e) => actualizarGastoManual(g.id, "importe", e.target.value)}
+                              placeholder="0,00"
+                              className="w-full border border-slate-300 rounded px-1.5 py-1 text-[11px] text-right tabular-nums bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                            />
+                          </td>
+                          <td className="px-2 py-1 text-right tabular-nums font-semibold text-slate-800">
+                            {eur(importe * 1.68)}
+                          </td>
+                          <td className="px-1 py-1 text-center">
+                            <button
+                              type="button"
+                              onClick={() => borrarGastoManual(g.id)}
+                              title="Eliminar línia"
+                              className="p-1 text-slate-400 hover:text-red-600 rounded"
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {gastosManuales.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="px-2 py-2 text-slate-400">
+                          Cap gasto manual. Usa «Afegir línia» si cal degradació o un cost que no surt a BC.
+                        </td>
+                      </tr>
                     )}
                   </tbody>
                 </table>
@@ -7461,6 +7741,47 @@ function recortarFilas(sourceId, filas) {
   return filas; // TODAS las columnas, TODAS las filas
 }
 
+// Misma clave que el refresco del servidor: tipo + documento + nº de línea.
+// Así una segunda carga del mismo tramo sustituye la línea, no la apila.
+function claveFilaBc(r) {
+  if (!r || typeof r !== "object") return null;
+  const doc = r.Document_No ?? r.documentNo;
+  const linea = r.Line_No ?? r.lineNo;
+  if (doc != null && String(doc) !== "" && linea != null && String(linea) !== "") {
+    const tipo = r.Document_Type ?? r.documentType ?? "";
+    return `lin|${tipo}|${doc}|${linea}`;
+  }
+  if (r.id) return `id|${r.id}`;
+  return null;
+}
+
+function dedupeFilasBc(filas) {
+  const sinClave = [];
+  const porClave = new Map();
+  const orden = [];
+  for (const r of filas || []) {
+    const k = claveFilaBc(r);
+    if (!k) {
+      sinClave.push(r);
+      continue;
+    }
+    if (!porClave.has(k)) orden.push(k);
+    porClave.set(k, r);
+  }
+  return [...sinClave, ...orden.map((k) => porClave.get(k))];
+}
+
+function seccionDesdeHash(soloHoras) {
+  if (soloHoras) return "horas";
+  if (typeof window === "undefined") return "panel";
+  const h = window.location.hash || "";
+  if (h === "#/horas" || h.startsWith("#/horas/") || h.startsWith("#/horas?")) return "horas";
+  if (h === "#/ropa" || h.startsWith("#/ropa/") || h.startsWith("#/ropa?")) return "ropa";
+  if (h === "#/ofertas" || h.startsWith("#/ofertas/") || h.startsWith("#/ofertas?")) return "ropa";
+  if ((h === "#/comercial" || h.startsWith("#/comercial/") || h.startsWith("#/comercial?")) && esEmpresaQuimlab()) return "comercial";
+  return "panel";
+}
+
 function PantallaPrincipal({ usuario = null, onLogout = null }) {
   const soloHoras = soloControlHoras(usuario);
   const [data, setData] = useState(() =>
@@ -7468,14 +7789,20 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
   );
   const [estadoInicial, setEstadoInicial] = useState(null);
 
-  // Restaurar el estado persistido (una vez, al montar). No aplica a solo_control_horas.
+  const [autoCarga, setAutoCarga] = useState(null); // { ultimo, activo, intervaloMs, … }
+  const ultimoAutoRef = useRef(null);
+
+  // Restaurar estado al montar. Luego, cada minuto, mirar la meta del
+  // auto-refresco (que corre cada hora) y bajar solo las fuentes tocadas.
   useEffect(() => {
     if (soloHoras) return;
-    (async () => {
+    let cancelado = false;
+    const cargarInicial = async () => {
       try {
         const r = await fetch("/api/estado");
         if (!r.ok) return;
         const est = await r.json();
+        if (cancelado) return;
         if (est.bcData) {
           setData((prev) => {
             const next = { ...prev };
@@ -7487,9 +7814,53 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
         }
         setEstadoInicial(est);
       } catch {
-        /* backend apagado: sin restauración */
+        /* backend apagado */
       }
-    })();
+    };
+    const aplicarFuentes = async (fuentes) => {
+      if (!fuentes?.length) return;
+      const updates = {};
+      for (const fuente of fuentes) {
+        try {
+          const r = await fetch(`/api/estado/bc/${encodeURIComponent(fuente)}`);
+          if (!r.ok) continue;
+          const j = await r.json();
+          if (j.data) updates[fuente] = { rows: [], cached: [], totalRows: 0, ...j.data };
+        } catch {
+          /* ignore */
+        }
+      }
+      if (cancelado || !Object.keys(updates).length) return;
+      setData((prev) => ({ ...prev, ...updates }));
+    };
+    const metaAuto = async () => {
+      try {
+        const r = await fetch("/api/carga-auto");
+        if (!r.ok) return;
+        const j = await r.json();
+        if (cancelado) return;
+        setAutoCarga(j);
+        if (j.ultimo && j.ultimo !== ultimoAutoRef.current) {
+          const yaHabia = ultimoAutoRef.current != null;
+          ultimoAutoRef.current = j.ultimo;
+          // La primera lectura solo anota el sello (ya tenemos el estado
+          // completo). Las siguientes bajan solo las fuentes tocadas.
+          if (yaHabia) {
+            const fuentes = [...new Set((j.porEmpresa || []).flatMap((e) => e.fuentes || []))];
+            await aplicarFuentes(fuentes);
+          }
+        }
+      } catch {
+        /* sin meta */
+      }
+    };
+    cargarInicial();
+    metaAuto();
+    const t = setInterval(metaAuto, 60 * 1000);
+    return () => {
+      cancelado = true;
+      clearInterval(t);
+    };
   }, [soloHoras]);
 
   const persistirBcData = (next) => {
@@ -7500,12 +7871,12 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
     }).catch(() => {});
   };
 
-  const handleLoad = (sourceId, range, newRows, newData) => {
+  const handleLoad = (sourceId, range, newRows, newData, opts) => {
     setData((prev) => {
       const cur = prev[sourceId];
       const merged = mergeRanges([...cur.cached, range]);
       const nuevas = newData?.length ? recortarFilas(sourceId, newData) : [];
-      let rows = nuevas.length ? [...cur.rows, ...nuevas] : cur.rows;
+      let rows = nuevas.length ? dedupeFilasBc([...cur.rows, ...nuevas]) : cur.rows;
       if (RECORTE_POR_FUENTE[sourceId] === "PREVIA" && rows.length > MAX_FILAS_PREVIA) {
         rows = rows.slice(0, MAX_FILAS_PREVIA); // vista previa acotada
       }
@@ -7517,7 +7888,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           rows,
         },
       };
-      persistirBcData(next);
+      if (opts?.persist !== false) persistirBcData(next);
       return next;
     });
   };
@@ -7561,18 +7932,49 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
     return { loaded, totalRows };
   }, [data]);
 
-  const [seccion, setSeccion] = useState(soloHoras ? "horas" : "cargar"); // cargar | memoria | explorador | recepcion | horas
-  const [vistas, setVistas] = useState(() => new Set([soloHoras ? "horas" : "cargar"]));
+  const seccionInicial = seccionDesdeHash(soloHoras);
+  const [seccion, setSeccion] = useState(seccionInicial); // cargar | memoria | explorador | recepcion | horas
+  const [vistas, setVistas] = useState(() => new Set([seccionInicial]));
   const abrirSeccion = (id) => {
     if (soloHoras && id !== "horas") return;
+    if (id === "comercial" && !esEmpresaQuimlab()) return;
     setVistas((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     setSeccion(id);
+  };
+  const [documentoRecepcion, setDocumentoRecepcion] = useState(null);
+  const abrirRecepcionConPdf = (doc) => {
+    setDocumentoRecepcion(doc);
+    abrirSeccion("recepcion");
+    requestAnimationFrame(() => {
+      document.querySelector(".bc-main")?.scrollTo?.({ top: 0 });
+    });
   };
 
   useEffect(() => {
     if (!soloHoras) return;
     setSeccion("horas");
     setVistas(new Set(["horas"]));
+  }, [soloHoras]);
+
+  useEffect(() => {
+    const aplicar = () => {
+      const h = window.location.hash || "";
+      const esHoras = h === "#/horas" || h.startsWith("#/horas/") || h.startsWith("#/horas?");
+      const esRopa = h === "#/ropa" || h.startsWith("#/ropa/") || h.startsWith("#/ropa?");
+      const esOfertas = h === "#/ofertas" || h.startsWith("#/ofertas/") || h.startsWith("#/ofertas?");
+      const esComercial = (h === "#/comercial" || h.startsWith("#/comercial/") || h.startsWith("#/comercial?")) && esEmpresaQuimlab();
+      if (!esHoras && !esRopa && !esOfertas && !esComercial) return;
+      if (soloHoras) {
+        setSeccion("horas");
+        setVistas(new Set(["horas"]));
+        return;
+      }
+      const id = esComercial ? "comercial" : (esRopa || esOfertas ? "ropa" : "horas");
+      setVistas((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
+      setSeccion(id);
+    };
+    window.addEventListener("hashchange", aplicar);
+    return () => window.removeEventListener("hashchange", aplicar);
   }, [soloHoras]);
   const [actualizandoRecep, setActualizandoRecep] = useState(false);
   const [actualizandoFacVenta, setActualizandoFacVenta] = useState(false);
@@ -7726,12 +8128,14 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
               navItem("horas", "Control de horas", Timer)
             ) : (
               <>
+                {navItem("panel", "Panel inicial", LayoutDashboard)}
                 {navItem("cargar", "Cargar datos", Database)}
                 {navItem("memoria", "Memoria histórica", History)}
                 {navItem("explorador", "Explorador de OTs", Search)}
                 {navItem("recepcion", "Recepción de material", Package)}
                 {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
                 {navItem("precios", "Precios de artículos", Tag)}
+                {esEmpresaQuimlab() && navItem("comercial", "Comercial", Briefcase)}
                 {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
                 {navItem("facturasventa", "Facturas de venta", FileText)}
                 {navItem("analisiscliente", "Anàlisi per client", Users)}
@@ -7742,6 +8146,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
                 {navItem("ia", "Asistente IA", Bot)}
                 {navItem("ratios", "Ratios financieros", BarChart3)}
                 {navItem("horas", "Control de horas", Timer)}
+                {navItem("ropa", "Ropa", Shirt)}
 
                 <div className="bc-nav-grupo">Hoja de ruta</div>
                 {[
@@ -7766,6 +8171,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
 
         {/* Main */}
         <main className="bc-main">
+          {panel("panel", <PanelInicial />)}
           {panel("explorador", <PantallaOTs incrustada />)}
           {panel("recepcion", (
             <Recepcion
@@ -7773,12 +8179,14 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
               lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
               onActualizarBC={actualizarRecepcionBC}
               actualizando={actualizandoRecep}
+              documentoEntrante={documentoRecepcion}
             />
           ))}
           {panel("facturascompra", (
             <FacturasCompra
               pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
               usuario={usuario}
+              onCargarRecepcion={abrirRecepcionConPdf}
             />
           ))}
           {panel("precios", (
@@ -7786,6 +8194,9 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
               lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
               pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
             />
+          ))}
+          {esEmpresaQuimlab() && panel("comercial", (
+            <Comercial tarifasBc={data["tarifas_venta"]?.rows || []} />
           ))}
           {panel("pedidosventa", (
             <PedidosVentaPendientes pedidosVenta={data["pedidos_venta"]?.rows || []} lineasPedidoVenta={data["lineas_pedido_venta"]?.rows || []} />
@@ -7834,6 +8245,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           {panel("ia", <ChatIA />)}
           {panel("ratios", <Ratios recursos={data.recursos?.rows || []} />)}
           {panel("horas", <ControlHoras recursos={data.recursos?.rows || []} usuario={usuario} />)}
+          {panel("ropa", <Ropa recursos={data.recursos?.rows || []} />)}
           {panel("memoria", (
             <>
               <div className="flex items-center gap-2">
@@ -7854,7 +8266,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
             <>
               <h1 className="bc-page-title">Cargar datos</h1>
               <p className="bc-page-sub">
-                Conecta con Business Central para traer los datos del departamento de ventas. Se guardan en caché por rango de fechas.
+                Conecta con Business Central para traer los datos del departamento de ventas. El histórico se guarda por rango de fechas; el día de hoy se refresca solo cada hora.
               </p>
 
               <div className="bc-cue-row">
@@ -7872,7 +8284,18 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
                   <div className="text-xs text-slate-500">
                     Origen: <span className="font-medium text-slate-700">API Business Central</span>
                     <br />
-                    La carga es incremental: si un rango ya está en caché, no se vuelve a pedir a la API.
+                    {autoCarga?.activo === false
+                      ? "Refresco automático desactivado (CARGA_AUTO_OFF=1)."
+                      : (
+                        <>
+                          Auto cada hora (día en curso, Europe/Madrid)
+                          {autoCarga?.ultimo
+                            ? ` · última: ${new Date(autoCarga.ultimo).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+                            : " · arrancando…"}
+                          .
+                        </>
+                      )}
+                    {" "}Los rangos antiguos siguen en caché; solo se vuelve a pedir el hoy.
                   </div>
                 </div>
               </div>

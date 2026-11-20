@@ -28,16 +28,18 @@ const input = "border rounded px-2 py-1 text-sm";
 const norm = (s) => String(s ?? "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]/g, "");
 export const normNum = (s) => String(s ?? "").trim().replace(/^0+/, "").toUpperCase();
 export const PRECIO_AMIANTO_DEFECTO = 30;
-const PLUS_FESTIVO_EUR = 50;
-const esFestivoPlus = (cod) => /^h[_\s.-]*fest(ivo)?[_\s.-]*[12]$/i.test(String(cod || "").trim());
-/** Días distintos con H_FESTIVO1 o H_FESTIVO2. El mismo día con los dos códigos cuenta una vez. */
-function plusFestivoDe(tr) {
+const PLUS_FESTIVO1_EUR = 30;
+const PLUS_FESTIVO2_EUR = 50;
+const esFestivo1 = (cod) => /^h[_\s.-]*fest(ivo)?[_\s.-]*1$/i.test(String(cod || "").trim());
+const esFestivo2 = (cod) => /^h[_\s.-]*fest(ivo)?[_\s.-]*2$/i.test(String(cod || "").trim());
+/** Días distintos con horas de ese código. Un día con los dos códigos cuenta en las dos columnas. */
+function plusFestivoCodigo(tr, esCodigo, eurDia) {
   const fechas = new Set();
   for (const mv of tr?.movs || []) {
-    if (!esFestivoPlus(mv.tipoTrabajo) || !(Number(mv.horas) > 0) || !mv.fecha) continue;
+    if (!esCodigo(mv.tipoTrabajo) || !(Number(mv.horas) > 0) || !mv.fecha) continue;
     fechas.add(mv.fecha);
   }
-  return { dias: fechas.size, importe: fechas.size * PLUS_FESTIVO_EUR };
+  return { dias: fechas.size, importe: fechas.size * eurDia };
 }
 /** Clave de precio editable por trabajador+día (plus amianto). */
 export const claveAmianto = (recurso, fecha) => `${normNum(recurso)}|${fecha}`;
@@ -341,9 +343,10 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
         return { c, horas: hh, ajuste: ajustesH[c] || 0, precio: p, importe: hh * p };
       });
       const ami = plusAmiantoDe(tr.recurso);
-      const festivo = plusFestivoDe(tr);
+      const festivo1 = plusFestivoCodigo(tr, esFestivo1, PLUS_FESTIVO1_EUR);
+      const festivo2 = plusFestivoCodigo(tr, esFestivo2, PLUS_FESTIVO2_EUR);
       const totalHoras = lineas.reduce((s, l) => s + l.importe, 0);
-      return { tr, fila, lineas, amianto: ami, festivo, total: totalHoras + ami.importe + festivo.importe };
+      return { tr, fila, lineas, amianto: ami, festivo1, festivo2, total: totalHoras + ami.importe + festivo1.importe + festivo2.importe };
     });
     const i2 = cods.findIndex((c) => /^h[_\s.-]*fest(ivo)?[_\s.-]*2$/i.test(String(c).trim()));
     const i1 = cods.findIndex((c) => /^h[_\s.-]*fest(ivo)?[_\s.-]*1$/i.test(String(c).trim()));
@@ -353,7 +356,7 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
 
   const setMapeo = (m) => guardar({ ...t, mapeo: { ...(t.mapeo || {}), ...m } });
   const nombreCod = (c) => (c === "__exceso" ? "Exceso sobre jornada (no declarado)" : c);
-  const tieneImporte = (p) => p.lineas.some((l) => l.horas) || p.amianto?.dias || p.festivo?.dias;
+  const tieneImporte = (p) => p.lineas.some((l) => l.horas) || p.amianto?.dias || p.festivo1?.dias || p.festivo2?.dias;
 
   function abrirPopupAmianto(p) {
     const ami = p.amianto || plusAmiantoDe(p.tr.recurso);
@@ -391,15 +394,19 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
         const hh = Math.round(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.horas || 0), 0) * 100) / 100;
         return [hh || "", "", imp || ""];
       });
-      const diasFest = pago.filas.reduce((s, p) => s + (p.festivo?.dias || 0), 0);
-      const impFest = Math.round(pago.filas.reduce((s, p) => s + (p.festivo?.importe || 0), 0) * 100) / 100;
-      const cab = ["Trabajador", "Nº recurso", ...colsTipo(antes), "Días plus festivo", "Plus festivo €", ...colsTipo(despues), "Días amianto", "Plus amianto €", "Total a pagar €"];
+      const diasFest1 = pago.filas.reduce((s, p) => s + (p.festivo1?.dias || 0), 0);
+      const impFest1 = Math.round(pago.filas.reduce((s, p) => s + (p.festivo1?.importe || 0), 0) * 100) / 100;
+      const diasFest2 = pago.filas.reduce((s, p) => s + (p.festivo2?.dias || 0), 0);
+      const impFest2 = Math.round(pago.filas.reduce((s, p) => s + (p.festivo2?.importe || 0), 0) * 100) / 100;
+      const cab = ["Trabajador", "Nº recurso", ...colsTipo(antes), "Días plus festivo 1", "Plus festivo 1 €", "Días plus festivo 2", "Plus festivo 2 €", ...colsTipo(despues), "Días amianto", "Plus amianto €", "Total a pagar €"];
       const filasX = visibles.map((p) => [
         p.tr.nombre,
         p.tr.recurso,
         ...valsTipo(p.lineas.slice(0, pago.corte)),
-        p.festivo?.dias || "",
-        p.festivo?.importe ? Math.round(p.festivo.importe * 100) / 100 : "",
+        p.festivo1?.dias || "",
+        p.festivo1?.importe ? Math.round(p.festivo1.importe * 100) / 100 : "",
+        p.festivo2?.dias || "",
+        p.festivo2?.importe ? Math.round(p.festivo2.importe * 100) / 100 : "",
         ...valsTipo(p.lineas.slice(pago.corte)),
         p.amianto?.dias || "",
         p.amianto?.importe ? Math.round(p.amianto.importe * 100) / 100 : "",
@@ -409,15 +416,17 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
         "Total",
         "",
         ...totTipo(antes),
-        diasFest || "",
-        impFest || "",
+        diasFest1 || "",
+        impFest1 || "",
+        diasFest2 || "",
+        impFest2 || "",
         ...totTipo(despues),
         pago.filas.reduce((s, p) => s + (p.amianto?.dias || 0), 0) || "",
         Math.round(pago.filas.reduce((s, p) => s + (p.amianto?.importe || 0), 0) * 100) / 100 || "",
         Math.round(pago.filas.reduce((s, p) => s + p.total, 0) * 100) / 100,
       ];
       const ws = XLSX.utils.aoa_to_sheet([
-        [`A pagar · Periodo ${fmtF(desde)} – ${fmtF(hasta)} · horas BC ± incidencias · plus festivo · plus amianto`],
+        [`A pagar · Periodo ${fmtF(desde)} – ${fmtF(hasta)} · horas BC ± incidencias · plus festivo 1 (días × ${PLUS_FESTIVO1_EUR} €) · plus festivo 2 (días × ${PLUS_FESTIVO2_EUR} €) · plus amianto`],
         cab,
         ...filasX,
         totales,
@@ -523,7 +532,7 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
               ) : (
                 <>
                   <div className="flex flex-wrap items-center gap-2 p-2 border-b bg-slate-50 text-xs text-slate-600">
-                    Periodo {fmtF(desde)} – {fmtF(hasta)} · horas BC ± incidencias · plus festivo (días × 50 €) · plus amianto (días × €)
+                    Periodo {fmtF(desde)} – {fmtF(hasta)} · horas BC ± incidencias · plus festivo 1 (H_FESTIVO1 · días × {PLUS_FESTIVO1_EUR} €) · plus festivo 2 (H_FESTIVO2 · días × {PLUS_FESTIVO2_EUR} €) · plus amianto (días × €)
                     <label className="flex items-center gap-1 ml-2">
                       Precio amianto por defecto
                       <input type="number" min={0} step={1} value={precioDefAmianto}
@@ -540,8 +549,8 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
                         const despues = pago.cods.slice(pago.corte);
                         const colsTipo = (codigos) => codigos.flatMap((c) => [`${nombreCod(c)} horas`, `${nombreCod(c)} precio`, `${nombreCod(c)} importe`]);
                         const valsTipo = (lineas) => Object.fromEntries(lineas.flatMap((l) => [[`${nombreCod(l.c)} horas`, h(l.horas)], [`${nombreCod(l.c)} precio`, h(l.precio)], [`${nombreCod(l.c)} importe`, h(l.importe)]]));
-                        descargarCSV(`pago_horas_${desde}_${hasta}.csv`, ["Nº recurso", "Trabajador", ...colsTipo(antes), "Días plus festivo", "Plus festivo", ...colsTipo(despues), "Días amianto", "Plus amianto", "Total"],
-                          pago.filas.filter(tieneImporte).map((p) => ({ "Nº recurso": p.tr.recurso, Trabajador: p.tr.nombre, ...valsTipo(p.lineas.slice(0, pago.corte)), "Días plus festivo": p.festivo?.dias || "", "Plus festivo": h(p.festivo?.importe), ...valsTipo(p.lineas.slice(pago.corte)), "Días amianto": p.amianto?.dias || "", "Plus amianto": h(p.amianto?.importe), Total: h(p.total) })));
+                        descargarCSV(`pago_horas_${desde}_${hasta}.csv`, ["Nº recurso", "Trabajador", ...colsTipo(antes), "Días plus festivo 1", "Plus festivo 1", "Días plus festivo 2", "Plus festivo 2", ...colsTipo(despues), "Días amianto", "Plus amianto", "Total"],
+                          pago.filas.filter(tieneImporte).map((p) => ({ "Nº recurso": p.tr.recurso, Trabajador: p.tr.nombre, ...valsTipo(p.lineas.slice(0, pago.corte)), "Días plus festivo 1": p.festivo1?.dias || "", "Plus festivo 1": h(p.festivo1?.importe), "Días plus festivo 2": p.festivo2?.dias || "", "Plus festivo 2": h(p.festivo2?.importe), ...valsTipo(p.lineas.slice(pago.corte)), "Días amianto": p.amianto?.dias || "", "Plus amianto": h(p.amianto?.importe), Total: h(p.total) })));
                       }}
                         className="px-2 py-1 rounded border bg-white hover:bg-slate-50">⬇ CSV</button>
                     </div>
@@ -551,7 +560,8 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
                       <tr className="text-xs text-slate-500">
                         <th className="px-3 py-1.5 text-left">Trabajador</th>
                         {pago.cods.slice(0, pago.corte).map((c) => <th key={c} className="px-3 text-right">{nombreCod(c)}<div className="font-normal text-[10px]">horas × precio</div></th>)}
-                        <th className="px-3 text-right">Plus festivo<div className="font-normal text-[10px]">días × 50 €</div></th>
+                        <th className="px-3 text-right">Plus festivo 1<div className="font-normal text-[10px]">H_FESTIVO1 · días × {PLUS_FESTIVO1_EUR} €</div></th>
+                        <th className="px-3 text-right">Plus festivo 2<div className="font-normal text-[10px]">H_FESTIVO2 · días × {PLUS_FESTIVO2_EUR} €</div></th>
                         {pago.cods.slice(pago.corte).map((c) => <th key={c} className="px-3 text-right">{nombreCod(c)}<div className="font-normal text-[10px]">horas × precio</div></th>)}
                         <th className="px-3 text-right">Plus amianto<div className="font-normal text-[10px]">días × €/día · clic para detalle</div></th>
                         <th className="px-3 text-right">Total a pagar</th>
@@ -571,7 +581,10 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
                             </td>
                           ))}
                           <td className="px-3 text-right whitespace-nowrap">
-                            {p.festivo?.dias ? <>{p.festivo.dias} {p.festivo.dias === 1 ? "día" : "días"}<div className="font-medium">{eur(p.festivo.importe)}</div></> : ""}
+                            {p.festivo1?.dias ? <>{p.festivo1.dias} {p.festivo1.dias === 1 ? "día" : "días"}<div className="font-medium">{eur(p.festivo1.importe)}</div></> : ""}
+                          </td>
+                          <td className="px-3 text-right whitespace-nowrap">
+                            {p.festivo2?.dias ? <>{p.festivo2.dias} {p.festivo2.dias === 1 ? "día" : "días"}<div className="font-medium">{eur(p.festivo2.importe)}</div></> : ""}
                           </td>
                           {p.lineas.slice(pago.corte).map((l) => (
                             <td key={l.c} className="px-3 text-right whitespace-nowrap">
@@ -595,7 +608,8 @@ export function TarifasHoras({ trabajadores, codigos, ajustes, desde, hasta, ami
                       <tr className="border-t-2 font-semibold">
                         <td className="px-3 py-2">Total</td>
                         {pago.cods.slice(0, pago.corte).map((c) => <td key={c} className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0))}</td>)}
-                        <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.festivo?.importe || 0), 0))}</td>
+                        <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.festivo1?.importe || 0), 0))}</td>
+                        <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.festivo2?.importe || 0), 0))}</td>
                         {pago.cods.slice(pago.corte).map((c) => <td key={c} className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.lineas.find((l) => l.c === c)?.importe || 0), 0))}</td>)}
                         <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + (p.amianto?.importe || 0), 0))}</td>
                         <td className="px-3 text-right">{eur(pago.filas.reduce((s, p) => s + p.total, 0))}</td>
@@ -703,16 +717,22 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
   const [nueva, setNueva] = useState({ recurso: "", tipo: "Festivo local", fecha: "", desc: "" });
   useEffect(() => { if (!sucio) setLineas(listaFestivos(ajustes)); }, [ajustes]); // eslint-disable-line react-hooks/exhaustive-deps
   const nombreDe = (rec) => (rec ? trabajadores.find((t) => t.recurso === rec)?.nombre || rec : "Todos");
-  const cambiar = (l) => { setLineas(l); setSucio(true); setMsg(""); };
 
+  async function persistir(nuevas) {
+    setLineas(nuevas);
+    setSucio(false);
+    setMsg("Guardando…");
+    const ok = await guardarAjustes({ ...ajustes, festivosLista: nuevas, festivos: nuevas.filter((l) => !l.recurso).map((l) => l.fecha) });
+    setMsg(ok === false ? "No se pudo guardar" : "Guardado ✓");
+    if (ok === false) setSucio(true);
+  }
   const añadir = () => {
     if (!nueva.fecha) return alert("Indica la fecha.");
-    cambiar([...lineas, { ...nueva, id: `${Date.now()}` }].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)));
+    persistir([...lineas, { ...nueva, id: `${Date.now()}` }].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)));
     setNueva({ ...nueva, fecha: "", desc: "" });
   };
   async function guardar() {
-    await guardarAjustes({ ...ajustes, festivosLista: lineas, festivos: lineas.filter((l) => !l.recurso).map((l) => l.fecha) });
-    setSucio(false); setMsg("Guardado ✓");
+    await persistir(lineas);
   }
   async function cargar(file) {
     if (!file) return;
@@ -749,8 +769,9 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
       const clave = (l) => `${l.recurso}|${l.fecha}`;
       const existentes = new Set(lineas.map(clave));
       const añadidas = nuevas.filter((l) => !existentes.has(clave(l)));
-      cambiar([...lineas, ...añadidas].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)));
-      setMsg(`Cargadas ${añadidas.length} líneas${nuevas.length - añadidas.length ? ` (${nuevas.length - añadidas.length} ya existían)` : ""}${errores.length ? ` · No reconocidas: ${errores.slice(0, 5).join(", ")}${errores.length > 5 ? "…" : ""}` : ""}. Pulsa «Guardar».`);
+      const juntas = [...lineas, ...añadidas].sort((a, b) => (a.fecha < b.fecha ? -1 : 1));
+      await persistir(juntas);
+      setMsg(`Guardadas ${añadidas.length} líneas${nuevas.length - añadidas.length ? ` (${nuevas.length - añadidas.length} ya existían)` : ""}${errores.length ? ` · No reconocidas: ${errores.slice(0, 5).join(", ")}${errores.length > 5 ? "…" : ""}` : ""}.`);
     } catch (e) {
       setMsg(`✗ No se pudo leer el fichero${String(e.message || e).includes("import") || String(e.message || e).includes("fetch") ? " (para .xlsx hace falta internet; prueba con CSV)" : `: ${e.message || e}`}`);
     }
@@ -781,7 +802,7 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
               <td className="px-2 py-1 border">{l.tipo}</td>
               <td className="px-2 py-1 border whitespace-nowrap">{fmtF(l.fecha)}</td>
               <td className="px-2 py-1 border text-slate-500">{l.desc}</td>
-              <td className="border text-center"><button onClick={() => cambiar(lineas.filter((x) => x.id !== l.id))} className="text-red-500" title="Quitar">✕</button></td>
+              <td className="border text-center"><button onClick={() => persistir(lineas.filter((x) => x.id !== l.id))} className="text-red-500" title="Quitar">✕</button></td>
             </tr>
           ))}
           <tr className="bg-blue-50/40">
@@ -803,6 +824,184 @@ export function FestivosLinea({ ajustes, guardarAjustes, trabajadores }) {
         </tbody>
       </table>
       <p className="text-xs text-slate-400">«Todos» = festivo para toda la plantilla. Si eliges un trabajador, solo cuenta para él. Para cargar desde Excel: columnas Trabajador (nombre, Nº recurso o «Todos») · Tipo · Fecha · Descripción.</p>
+    </div>
+  );
+}
+
+/** Jornada distinta para un trabajador entre dos fechas (p. ej. Iker, 6 h/día). */
+export function JornadaPorTrabajador({ ajustes, guardarAjustes, trabajadores = [] }) {
+  const [nueva, setNueva] = useState({ recurso: "", desde: "", hasta: "", horas: "6" });
+  const [error, setError] = useState("");
+  const nombreDe = (rec) => trabajadores.find((t) => t.recurso === rec)?.nombre || rec;
+  const lineas = (ajustes.incidencias || [])
+    .filter((i) => i.tipo === "reduccion" && i.recurso && i.desde)
+    .slice()
+    .sort((a, b) => nombreDe(a.recurso).localeCompare(nombreDe(b.recurso), "es") || String(a.desde).localeCompare(String(b.desde)));
+
+  const añadir = () => {
+    if (!nueva.recurso) { setError("Elige un trabajador."); return; }
+    if (!nueva.desde) { setError("Indica la fecha desde."); return; }
+    const hasta = nueva.hasta || nueva.desde;
+    if (hasta < nueva.desde) { setError("La fecha hasta no puede ser anterior a la de desde."); return; }
+    const horas = Number(String(nueva.horas).replace(",", "."));
+    if (!(horas > 0)) { setError("Indica las horas al día."); return; }
+    const i = {
+      id: `j${Date.now()}`,
+      recurso: nueva.recurso,
+      tipo: "reduccion",
+      desde: nueva.desde,
+      hasta,
+      horas,
+      codigo: "",
+      motivo: "Jornada del trabajador",
+    };
+    guardarAjustes({ ...ajustes, incidencias: [...(ajustes.incidencias || []), i] });
+    setNueva({ recurso: "", desde: "", hasta: "", horas: "6" });
+    setError("");
+  };
+
+  const quitar = (id) => {
+    guardarAjustes({ ...ajustes, incidencias: (ajustes.incidencias || []).filter((x) => x.id !== id) });
+  };
+
+  return (
+    <div className="mt-1">
+      <div className="font-medium text-slate-800">Jornada de un trabajador</div>
+      <p className="text-xs text-slate-400 mb-2">Si alguien no hace la jornada general, indica desde qué día hasta qué día y cuántas horas le tocan. Por ejemplo, Iker del 01/11/2026 al 30/11/2026 a 6 h al día: con 6 h el día queda completo.</p>
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="text-xs text-slate-500">Trabajador
+          <select value={nueva.recurso} onChange={(e) => setNueva({ ...nueva, recurso: e.target.value })} className={`${input} block mt-1 max-w-[240px]`}>
+            <option value="">— Elige —</option>
+            {[...trabajadores].sort((a, b) => a.nombre.localeCompare(b.nombre, "es")).map((t) => (
+              <option key={t.recurso} value={t.recurso}>{t.nombre}</option>
+            ))}
+          </select>
+        </label>
+        <label className="text-xs text-slate-500">Desde
+          <input type="date" value={nueva.desde} onChange={(e) => setNueva({ ...nueva, desde: e.target.value })} className={`${input} block mt-1`} />
+        </label>
+        <label className="text-xs text-slate-500">Hasta
+          <input type="date" value={nueva.hasta} onChange={(e) => setNueva({ ...nueva, hasta: e.target.value })} className={`${input} block mt-1`} />
+        </label>
+        <label className="text-xs text-slate-500">Horas al día
+          <input type="number" step="0.25" min="0.25" value={nueva.horas} onChange={(e) => setNueva({ ...nueva, horas: e.target.value })} className={`${input} block mt-1 w-20`} />
+        </label>
+        <button type="button" onClick={añadir} className="px-3 py-1 rounded bg-blue-700 text-white text-sm">Añadir</button>
+      </div>
+      {error && <p className="text-xs text-red-600 mt-1">{error}</p>}
+      {lineas.length > 0 && (
+        <table className="w-full text-sm border-collapse mt-2">
+          <thead>
+            <tr className="text-left text-xs text-slate-500">
+              <th className="px-2 py-1 border">Trabajador</th>
+              <th className="px-2 py-1 border">Desde</th>
+              <th className="px-2 py-1 border">Hasta</th>
+              <th className="px-2 py-1 border text-right">Horas/día</th>
+              <th className="border w-8" />
+            </tr>
+          </thead>
+          <tbody>
+            {lineas.map((i) => (
+              <tr key={i.id}>
+                <td className="px-2 py-1 border">{nombreDe(i.recurso)}</td>
+                <td className="px-2 py-1 border whitespace-nowrap">{fmtF(i.desde)}</td>
+                <td className="px-2 py-1 border whitespace-nowrap">{fmtF(i.hasta || i.desde)}</td>
+                <td className="px-2 py-1 border text-right">{h(i.horas) || i.horas} h</td>
+                <td className="border text-center">
+                  <button type="button" onClick={() => quitar(i.id)} className="text-red-500" title="Quitar">✕</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+/** Quién entra en el cuadro de horas. Se guarda con el resto de ajustes. */
+export function VentanaPlantilla({ ajustes, guardarAjustes, personas = [], defecto, onCerrar, embebida = false }) {
+  const [q, setQ] = useState("");
+  const inactivos = new Set(ajustes.inactivos || []);
+  const forzados = new Set(ajustes.activosForzados || []);
+  const esActivo = (id) => {
+    if (inactivos.has(id)) return false;
+    return forzados.has(id) || defecto?.has(id);
+  };
+  const texto = q.trim().toLowerCase();
+  const coincide = (p) => !texto || `${p.nombre} ${p.recurso} ${p.depto}`.toLowerCase().includes(texto);
+  const activos = personas.filter((p) => esActivo(p.recurso) && coincide(p));
+  const noActivos = personas.filter((p) => !esActivo(p.recurso) && coincide(p));
+
+  function guardar(listaInactivos, listaForzados) {
+    guardarAjustes({ ...ajustes, inactivos: listaInactivos, activosForzados: listaForzados });
+  }
+  function pasarANoActivo(id) {
+    guardar(
+      [...new Set([...(ajustes.inactivos || []), id])],
+      (ajustes.activosForzados || []).filter((x) => x !== id),
+    );
+  }
+  function pasarAActivo(id) {
+    const sinEste = (ajustes.inactivos || []).filter((x) => x !== id);
+    const forz = defecto?.has(id)
+      ? (ajustes.activosForzados || []).filter((x) => x !== id)
+      : [...new Set([...(ajustes.activosForzados || []), id])];
+    guardar(sinEste, forz);
+  }
+
+  const columna = (titulo, lista, activo) => (
+    <div className="flex flex-col min-w-0 border border-slate-200 rounded-lg overflow-hidden">
+      <div className={`px-3 py-2 text-sm font-semibold ${activo ? "bg-emerald-50 text-emerald-900" : "bg-slate-100 text-slate-700"}`}>
+        {titulo} · {lista.length}
+      </div>
+      <ul className="overflow-y-auto max-h-[55vh] divide-y divide-slate-100">
+        {lista.length === 0 && <li className="px-3 py-4 text-sm text-slate-400">Nadie con esta búsqueda.</li>}
+        {lista.map((p) => (
+          <li key={p.recurso} className="px-3 py-2 flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-slate-800 uppercase truncate">{p.nombre}</div>
+              <div className="text-xs text-slate-400 truncate">{p.depto} · {p.recurso}</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => (activo ? pasarANoActivo(p.recurso) : pasarAActivo(p.recurso))}
+              className={`shrink-0 text-xs px-2 py-1 rounded border ${activo ? "border-slate-300 text-slate-600 hover:bg-slate-50" : "border-emerald-300 text-emerald-800 hover:bg-emerald-50"}`}
+            >
+              {activo ? "No activo" : "Activo"}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+  const cuerpo = (
+    <div className={embebida ? "bg-white rounded-xl shadow-sm border border-slate-200 mt-3" : "bg-white rounded-xl shadow-xl w-full max-w-4xl"} onClick={(e) => e.stopPropagation()}>
+      <div className="px-4 py-3 border-b flex items-center gap-3">
+        <div className="font-semibold text-slate-800">Trabajadores activos y no activos</div>
+        <input
+          autoFocus
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Buscar por nombre, departamento o número…"
+          className="border rounded px-2 py-1 text-sm flex-1"
+        />
+        {onCerrar && <button type="button" onClick={onCerrar} className="text-slate-400 hover:text-slate-700 text-lg px-2">✕</button>}
+      </div>
+      <p className="px-4 pt-3 text-xs text-slate-500">
+        Los activos salen en el cuadro, también si un día no tienen horas. Los no activos no salen. Quien ha imputado en los últimos 21 días entra como activo hasta que lo pases al otro lado.
+      </p>
+      <div className="grid md:grid-cols-2 gap-3 p-4">
+        {columna("Activos", activos, true)}
+        {columna("No activos", noActivos, false)}
+      </div>
+    </div>
+  );
+  if (embebida) return cuerpo;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onCerrar}>
+      {cuerpo}
     </div>
   );
 }

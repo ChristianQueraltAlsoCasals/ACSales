@@ -5,7 +5,7 @@
  */
 import React, { useEffect, useRef, useState } from "react";
 import { Bot, Send, X, Paperclip, Plus, Minimize2 } from "lucide-react";
-import { TarjetaCambio, cargarImagen, MensajeConTablas } from "./chatIA.jsx";
+import { TarjetaCambio, MensajeConTablas, leerAdjuntosChat, esPdf } from "./chatIA.jsx";
 import { empresaGuardada } from "./empresa.jsx";
 import { aplicarAccionesApp, snapshotAppParaIA } from "./accionesAppIA.js";
 
@@ -18,6 +18,7 @@ const NOMBRES = {
   precios: "Precios de artículos",
   pedidosventa: "Pedidos de venta",
   facturasventa: "Facturas de venta emitidas",
+  comercial: "Comercial",
   analisiscliente: "Anàlisi per client",
   simuladortarifas: "Simulador de tarifas 2027",
   correo: "Correo",
@@ -25,6 +26,7 @@ const NOMBRES = {
   calendario: "Calendario",
   ratios: "Ratios financieros",
   horas: "Control de horas",
+  ropa: "Ropa",
   ia: "Asistente IA",
 };
 
@@ -34,9 +36,10 @@ const SUGERENCIAS = {
   explorador: ["¿Qué OTs de la pantalla están pendientes de facturar?", "Resume esta OT"],
   recepcion: ["¿Qué pedidos llevan más retraso?", "¿Qué proveedores tienen más pedidos pendientes?"],
   facturascompra: ["¿Esta factura cuadra con el pedido?", "¿Qué facturas tengo pendientes de validar?"],
-  precios: ["¿Qué artículos han subido más de precio?", "Compara los precios de este artículo entre proveedores"],
+  precios: ["¿Qué artículos han subido más de precio?", "Compara las ofertas en PDF de los proveedores"],
   pedidosventa: ["¿Qué pedidos de venta llevan más tiempo pendientes?", "Resume los pendientes por cliente"],
   facturasventa: ["¿Qué facturas de venta están pendientes de cobro?", "Resume las facturas de esta pantalla"],
+  comercial: ["¿A quién tengo que hacer seguimiento hoy?", "Resume los presupuestos abiertos"],
   analisiscliente: ["Quin deute té aquest client?", "Com paga aquest client?", "Quin risc té aquest client?"],
   simuladortarifas: [
     "Quins clients han de pujar tarifa el 2027?",
@@ -48,6 +51,7 @@ const SUGERENCIAS = {
   calendario: ["¿Qué tengo esta semana?", "Crea un evento para mañana"],
   ratios: ["Explícame los ratios en fácil", "¿Qué ratio debería preocuparme más?"],
   horas: ["¿Quién tiene más días sin imputar?", "¿Quién acumula más horas extra?"],
+  ropa: ["¿Qué tallas están sin stock?", "Compara las ofertas en PDF de los proveedores"],
 };
 
 function textoPantalla() {
@@ -61,6 +65,8 @@ export default function IAFlotante({ seccion, incrustado = false, onAbrirSeccion
   const [conv, setConv] = useState({});
   const [entrada, setEntrada] = useState("");
   const [imagenes, setImagenes] = useState([]);
+  const [pdfs, setPdfs] = useState([]);
+  const [avisoAdjunto, setAvisoAdjunto] = useState("");
   const [ocupado, setOcupado] = useState(false);
   const [usarPantalla, setUsarPantalla] = useState(true);
   const finRef = useRef(null);
@@ -91,15 +97,17 @@ export default function IAFlotante({ seccion, incrustado = false, onAbrirSeccion
     } catch { /* guardar es opcional */ }
   };
 
-  async function enviar(textoDirecto, mostrar = true, imgsDirectas) {
+  async function enviar(textoDirecto, mostrar = true, imgsDirectas, docsDirectos) {
     const texto = (textoDirecto ?? entrada).trim();
     const imgs = imgsDirectas ?? imagenes;
-    if ((!texto && !imgs.length) || ocupado) return;
+    const docs = docsDirectos ?? (textoDirecto == null ? pdfs : []);
+    if ((!texto && !imgs.length && !docs.length) || ocupado) return;
     const sec = seccion;
     const previo = conv[sec] || { mensajes: [], historial: [], chatId: "" };
-    const mensajesYo = mostrar ? [...previo.mensajes, { rol: "yo", texto: texto || "(imágenes)", miniaturas: imgs.map((i) => i.miniatura) }] : previo.mensajes;
+    const textoVisible = texto || (docs.length ? docs.map((d) => d.nombre).join(", ") : "(imágenes)");
+    const mensajesYo = mostrar ? [...previo.mensajes, { rol: "yo", texto: textoVisible, miniaturas: imgs.map((i) => i.miniatura), pdfs: docs.map((d) => d.nombre) }] : previo.mensajes;
     setConv((c) => ({ ...c, [sec]: { ...previo, mensajes: mensajesYo } }));
-    if (textoDirecto == null) { setEntrada(""); setImagenes([]); }
+    if (textoDirecto == null) { setEntrada(""); setImagenes([]); setPdfs([]); setAvisoAdjunto(""); }
     setOcupado(true);
     try {
       const r = await fetch("/api/ia-bc/chat", {
@@ -110,6 +118,7 @@ export default function IAFlotante({ seccion, incrustado = false, onAbrirSeccion
           historial: previo.historial,
           empresa: empresaId,
           imagenes: imgs.map((i) => ({ media_type: i.media_type, data: i.data })),
+          documentos: docs.map((d) => ({ media_type: d.media_type, data: d.data, nombre: d.nombre })),
           contexto: {
             pantalla,
             texto: usarPantalla ? textoPantalla() : "(Maria ha desactivado enviar el contenido de la pantalla)",
@@ -145,14 +154,17 @@ export default function IAFlotante({ seccion, incrustado = false, onAbrirSeccion
     else fijar((a) => ({ historial: [...a.historial, { role: "user", content: nota }, { role: "assistant", content: [{ type: "text", text: "Entendido, cambio aplicado." }] }] }));
   };
 
-  const añadirImagenes = async (ficheros) => {
-    for (const f of [...ficheros].filter((x) => x && /^image\//.test(x.type)).slice(0, 10)) {
-      try { const im = await cargarImagen(f); setImagenes((p) => [...p, im].slice(0, 10)); } catch { /* imagen no válida */ }
-    }
+  const añadirAdjuntos = async (ficheros) => {
+    const r = await leerAdjuntosChat(ficheros, { imagenesYa: imagenes.length, pdfsYa: pdfs.length });
+    if (r.imagenes.length) setImagenes((p) => [...p, ...r.imagenes].slice(0, 10));
+    if (r.pdfs.length) setPdfs((p) => [...p, ...r.pdfs].slice(0, 3));
+    setAvisoAdjunto(r.avisos.join(" "));
   };
   const onPegar = (e) => {
-    const fich = [...(e.clipboardData?.items || [])].filter((it) => it.kind === "file" && /^image\//.test(it.type)).map((it) => it.getAsFile());
-    if (fich.length) { e.preventDefault(); añadirImagenes(fich); }
+    const fich = [...(e.clipboardData?.items || [])].filter((it) => it.kind === "file").map((it) => it.getAsFile()).filter(Boolean);
+    const utiles = fich.filter((f) => /^image\//.test(f.type || "") || esPdf(f));
+    if (utiles.length) { e.preventDefault(); añadirAdjuntos(utiles); }
+    else if (fich.length) { e.preventDefault(); setAvisoAdjunto(`«${fich[0].name || "fichero"}» no es un PDF ni una imagen.`); }
   };
   const nueva = () => {
     delete chatIds.current[seccion];
@@ -181,6 +193,15 @@ export default function IAFlotante({ seccion, incrustado = false, onAbrirSeccion
                 {m.miniaturas?.length > 0 && (
                   <div className="flex gap-1 mb-1">{m.miniaturas.map((src, i) => <img key={i} src={src} alt="" className="h-12 rounded" />)}</div>
                 )}
+                {(m.pdfs || []).length > 0 && (
+                  <div className="flex flex-wrap gap-1 mb-1">
+                    {m.pdfs.map((nombre, i) => (
+                      <span key={i} className="inline-flex items-center gap-1 text-[11px] bg-white/90 text-slate-700 border border-slate-200 rounded px-1.5 py-0.5 max-w-full">
+                        <Paperclip size={11} /> <span className="truncate">{nombre}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 {m.rol === "yo" ? m.texto : <MensajeConTablas texto={m.texto} empresaId={empresaId} />}
                 {(m.pasos || []).filter((p) => p.herramienta === "guardar_regla" && p.ok).map((p, i) => (
                   <div key={i} className="mt-1 text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">Regla guardada: {p.entrada?.texto}</div>
@@ -208,20 +229,31 @@ export default function IAFlotante({ seccion, incrustado = false, onAbrirSeccion
             ))}
           </div>
         )}
+        {pdfs.length > 0 && (
+          <div className="flex flex-wrap gap-1 mb-1">
+            {pdfs.map((d, i) => (
+              <span key={i} className="inline-flex items-center gap-1 text-[11px] border border-slate-300 rounded px-1.5 py-0.5 max-w-full">
+                <Paperclip size={11} /> <span className="truncate">{d.nombre}</span>
+                <button onClick={() => setPdfs((p) => p.filter((_, j) => j !== i))} className="text-slate-400 hover:text-red-600" title="Quitar"><X size={10} /></button>
+              </span>
+            ))}
+          </div>
+        )}
+        {avisoAdjunto && <div className="mb-1 text-[11px] text-red-700">{avisoAdjunto}</div>}
         <div className="flex items-end gap-1">
           {incrustado && <button onClick={nueva} title="Nueva conversación" className="p-2 text-slate-500 hover:text-slate-700"><Plus size={16} /></button>}
-          <button onClick={() => inputImgRef.current?.click()} className="p-2 text-slate-500 hover:text-slate-700" title="Adjuntar imagen (también puedes pegarla con Ctrl+V)"><Paperclip size={16} /></button>
-          <input ref={inputImgRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => { añadirImagenes(e.target.files); e.target.value = ""; }} />
+          <button onClick={() => inputImgRef.current?.click()} className="p-2 text-slate-500 hover:text-slate-700" title="Adjuntar imagen o PDF (también puedes pegarlos con Ctrl+V)"><Paperclip size={16} /></button>
+          <input ref={inputImgRef} type="file" accept="image/*,application/pdf,.pdf" multiple className="hidden" onChange={(e) => { añadirAdjuntos(e.target.files); e.target.value = ""; }} />
           <textarea
             value={entrada}
             onChange={(e) => setEntrada(e.target.value)}
             onPaste={onPegar}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } }}
             rows={2}
-            placeholder="Pregunta sobre esta pantalla… (Enter para enviar)"
+            placeholder="Pregunta sobre esta pantalla… Puedes adjuntar un PDF (Enter para enviar)"
             className="flex-1 resize-none border rounded-md px-2 py-1 text-sm"
           />
-          <button onClick={() => enviar()} disabled={ocupado || (!entrada.trim() && !imagenes.length)} className="p-2 rounded-md bg-blue-700 text-white disabled:opacity-40"><Send size={16} /></button>
+          <button onClick={() => enviar()} disabled={ocupado || (!entrada.trim() && !imagenes.length && !pdfs.length)} className="p-2 rounded-md bg-blue-700 text-white disabled:opacity-40"><Send size={16} /></button>
         </div>
         <label className="flex items-center gap-1 mt-1 text-[10px] text-slate-400">
           <input type="checkbox" checked={usarPantalla} onChange={(e) => setUsarPantalla(e.target.checked)} /> Enviar a la IA lo que se ve en pantalla

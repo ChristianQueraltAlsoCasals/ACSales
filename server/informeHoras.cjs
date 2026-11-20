@@ -68,7 +68,8 @@ function listaFestivos(ajustes) {
   return (ajustes.festivos || []).map((f) => ({ recurso: "", fecha: f }));
 }
 
-function contextoJornada(ajustes) {
+function contextoJornada(ajustes, altaPorRecurso = {}) {
+  const altaDe = altaPorRecurso || {};
   const festivos = new Set();
   const festivosRec = {};
   for (const l of listaFestivos(ajustes)) {
@@ -86,6 +87,8 @@ function contextoJornada(ajustes) {
     if (ds === 0 || ds === 6 || festivos.has(dia)) return 0;
     let base = ds === 5 && ajustes.jornadaViernes ? Number(ajustes.jornadaViernes) : Number(ajustes.jornada) || 8;
     if (recurso) {
+      const fechaAlta = altaDe[recurso];
+      if (fechaAlta && dia < fechaAlta) return 0;
       if (festivosRec[recurso]?.has(dia)) return 0;
       const pob = ajustes.asignacion?.[recurso];
       if (pob && festPobl[pob]?.has(dia)) return 0;
@@ -255,14 +258,21 @@ async function leerRecursos(token, empresa) {
   const servicio = process.env.BC_WS_RECURSOS || "Ficha_recurso_Excel";
   let filas;
   try {
-    filas = await paginar(`${base}/${encodeURIComponent(servicio)}?$select=No,Name,Type,Resource_Group_No`, headers);
+    filas = await paginar(`${base}/${encodeURIComponent(servicio)}?$select=No,Name,Type,Resource_Group_No,Employment_Date`, headers);
   } catch (e) {
     if (e.status !== 400 && e.status !== 404) throw e;
-    return { nombres: {}, maquina: new Set(), departamentos: {} };
+    if (e.status === 404) return { nombres: {}, maquina: new Set(), departamentos: {}, alta: {} };
+    try {
+      filas = await paginar(`${base}/${encodeURIComponent(servicio)}?$select=No,Name,Type,Resource_Group_No`, headers);
+    } catch (e2) {
+      if (e2.status !== 400 && e2.status !== 404) throw e2;
+      return { nombres: {}, maquina: new Set(), departamentos: {}, alta: {} };
+    }
   }
   const nombres = {};
   const maquina = new Set();
   const departamentos = {};
+  const alta = {};
   for (const r of filas) {
     const no = String(campo(r, ["No", "No_", "Nº"])).trim();
     if (!no) continue;
@@ -270,8 +280,10 @@ async function leerRecursos(token, empresa) {
     const tipo = String(campo(r, ["Type", "Tipo"]) || "");
     if (/machin|m[aá]quina/i.test(tipo)) maquina.add(no);
     departamentos[no] = departamentoDeGrupo(campo(r, ["Resource_Group_No", "ResourceGroupNo"]));
+    const emp = String(campo(r, ["Employment_Date", "Fecha_empleo"]) || "").slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(emp) && emp > "1900-01-01") alta[no] = emp;
   }
-  return { nombres, maquina, departamentos };
+  return { nombres, maquina, departamentos, alta };
 }
 
 async function leerClientes(token, empresa, ots) {
@@ -299,12 +311,13 @@ async function leerClientes(token, empresa, ots) {
   return clientes;
 }
 
-function desviaciones({ filas, nombres, maquina, departamentos, clientes, ajustes, fecha }) {
-  const { jornadaDia } = contextoJornada(ajustes);
+function desviaciones({ filas, nombres, maquina, departamentos, clientes, ajustes, fecha, alta }) {
+  const { jornadaDia } = contextoJornada(ajustes, alta);
   const catDe = (tipo) => ajustes.tipos?.[tipo] || adivinar(tipo);
   const porRec = {};
+  const inactivos = new Set(ajustes?.inactivos || []);
   for (const f0 of filas) {
-    if (!f0.recurso || maquina.has(f0.recurso)) continue;
+    if (!f0.recurso || maquina.has(f0.recurso) || inactivos.has(f0.recurso)) continue;
     const cat = catDe(f0.tipoTrabajo);
     if (cat === "noHoras") continue;
     const enDias = /^(d|dia|día|dias|días|day|days|jornada)$/i.test(f0.unidad);
@@ -324,10 +337,14 @@ function desviaciones({ filas, nombres, maquina, departamentos, clientes, ajuste
     else if (AUSENCIA.has(cat)) r.aus += horas;
     else r.trabajo += horas;
   }
+  for (const recurso of ajustes?.activosForzados || []) {
+    if (!recurso || inactivos.has(recurso) || maquina.has(recurso) || porRec[recurso]) continue;
+    porRec[recurso] = { activo: true, trabajo: 0, extra: 0, aus: 0, lineas: [] };
+  }
 
   const avisos = [];
   for (const [recurso, r] of Object.entries(porRec)) {
-    if (!r.activo) continue;
+    if (!r.activo || inactivos.has(recurso)) continue;
     const jornada = jornadaDia(fecha, recurso);
     if (!(jornada > 0)) continue;
     const normales = r.trabajo - r.extra;
@@ -555,7 +572,7 @@ async function preparar({ db, fecha, fechaHoy } = {}) {
         continue;
       }
       const clientes = await leerClientes(token, empresa, filas.filter((f) => f.fecha === dia).map((f) => f.ot));
-      const avisos = desviaciones({ filas, nombres: rec.nombres, maquina: rec.maquina, departamentos: rec.departamentos, clientes, ajustes, fecha: dia });
+      const avisos = desviaciones({ filas, nombres: rec.nombres, maquina: rec.maquina, departamentos: rec.departamentos, clientes, ajustes, fecha: dia, alta: rec.alta });
       bloques.push({ etiqueta: empresa.etiqueta, filas: avisos });
       leidas++;
     } catch (e) {
@@ -650,4 +667,15 @@ function programar({ db }) {
   console.log(`[informe-horas] Cada día a las ${String(hora).padStart(2, "0")}:00 (Europe/Madrid), jornada de hace ${diasAtras()} días → ${destinatarios().join(", ")}`);
 }
 
-module.exports = { preparar, enviar, programar };
+module.exports = {
+  preparar,
+  enviar,
+  programar,
+  obtenerTokenBC,
+  empresasCompra,
+  leerMovimientos,
+  leerRecursos,
+  contextoJornada,
+  adivinar,
+  claveAjustes,
+};

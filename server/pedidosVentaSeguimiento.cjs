@@ -6,7 +6,7 @@
  *
  *   { notas: { [ot]: Nota[] }, enviados: { [ot]: { ts, veces, para } } }
  */
-module.exports = function montarPedidosVentaSeguimiento({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL }) {
+module.exports = function montarPedidosVentaSeguimiento({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL, buzonDelUsuario }) {
   const DEF = { notas: {}, enviados: {} };
   const leer = async () => db.getDoc(claveEmpresa("pedidos_venta_seguimiento"), { ...DEF, notas: {}, enviados: {} });
   const escribir = async (d) => db.setDoc(claveEmpresa("pedidos_venta_seguimiento"), d);
@@ -160,6 +160,129 @@ module.exports = function montarPedidosVentaSeguimiento({ app, db, claveEmpresa,
     } catch (err) {
       console.error("Error /api/pedidos-venta/correos:", err);
       res.status(500).json({ error: "No se pudieron leer los correos.", detalle: String(err.message || err) });
+    }
+  });
+
+  // Doc. extern (101026A-2026) → número de parte que va en el PDF (PR101026-26.pdf / PR101026-26M.pdf).
+  const claveExterno = (externo) => {
+    const m = /^(\d{4,7})([A-Za-z])?\s*[-/]\s*(\d{2}|\d{4})$/.exec(String(externo || "").trim());
+    if (!m) return null;
+    return { raw: String(externo).trim(), numero: m[1], letra: (m[2] || "").toUpperCase() };
+  };
+  const claveAdjunto = (nombre) => {
+    const base = String(nombre || "").replace(/\.[^.]+$/, "");
+    const m = /^PR(\d{4,7})([A-Za-z])?(?:-(\d{2})([A-Za-z])?)?$/i.exec(base);
+    if (!m) return null;
+    return { numero: m[1], marca: ((m[2] || "") + (m[4] || "")).toUpperCase() };
+  };
+
+  const cachePdf = new Map();
+
+  app.post("/api/pedidos-venta/enviados-pdf", async (req, res) => {
+    if (!process.env.M365_CLIENT_SECRET) return res.status(503).json({ error: "Falta configurar M365_* en .env." });
+    const claves = [];
+    const vistos = new Set();
+    for (const item of Array.isArray(req.body?.externos) ? req.body.externos : []) {
+      const c = claveExterno(item);
+      if (!c || vistos.has(c.raw)) continue;
+      vistos.add(c.raw);
+      claves.push(c);
+      if (claves.length >= 80) break;
+    }
+    if (!claves.length) return res.json({ enviados: {} });
+
+    let buzon = "";
+    try {
+      buzon = buzonDelUsuario ? await buzonDelUsuario(req, res) : BUZON_PERSONAL();
+    } catch (err) {
+      return res.status(500).json({ error: "No se pudo saber el buzón.", detalle: String(err.message || err) });
+    }
+    if (!buzon) return;
+
+    const firma = `${String(buzon).toLowerCase()}|${claves.map((c) => c.raw).sort().join(",")}`;
+    const guardado = cachePdf.get(firma);
+    if (guardado && guardado.exp > Date.now()) return res.json({ enviados: guardado.enviados, buzon });
+
+    const porNumero = new Map();
+    for (const c of claves) {
+      const lista = porNumero.get(c.numero) || [];
+      lista.push(c);
+      porNumero.set(c.numero, lista);
+    }
+
+    try {
+      const token = await obtenerTokenGraph();
+      const headers = { Authorization: `Bearer ${token}`, ConsistencyLevel: "eventual" };
+      const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}`;
+      const numeros = [...porNumero.keys()];
+      const mensajes = [];
+      const ids = new Set();
+      for (let i = 0; i < numeros.length; i += 12) {
+        const trozo = numeros.slice(i, i + 12);
+        const q = `"${trozo.map((n) => `PR${n}`).join(" OR ")}"`;
+        let url = `${base}/mailFolders/sentitems/messages?$search=${encodeURIComponent(q)}&$select=id,subject,sentDateTime,toRecipients,ccRecipients,hasAttachments&$top=25`;
+        let paginas = 0;
+        while (url && paginas < 3 && mensajes.length < 60) {
+          const r = await fetchConReintento(url, { headers });
+          if (!r.ok) throw new Error(`Graph respondió ${r.status}: ${(await r.text()).slice(0, 250)}`);
+          const j = await r.json();
+          for (const m of j.value || []) {
+            if (ids.has(m.id)) continue;
+            ids.add(m.id);
+            mensajes.push(m);
+          }
+          url = j["@odata.nextLink"] || "";
+          paginas += 1;
+        }
+      }
+
+      const conAdjunto = mensajes.filter((m) => m.hasAttachments);
+      const nombres = new Map();
+      const lote = 4;
+      for (let i = 0; i < conAdjunto.length; i += lote) {
+        const grupo = conAdjunto.slice(i, i + lote);
+        const listas = await Promise.all(grupo.map(async (m) => {
+          const r = await fetchConReintento(`${base}/messages/${m.id}/attachments?$select=name,isInline`, { headers });
+          if (!r.ok) return [];
+          const j = await r.json();
+          return (j.value || []).filter((a) => !a.isInline).map((a) => String(a.name || ""));
+        }));
+        grupo.forEach((m, idx) => nombres.set(m.id, listas[idx]));
+      }
+
+      const enviados = {};
+      for (const m of conAdjunto) {
+        const para = (m.toRecipients || []).map((t) => t.emailAddress?.address).filter(Boolean);
+        const cc = (m.ccRecipients || []).map((t) => t.emailAddress?.address).filter(Boolean);
+        for (const nombre of nombres.get(m.id) || []) {
+          const adj = claveAdjunto(nombre);
+          if (!adj) continue;
+          const candidatos = porNumero.get(adj.numero) || [];
+          if (!candidatos.length) continue;
+          const conLetra = candidatos.filter((c) => c.letra);
+          const sinLetra = candidatos.filter((c) => !c.letra);
+          const elegidos = conLetra.length && sinLetra.length
+            ? (adj.marca ? conLetra : sinLetra)
+            : candidatos;
+          for (const c of elegidos) {
+            const prev = enviados[c.raw];
+            if (prev && String(prev.fecha) >= String(m.sentDateTime || "")) continue;
+            enviados[c.raw] = {
+              fecha: m.sentDateTime || "",
+              para,
+              cc,
+              asunto: m.subject || "",
+              adjunto: nombre,
+            };
+          }
+        }
+      }
+      for (const c of claves) if (!(c.raw in enviados)) enviados[c.raw] = null;
+      cachePdf.set(firma, { exp: Date.now() + 10 * 60 * 1000, enviados });
+      res.json({ enviados, buzon });
+    } catch (err) {
+      console.error("Error /api/pedidos-venta/enviados-pdf:", err);
+      res.status(500).json({ error: "No se pudo revisar el correo enviado.", detalle: String(err.message || err) });
     }
   });
 };

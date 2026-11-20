@@ -12,13 +12,18 @@
  * Solo LECTURA. Se calcula también el mismo periodo del año anterior
  * para comparar. El último resultado se guarda en disco por empresa:
  * al abrir la pantalla se enseña ese resultado. Solo «Actualizar» vuelve a leer BC.
+ *
+ * Filtro opcional de línea de negocio (?lineas=INS,AUT o ?contiene=EST).
+ * Ese resultado no sustituye las cifras guardadas de toda la empresa.
  */
 const fs = require("fs");
 const path = require("path");
 
 module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE, db, claveEmpresa }) {
   const cache = new Map();
+  const cacheLineas = new Map(); // empresa+fechas -> movimientos ya partidos por línea de negocio
   const cacheNombres = new Map(); // empresa -> {ts, mapa}
+  const UNIDADES_LN = new Set(["AMT", "AUT", "CON", "INS", "LLM", "MAN"]);
   const dirGuardado = path.join(__dirname, "data", "ratios");
 
   function rutaGuardado() {
@@ -181,26 +186,100 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
     return puntos;
   }
 
-  // Recorre los movimientos una sola vez y acumula el periodo a analizar y el de comparación.
-  async function calcular(hasta, desde, hastaPrev, desdePrev) {
-    hastaPrev = hastaPrev || menosUnAño(hasta);
-    desdePrev = desdePrev || menosUnAño(desde);
+  function mapasVacios() {
+    return { bal: new Map(), balPrev: new Map(), pyg: new Map(), pygPrev: new Map(), deltaBal: new Map(), deltaPyg: new Map(), n: 0, cierre: 0 };
+  }
+
+  function sumarMapa(dest, src) {
+    for (const [k, v] of src) dest.set(k, (dest.get(k) || 0) + v);
+  }
+
+  function sumarDeltas(dest, src) {
+    for (const [mes, cuentas] of src) {
+      if (!dest.has(mes)) dest.set(mes, new Map());
+      sumarMapa(dest.get(mes), cuentas);
+    }
+  }
+
+  function sumarBloque(dest, src) {
+    sumarMapa(dest.bal, src.bal);
+    sumarMapa(dest.balPrev, src.balPrev);
+    sumarMapa(dest.pyg, src.pyg);
+    sumarMapa(dest.pygPrev, src.pygPrev);
+    sumarDeltas(dest.deltaBal, src.deltaBal);
+    sumarDeltas(dest.deltaPyg, src.deltaPyg);
+    dest.n += src.n;
+    dest.cierre += src.cierre;
+  }
+
+  // Dimensión 1 de BC: códigos como INS-P, AUT-I, _EST-AC.
+  function lineaDeAsiento(e) {
+    const directo = [e.shortcutDimension1Code, e.globalDimension1Code, e.Shortcut_Dimension_1_Code, e.Global_Dimension_1_Code]
+      .map((v) => String(v || "").trim())
+      .find(Boolean);
+    if (directo) return directo;
+    const dims = e.dimensionSetLines || [];
+    let ln = "";
+    const otras = [];
+    for (const d of dims) {
+      const code = String(d.code || d.dimensionCode || "").trim().toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      const val = String(d.valueCode || d.dimensionValueCode || "").trim();
+      if (!val) continue;
+      if (code === "OT" || code === "JOB" || code === "PROYECTO") continue;
+      if (code === "LINEA" || code === "LN" || code === "DEPARTMENT" || code.includes("LINEA") || code.includes("NEGOCIO") || code === "DEPARTAMENTO" || code === "UNIDAD") ln = val;
+      else otras.push(val);
+    }
+    if (ln) return ln;
+    return otras.length === 1 ? otras[0] : "";
+  }
+
+  function normalizarFiltroLN(query) {
+    const crudo = Array.isArray(query.lineas) ? query.lineas.join(",") : String(query.lineas || "");
+    const unidades = [...new Set(
+      crudo.split(",").map((s) => s.trim().toUpperCase()).filter((s) => /^[A-Z0-9_+\-]{1,40}$/.test(s))
+    )].slice(0, 80);
+    const contiene = String(query.contiene || "").trim().slice(0, 40);
+    return { unidades, contiene, activo: unidades.length > 0 || contiene.length > 0 };
+  }
+
+  // Una unidad (INS) incluye INS, INS-P, INS-I… Un código concreto (INS-P) solo ese.
+  // «contiene» busca el texto dentro del código. Si llegan las dos cosas, vale cualquiera.
+  function coincideLinea(ln, filtro) {
+    if (!filtro?.activo) return true;
+    const up = String(ln || "").trim().toUpperCase();
+    if (!up) return false;
+    const unidad = extraerActividad(up).toUpperCase();
+    const okU = filtro.unidades.some((t) => (
+      UNIDADES_LN.has(t) ? (unidad === t || up === t || up.startsWith(`${t}-`)) : up === t
+    ));
+    const okC = filtro.contiene && up.includes(filtro.contiene.toUpperCase());
+    return okU || okC;
+  }
+
+  // Recorre los movimientos una sola vez. Con porLinea, parte el acumulado por código de dimensión.
+  async function descargarMovimientos(hasta, desde, hastaPrev, desdePrev, porLinea) {
     const corte = hastaPrev > hasta ? hastaPrev : hasta;
     const token = await obtenerTokenBC();
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/generalLedgerEntries`;
-    let url = `${base}?$select=postingDate,accountNumber,debitAmount,creditAmount,documentNumber&$filter=${encodeURIComponent(`postingDate le ${corte}`)}`;
+    const filtroOData = `postingDate le ${corte}`;
+    let url = porLinea
+      ? `${base}?$expand=dimensionSetLines&$filter=${encodeURIComponent(filtroOData)}`
+      : `${base}?$select=postingDate,accountNumber,debitAmount,creditAmount,documentNumber&$filter=${encodeURIComponent(filtroOData)}`;
 
-    const bal = new Map(), balPrev = new Map(), pyg = new Map(), pygPrev = new Map();
-    // Deltas mensuales solo para la serie del cuadro de mando. No alteran bal/pyg.
-    const deltaBal = new Map(), deltaPyg = new Map();
+    const bloques = new Map();
+    const bloqueDe = (ln) => {
+      const k = porLinea ? String(ln || "") : "*";
+      if (!bloques.has(k)) bloques.set(k, mapasVacios());
+      return bloques.get(k);
+    };
+    const suma = (m, k, v) => m.set(k, (m.get(k) || 0) + v);
     const addMes = (mapa, mes, cta, v) => {
       if (!mapa.has(mes)) mapa.set(mes, new Map());
       suma(mapa.get(mes), cta, v);
     };
     // Asientos del 31/12 que tocan la 129 = asientos de REGULARIZACIÓN/CIERRE:
     // se quitan de la cuenta de resultados del periodo (si no, gastos e ingresos saldrían a 0).
-    const docs3112 = new Map(); // doc|fecha -> {tiene129, pyg: Map}
-    const suma = (m, k, v) => m.set(k, (m.get(k) || 0) + v);
+    const docs3112 = new Map();
     let n = 0;
     while (url) {
       const r = await fetchConReintento(url, { headers: { Authorization: `Bearer ${token}` } });
@@ -212,42 +291,45 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
         const f = String(e.postingDate || "").slice(0, 10);
         const v = (Number(e.debitAmount) || 0) - (Number(e.creditAmount) || 0);
         const esPyg = cta.startsWith("6") || cta.startsWith("7");
-        if (f <= hasta) suma(bal, cta, v);
-        if (f <= hastaPrev) suma(balPrev, cta, v);
+        const b = bloqueDe(porLinea ? lineaDeAsiento(e) : "");
+        b.n++;
+        if (f <= hasta) suma(b.bal, cta, v);
+        if (f <= hastaPrev) suma(b.balPrev, cta, v);
         const mes = f.slice(0, 7);
         if (mes.length === 7) {
-          addMes(deltaBal, mes, cta, v);
-          if (esPyg) addMes(deltaPyg, mes, cta, v);
+          addMes(b.deltaBal, mes, cta, v);
+          if (esPyg) addMes(b.deltaPyg, mes, cta, v);
         }
         if (f.endsWith("-12-31")) {
           const k = `${e.documentNumber}|${f}`;
           if (!docs3112.has(k)) docs3112.set(k, { tiene129: false, movs: [] });
           const d = docs3112.get(k);
           if (cta.startsWith("129")) d.tiene129 = true;
-          if (esPyg) d.movs.push([cta, v, f]);
+          if (esPyg) d.movs.push([cta, v, f, b]);
         }
         if (esPyg) {
-          if (f >= desde && f <= hasta) suma(pyg, cta, v);
-          if (f >= desdePrev && f <= hastaPrev) suma(pygPrev, cta, v);
+          if (f >= desde && f <= hasta) suma(b.pyg, cta, v);
+          if (f >= desdePrev && f <= hastaPrev) suma(b.pygPrev, cta, v);
         }
       }
       url = j["@odata.nextLink"] || null;
     }
-    // Quitar los asientos de cierre de la cuenta de resultados
-    let movsCierre = 0;
     for (const d of docs3112.values()) {
       if (!d.tiene129) continue;
-      for (const [cta, v, f] of d.movs) {
-        movsCierre++;
-        if (f >= desde && f <= hasta) suma(pyg, cta, -v);
-        if (f >= desdePrev && f <= hastaPrev) suma(pygPrev, cta, -v);
+      for (const [cta, v, f, b] of d.movs) {
+        b.cierre++;
+        if (f >= desde && f <= hasta) suma(b.pyg, cta, -v);
+        if (f >= desdePrev && f <= hastaPrev) suma(b.pygPrev, cta, -v);
         const mes = String(f).slice(0, 7);
-        if (deltaPyg.has(mes)) suma(deltaPyg.get(mes), cta, -v);
+        if (b.deltaPyg.has(mes)) suma(b.deltaPyg.get(mes), cta, -v);
       }
     }
+    return { token, bloques, n };
+  }
+
+  async function empaquetar(hasta, desde, hastaPrev, desdePrev, token, bloque, extra) {
     let serie = [];
-    try { serie = serieMensual(deltaBal, deltaPyg, hasta, masas); } catch (e) { console.error("serie mensual:", e); }
-    // Detalle por cuenta (gastos/ingresos del periodo y saldos) para el simulador de escenarios
+    try { serie = serieMensual(bloque.deltaBal, bloque.deltaPyg, hasta, masas); } catch (e) { console.error("serie mensual:", e); }
     const nombres = await nombresCuentas(token);
     const r2 = (m) => Object.fromEntries([...m].filter(([, v]) => Math.abs(v) >= 0.005).map(([k, v]) => [k, Math.round(v * 100) / 100]));
     const dias = (d1, d2) => Math.round((new Date(`${d2}T00:00:00Z`) - new Date(`${d1}T00:00:00Z`)) / 86400000) + 1;
@@ -257,14 +339,57 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
       desde,
       hastaPrev,
       desdePrev,
-      movimientos: n,
-      movsCierreExcluidos: movsCierre,
-      actual: masas(bal, pyg, dias(desde, hasta)),
-      anterior: masas(balPrev, pygPrev, dias(desdePrev, hastaPrev)),
+      movimientos: bloque.n,
+      movsCierreExcluidos: bloque.cierre,
+      actual: masas(bloque.bal, bloque.pyg, dias(desde, hasta)),
+      anterior: masas(bloque.balPrev, bloque.pygPrev, dias(desdePrev, hastaPrev)),
       serie,
-      cuentas: { pyg: r2(pyg), pygPrev: r2(pygPrev), bal: r2(bal), balPrev: r2(balPrev), nombres },
+      cuentas: { pyg: r2(bloque.pyg), pygPrev: r2(bloque.pygPrev), bal: r2(bloque.bal), balPrev: r2(bloque.balPrev), nombres },
       calculado: new Date().toISOString(),
+      ...extra,
     };
+  }
+
+  async function calcular(hasta, desde, hastaPrev, desdePrev) {
+    hastaPrev = hastaPrev || menosUnAño(hasta);
+    desdePrev = desdePrev || menosUnAño(desde);
+    const desc = await descargarMovimientos(hasta, desde, hastaPrev, desdePrev, false);
+    const bloque = desc.bloques.get("*") || mapasVacios();
+    return empaquetar(hasta, desde, hastaPrev, desdePrev, desc.token, bloque, { filtroLinea: null });
+  }
+
+  async function calcularFiltrado(hasta, desde, hastaPrev, desdePrev, filtro, forzar) {
+    const clave = `${EMPRESA_ID()}|${desde}|${hasta}|${desdePrev}|${hastaPrev}`;
+    let pack = cacheLineas.get(clave);
+    let deCache = false;
+    if (pack && !forzar && Date.now() - pack.ts < 30 * 60 * 1000) deCache = true;
+    else {
+      const desc = await descargarMovimientos(hasta, desde, hastaPrev, desdePrev, true);
+      pack = { ts: Date.now(), ...desc };
+      cacheLineas.set(clave, pack);
+    }
+    const dest = mapasVacios();
+    const lineasDisponibles = [];
+    let sinLinea = 0;
+    for (const [codigo, bloque] of pack.bloques) {
+      if (!codigo) {
+        sinLinea += bloque.n;
+        continue;
+      }
+      lineasDisponibles.push({ codigo, movimientos: bloque.n });
+      if (coincideLinea(codigo, filtro)) sumarBloque(dest, bloque);
+    }
+    lineasDisponibles.sort((a, b) => a.codigo.localeCompare(b.codigo, "es"));
+    if (pack.n > 50 && lineasDisponibles.length === 0) {
+      throw new Error("Business Central no ha devuelto la línea de negocio en los movimientos, así que no se puede filtrar.");
+    }
+    const datos = await empaquetar(hasta, desde, hastaPrev, desdePrev, pack.token, dest, {
+      filtroLinea: { unidades: filtro.unidades, contiene: filtro.contiene },
+      lineasDisponibles,
+      sinLinea,
+      movimientosLeidos: pack.n,
+    });
+    return { datos, deCache };
   }
 
   app.get("/api/contabilidad/ratios/ultimo", (req, res) => {
@@ -281,10 +406,18 @@ module.exports = function montarContabilidad({ app, obtenerTokenBC, fetchConRein
     const desdePrev = fechaOk(req.query.desdePrev) ? req.query.desdePrev : menosUnAño(desde);
     if (desde > hasta) return res.status(400).json({ error: "En el periodo a analizar, la fecha inicial no puede ser posterior a la final." });
     if (desdePrev > hastaPrev) return res.status(400).json({ error: "En la comparación, la fecha inicial no puede ser posterior a la final." });
+    const filtro = normalizarFiltroLN(req.query);
     const clave = `${EMPRESA_ID()}|${desde}|${hasta}|${desdePrev}|${hastaPrev}|ctas`;
-    const c = cache.get(clave);
-    if (c && !req.query.refrescar && Date.now() - c.ts < 30 * 60 * 1000) return res.json({ ...c.datos, deCache: true });
+    if (!filtro.activo) {
+      const c = cache.get(clave);
+      if (c && !req.query.refrescar && Date.now() - c.ts < 30 * 60 * 1000) return res.json({ ...c.datos, deCache: true });
+    }
     try {
+      if (filtro.activo) {
+        const { datos, deCache } = await calcularFiltrado(hasta, desde, hastaPrev, desdePrev, filtro, req.query.refrescar === "1");
+        console.log(`[contabilidad/ratios] ${datos.empresa} filtro ${JSON.stringify(filtro)}: ${datos.movimientos} de ${datos.movimientosLeidos} movimientos${deCache ? " (caché)" : ""}`);
+        return res.json({ ...datos, deCache });
+      }
       const datos = escribirGuardado(await calcular(hasta, desde, hastaPrev, desdePrev));
       cache.set(clave, { ts: Date.now(), datos });
       console.log(`[contabilidad/ratios] ${datos.empresa} hasta ${hasta}: ${datos.movimientos} movimientos (${datos.movsCierreExcluidos} de cierre excluidos)`);

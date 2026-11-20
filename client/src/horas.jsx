@@ -15,10 +15,19 @@
  *    laborables sin imputar e incidencias de Configuración).
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ConfiguracionHoras, TarifasHoras, FestivosLinea, listaFestivos, agruparAmiantoPorDia, normNum, TIPOS_INCIDENCIA } from "./horasExtra.jsx";
-import { indiceRecursos } from "./manoObra.jsx";
+import { ConfiguracionHoras, TarifasHoras, FestivosLinea, JornadaPorTrabajador, VentanaPlantilla, listaFestivos, agruparAmiantoPorDia, normNum } from "./horasExtra.jsx";
+import { indiceRecursos, indiceDesdeGrupos } from "./manoObra.jsx";
 import { puedeTarifasPago } from "./permisos.js";
-import { codigoDepartamentoDesdeUnidad, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
+import { codigoDepartamentoDesdeUnidad, listasCorreoDepartamento, listasCorreoTodosResponsables, aplicarRemitente } from "./departamentos.js";
+
+/** Contraseña de la pestaña confidencial Tarifas y pago. */
+const CLAVE_TARIFAS = "ALSO";
+
+/** Enlace público de Control de horas (Cuadro de horas). No usar localhost: el correo lo abren los responsables. */
+const URL_CUADRO_HORAS = "https://acsales.alsocasals.com/#/horas";
+function urlCuadroHoras() {
+  return URL_CUADRO_HORAS;
+}
 
 const CATS = {
   normal: { txt: "Normal", color: "" },
@@ -177,136 +186,133 @@ function textoAHtml(t) {
   return escHtml(t).split(/\r?\n/).join("<br/>");
 }
 
-function badgeSituacion(tipo) {
-  const estilos = {
-    incompleto: "background:#f59e0b;color:#fff",
-    sinImputar: "background:#fecaca;color:#7f1d1d",
-    incidencia: "background:#e2e8f0;color:#334155",
-  };
-  const textos = {
-    incompleto: "Faltan horas",
-    sinImputar: "Sin imputar",
-    incidencia: "Incidencia",
-  };
-  return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;${estilos[tipo] || estilos.incidencia}">${textos[tipo] || tipo}</span>`;
+/** El texto «Haz clic» del aviso sale como enlace al Cuadro de horas. */
+function textoAHtmlConEnlace(t, url) {
+  const html = textoAHtml(t);
+  if (!url) return html;
+  const enlace = `<a href="${escHtml(url)}" style="color:#1d4ed8;font-weight:700;text-decoration:underline">Haz clic</a>`;
+  return html.replace(/Haz clic/g, enlace);
 }
 
-/** Tabla HTML del detalle (Outlook-friendly) + intro/cierre editables. */
-function construirAvisoHoras({ deptoNombre, desde, hasta, filas }) {
-  const th = 'style="text-align:left;padding:6px 10px;border-bottom:2px solid #cbd5e1;background:#f1f5f9;font-size:12px;white-space:nowrap"';
-  const td = 'style="padding:6px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;vertical-align:top"';
-  const tdR = 'style="padding:6px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;vertical-align:top;font-variant-numeric:tabular-nums"';
+function textoRevision(f) {
+  const partes = [];
+  if (f.sinImputar?.length) partes.push(`${f.sinImputar.length} día${f.sinImputar.length === 1 ? "" : "s"} en rojo`);
+  if (f.incompletos?.length) partes.push(`${f.incompletos.length} día${f.incompletos.length === 1 ? "" : "s"} en naranja`);
+  if (f.incidencias?.length) partes.push(`${f.incidencias.length} en configuración`);
+  return partes.join(" · ") || "—";
+}
 
-  const filasDetalle = [];
+/** Días a revisar de un trabajador, con la línea de tipo de trabajo y el total del día. */
+function detalleDias(f) {
+  const dias = [
+    ...(f.sinImputar || []).map((dia) => ({ dia, horas: 0 })),
+    ...(f.incompletos || []).map((x) => ({ dia: x.dia, horas: x.horas })),
+  ].sort((a, b) => (a.dia < b.dia ? -1 : a.dia > b.dia ? 1 : 0));
+  return dias.map((d) => {
+    const movs = (f.movs || []).filter((m) => m.fecha === d.dia);
+    const porTipo = new Map();
+    for (const m of movs) {
+      const k = m.tipoTrabajo || "(sin tipo)";
+      porTipo.set(k, (porTipo.get(k) || 0) + (Number(m.horas) || 0));
+    }
+    const lineas = [...porTipo.entries()].map(([tipo, horas]) => ({ tipo, horas }));
+    const total = movs.length ? movs.reduce((t, m) => t + (Number(m.horas) || 0), 0) : d.horas;
+    return { dia: d.dia, lineas, total };
+  });
+}
+
+function horasTxt(v) {
+  return `${h(v) || "0"} h`;
+}
+
+/** Tabla del correo agrupada por departamento, con sus trabajadores debajo. */
+function construirAvisoHoras({ filas }) {
+  const th = 'style="text-align:left;padding:6px 10px;border-bottom:1px solid #cbd5e1;background:#f8fafc;font-size:12px;color:#475569"';
+  const td = 'style="padding:6px 10px;border-bottom:1px solid #e2e8f0;font-size:13px;vertical-align:top"';
+  const porDepto = new Map();
   for (const f of filas) {
-    const quien = `${f.nombre}`;
-    const cod = f.recurso;
-    for (const x of f.incompletos) {
-      const falta = Math.round((x.jornada - x.horas) * 100) / 100;
-      filasDetalle.push({
-        nombre: quien, recurso: cod, tipo: "incompleto",
-        fecha: fmtF(x.dia), imputado: `${h(x.horas)} h`, jornada: `${h(x.jornada)} h`,
-        obs: `Faltan ${h(falta)} h para completar la jornada`,
-      });
-    }
-    for (const dia of f.sinImputar) {
-      filasDetalle.push({
-        nombre: quien, recurso: cod, tipo: "sinImputar",
-        fecha: fmtF(dia), imputado: "0 h", jornada: "—",
-        obs: "Día laborable sin ninguna hora imputada",
-      });
-    }
-    for (const i of f.incidencias) {
-      const tipoTxt = TIPOS_INCIDENCIA[i.tipo]?.txt || i.tipo;
-      const periodo = i.hasta && i.hasta !== i.desde ? `${fmtF(i.desde)} – ${fmtF(i.hasta)}` : fmtF(i.desde);
-      const extras = [
-        i.tipo === "reduccion" && i.horas ? `${i.horas} h/día` : "",
-        i.motivo || "",
-      ].filter(Boolean).join(" · ");
-      filasDetalle.push({
-        nombre: quien, recurso: cod, tipo: "incidencia",
-        fecha: periodo, imputado: "—", jornada: "—",
-        obs: extras ? `${tipoTxt} · ${extras}` : tipoTxt,
-      });
-    }
+    const depto = f.depto || SIN_DEPTO;
+    if (!porDepto.has(depto)) porDepto.set(depto, []);
+    porDepto.get(depto).push(f);
   }
+  const departamentos = [...porDepto.keys()].sort((a, b) => {
+    if (a === SIN_DEPTO) return 1;
+    if (b === SIN_DEPTO) return -1;
+    return a.localeCompare(b, "es");
+  });
 
-  const nInc = filas.reduce((t, f) => t + f.incompletos.length, 0);
-  const nSin = filas.reduce((t, f) => t + f.sinImputar.length, 0);
-  const nCfg = filas.reduce((t, f) => t + f.incidencias.length, 0);
-
-  const resumenFilas = filas.map((f) => {
-    const partes = [];
-    if (f.incompletos.length) partes.push(`${f.incompletos.length} día(s) incompleto(s)`);
-    if (f.sinImputar.length) partes.push(`${f.sinImputar.length} sin imputar`);
-    if (f.incidencias.length) partes.push(`${f.incidencias.length} incidencia(s)`);
-    return `<tr>
-      <td ${td}><b>${escHtml(f.nombre)}</b><div style="color:#64748b;font-size:11px">${escHtml(f.recurso)}</div></td>
-      <td ${td}>${escHtml(partes.join(" · "))}</td>
-      <td ${tdR}>${f.incompletos.length || "—"}</td>
-      <td ${tdR}>${f.sinImputar.length || "—"}</td>
-      <td ${tdR}>${f.incidencias.length || "—"}</td>
-    </tr>`;
+  const tdSub = 'style="padding:4px 10px 4px 22px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#334155"';
+  const tdNum = 'style="padding:4px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;white-space:nowrap;color:#334155"';
+  const tdTotal = 'style="padding:4px 10px 8px 22px;border-bottom:1px solid #cbd5e1;font-size:12px;font-weight:700;color:#0f172a"';
+  const tdNumBold = 'style="padding:4px 10px 8px;border-bottom:1px solid #cbd5e1;font-size:12px;font-weight:700;text-align:right;white-space:nowrap;color:#0f172a"';
+  const bloques = departamentos.map((depto) => {
+    const lista = porDepto.get(depto).slice().sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+    const n = lista.length;
+    const etiqueta = `${n} incidencia${n === 1 ? "" : "s"}`;
+    const cuerpo = lista.map((f) => {
+      const dias = detalleDias(f);
+      const filasDia = dias.map((d) => {
+        const lineas = d.lineas.length
+          ? d.lineas.map((l) => `<tr>
+              <td ${tdSub}>${escHtml(fmtF(d.dia))} · ${escHtml(l.tipo)}</td>
+              <td ${tdNum}>${escHtml(horasTxt(l.horas))}</td>
+            </tr>`).join("")
+          : `<tr>
+              <td ${tdSub}>${escHtml(fmtF(d.dia))} · sin línea</td>
+              <td ${tdNum}>0 h</td>
+            </tr>`;
+        return `${lineas}<tr>
+          <td ${tdTotal}>${escHtml(fmtF(d.dia))} · Horas totales</td>
+          <td ${tdNumBold}>${escHtml(horasTxt(d.total))}</td>
+        </tr>`;
+      }).join("");
+      return `<tr>
+        <td colspan="2" ${td}><b>${escHtml(f.nombre)}</b> <span style="color:#64748b;font-weight:400;font-size:11px">${escHtml(f.recurso)} · ${escHtml(textoRevision(f))}</span></td>
+      </tr>${filasDia}`;
+    }).join("");
+    return `
+<table style="border-collapse:collapse;width:100%;max-width:720px;font-family:Segoe UI,Arial,sans-serif;margin:16px 0 0">
+  <tr>
+    <td style="background:#0f3a5f;color:#ffffff;padding:8px 12px;font-size:14px;font-weight:700">${escHtml(depto)}</td>
+    <td style="background:#0f3a5f;color:#ffffff;padding:8px 12px;font-size:14px;font-weight:700;text-align:right;white-space:nowrap">${etiqueta}</td>
+  </tr>
+</table>
+<table style="border-collapse:collapse;width:100%;max-width:720px;font-family:Segoe UI,Arial,sans-serif;margin:0 0 8px">
+  <thead><tr>
+    <th ${th}>Día y línea</th>
+    <th ${th} style="text-align:right">Horas</th>
+  </tr></thead>
+  <tbody>${cuerpo}</tbody>
+</table>`;
   }).join("");
 
-  const detalleFilas = filasDetalle.map((r) => `<tr>
-    <td ${td}><b>${escHtml(r.nombre)}</b><div style="color:#64748b;font-size:11px">${escHtml(r.recurso)}</div></td>
-    <td ${td}>${badgeSituacion(r.tipo)}</td>
-    <td ${td} style="white-space:nowrap">${escHtml(r.fecha)}</td>
-    <td ${tdR}>${escHtml(r.imputado)}</td>
-    <td ${tdR}>${escHtml(r.jornada)}</td>
-    <td ${td}>${escHtml(r.obs)}</td>
-  </tr>`).join("");
-
   const htmlDetalle = `
-<div style="margin:16px 0 8px;font-size:13px;color:#334155">
-  <b>Resumen</b> · ${filas.length} trabajador${filas.length === 1 ? "" : "es"} ·
-  ${nInc} día(s) con horas incompletas · ${nSin} día(s) sin imputar · ${nCfg} incidencia(s)
+<div style="margin:16px 0 4px;font-size:13px;color:#334155">
+  <b>${departamentos.length} departamento${departamentos.length === 1 ? "" : "s"}</b>
+  · ${filas.length} trabajador${filas.length === 1 ? "" : "es"} con horas a revisar
 </div>
-<table style="border-collapse:collapse;width:100%;max-width:720px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:18px">
-  <thead><tr>
-    <th ${th}>Trabajador</th>
-    <th ${th}>Qué revisar</th>
-    <th ${th} style="text-align:right">Incompletos</th>
-    <th ${th} style="text-align:right">Sin imputar</th>
-    <th ${th} style="text-align:right">Incidencias</th>
-  </tr></thead>
-  <tbody>${resumenFilas}</tbody>
-</table>
-<div style="margin:8px 0;font-size:13px;color:#334155"><b>Detalle día a día</b></div>
-<table style="border-collapse:collapse;width:100%;max-width:900px;font-family:Segoe UI,Arial,sans-serif">
-  <thead><tr>
-    <th ${th}>Trabajador</th>
-    <th ${th}>Situación</th>
-    <th ${th}>Fecha</th>
-    <th ${th} style="text-align:right">Imputado</th>
-    <th ${th} style="text-align:right">Jornada</th>
-    <th ${th}>Observación</th>
-  </tr></thead>
-  <tbody>${detalleFilas}</tbody>
-</table>
+${bloques}
 <p style="margin:14px 0 0;font-size:12px;color:#64748b">
-  Leyenda: <span style="color:#b45309">■ Faltan horas</span> (amarillo en el cuadro) ·
-  <span style="color:#b91c1c">■ Sin imputar</span> (rojo / laborable vacío) ·
-  Incidencia = apunte de Configuración (día libre, reducción…).
+  En rojo: día laborable sin imputar. En naranja: faltan horas (no validar). El detalle día a día está en el Cuadro de horas.
 </p>`.trim();
 
   const intro = [
-    "Buenos días,",
+    "Estimados Responsables y Técnicos de UN.",
     "",
-    `Os pedimos que reviséis las horas del departamento ${deptoNombre || "—"} en el periodo ${fmtF(desde)} – ${fmtF(hasta)}.`,
+    "Les solicitamos revisar, modificar y validar las horas registradas de los operarios, asegurándose de que cada trabajador tenga registradas sus 8 horas diarias y que cada hora esté correctamente asignada al código de trabajo correspondiente: Horas Normales, Horas Extras, Festivo 1, Festivo 2, Nocturnas, Guardia o Urgencias.",
     "",
-    "Abajo tenéis un resumen por trabajador y el detalle de cada día a revisar (jornada incompleta, laborable sin horas o incidencia).",
+    "Recordar que lo que esta en naranja no se debe validar.",
+    "",
+    "Adjunto link para que puedan ver que días y horas se deben revisar, dichas horas se encuentran marcadas en color rojo en la tabla que aparece en la pestaña horas o directamente en el botón de power Bi del de chat de teams que tienen conmigo. Haz clic",
+    "",
+    "Es importante que esta revisión se realice a la brevedad posible, con el fin de garantizar la correcta imputación en el sistema y evitar inconsistencias en los reportes.",
+    "Agradeceré confirmar una vez finalizada la validación o informarnos si existe alguna observación.",
+    "Quedo atento(a) a sus comentarios.",
   ].join("\n");
 
-  const cierre = [
-    "Por favor, revisadlo en Business Central (Movs. proyecto) o en Control de horas de ACSales y completad o corregid lo que corresponda.",
-    "",
-    "Gracias.",
-    "Un saludo,",
-  ].join("\n");
+  const cierre = "";
 
-  return { intro, cierre, htmlDetalle, nFilasDetalle: filasDetalle.length };
+  return { intro, cierre, htmlDetalle, nFilasDetalle: filas.length };
 }
 
 function ModalCorreoAvisoHoras({ borrador, onCerrar, onEnviado }) {
@@ -345,9 +351,9 @@ function ModalCorreoAvisoHoras({ borrador, onCerrar, onEnviado }) {
     setError(null);
     try {
       const cuerpoHtml = `<div style="font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;line-height:1.45">
-<p style="margin:0 0 12px">${textoAHtml(intro)}</p>
+<p style="margin:0 0 12px">${textoAHtmlConEnlace(intro, borrador.urlCuadro)}</p>
 ${borrador.htmlDetalle || ""}
-<p style="margin:16px 0 0">${textoAHtml(cierre)}</p>
+${cierre.trim() ? `<p style="margin:16px 0 0">${textoAHtmlConEnlace(cierre, borrador.urlCuadro)}</p>` : ""}
 </div>`;
       const r = await fetch("/api/correo/enviar", {
         method: "POST",
@@ -378,7 +384,7 @@ ${borrador.htmlDetalle || ""}
             <div className="text-[11px] text-slate-500">
               {borrador.deptoNombre ? `dpto. ${borrador.deptoNombre}` : "sin departamento"}
               {borrador.nTrabajadores ? ` · ${borrador.nTrabajadores} trabajador${borrador.nTrabajadores === 1 ? "" : "es"}` : ""}
-              {borrador.nFilasDetalle ? ` · ${borrador.nFilasDetalle} líneas de detalle` : ""}
+              {borrador.nFilasDetalle ? ` · ${borrador.nFilasDetalle} trabajador${borrador.nFilasDetalle === 1 ? "" : "es"}` : ""}
               {de ? ` · desde ${de}` : ""}
             </div>
           </div>
@@ -402,8 +408,13 @@ ${borrador.htmlDetalle || ""}
           </label>
           <label className="block">
             <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Introducción</span>
-            <textarea value={intro} onChange={(e) => setIntro(e.target.value)} rows={5}
+            <textarea value={intro} onChange={(e) => setIntro(e.target.value)} rows={12}
               className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] font-sans" />
+            {borrador.urlCuadro && (
+              <p className="mt-1 text-[11px] text-slate-500">
+                Las palabras «Haz clic» se envían como enlace al Cuadro de horas: {borrador.urlCuadro}
+              </p>
+            )}
           </label>
           <div>
             <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Tablas del correo (vista previa)</span>
@@ -456,6 +467,13 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
   // Paso 2: elegir trabajadores → { deptoNombre, filas, seleccionados: { [recurso]: true } }
   const [elegirTrabajadoresAviso, setElegirTrabajadoresAviso] = useState(null);
   const [avisoEnviado, setAvisoEnviado] = useState("");
+  const [gruposBc, setGruposBc] = useState(null);
+  const [gruposError, setGruposError] = useState("");
+  const [tarifasAbierta, setTarifasAbierta] = useState(false);
+  const [pedirClaveTarifas, setPedirClaveTarifas] = useState(false);
+  const [claveTarifas, setClaveTarifas] = useState("");
+  const [claveTarifasError, setClaveTarifasError] = useState("");
+  const [verPlantilla, setVerPlantilla] = useState(false);
   useEffect(() => {
     const esc = (e) => {
       if (e.key !== "Escape") return;
@@ -464,6 +482,8 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
       setAvisoHoras(null);
       setElegirDeptoAviso(null);
       setElegirTrabajadoresAviso(null);
+      setPedirClaveTarifas(false);
+      setVerPlantilla(false);
     };
     window.addEventListener("keydown", esc);
     return () => window.removeEventListener("keydown", esc);
@@ -474,10 +494,64 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
   }, [veTarifas, pestana]);
 
   useEffect(() => {
-    fetch("/api/horas/estado").then((r) => r.json()).then((j) => {
-      if (j.datos) { setDatos(j.datos); setDesde(j.datos.desde); setHasta(j.datos.hasta); }
-      if (j.ajustes) setAjustes((a) => ({ ...a, ...j.ajustes }));
-    }).catch(() => setError({ error: "No se pudo conectar con el backend. ¿Está arrancado (INICIAR.bat)?" }));
+    const irCuadro = () => {
+      const h = window.location.hash || "";
+      if (h === "#/horas" || h.startsWith("#/horas/") || h.startsWith("#/horas?")) {
+        setPestana("cuadro");
+        setPedirClaveTarifas(false);
+      }
+    };
+    window.addEventListener("hashchange", irCuadro);
+    return () => window.removeEventListener("hashchange", irCuadro);
+  }, []);
+
+  function elegirPestana(k) {
+    if (k === "tarifas" && !tarifasAbierta) {
+      setClaveTarifas("");
+      setClaveTarifasError("");
+      setPedirClaveTarifas(true);
+      return;
+    }
+    setPestana(k);
+  }
+
+  function confirmarClaveTarifas(e) {
+    e?.preventDefault();
+    if (claveTarifas.trim().toUpperCase() === CLAVE_TARIFAS) {
+      setTarifasAbierta(true);
+      setPedirClaveTarifas(false);
+      setClaveTarifas("");
+      setClaveTarifasError("");
+      setPestana("tarifas");
+      return;
+    }
+    setClaveTarifasError("Contraseña incorrecta.");
+  }
+
+  const ajustesListos = useRef(false);
+  const [ajustesCargados, setAjustesCargados] = useState(false);
+
+  useEffect(() => {
+    let vivo = true;
+    (async () => {
+      for (let i = 0; i < 8 && vivo; i++) {
+        try {
+          const r = await fetch("/api/horas/estado");
+          if (!r.ok) throw new Error(`estado ${r.status}`);
+          const j = await r.json();
+          if (!vivo) return;
+          if (j.datos) { setDatos(j.datos); setDesde(j.datos.desde); setHasta(j.datos.hasta); }
+          if (j.ajustes) setAjustes((a) => ({ ...a, ...j.ajustes }));
+          ajustesListos.current = true;
+          setAjustesCargados(true);
+          return;
+        } catch {
+          await new Promise((res) => setTimeout(res, 1500));
+        }
+      }
+      if (vivo) setError({ error: "No se pudo conectar con el backend. ¿Está arrancado (INICIAR.bat)?" });
+    })();
+    return () => { vivo = false; };
   }, []);
 
   // Partes con amianto (ALSOAPP) del mismo periodo que las horas de BC
@@ -535,11 +609,18 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     setCargando(false);
   }
   async function guardarAjustes(nuevo) {
+    // Hasta que el servidor haya contestado, no guardar: si no, el formulario
+    // vacío de arranque pisaría la jornada y los festivos ya guardados.
+    if (!ajustesListos.current) return false;
     setAjustes(nuevo);
     try {
-      await fetch("/api/horas/ajustes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(nuevo) });
+      const r = await fetch("/api/horas/ajustes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(nuevo) });
+      if (!r.ok) throw new Error(`ajustes ${r.status}`);
+      const j = await r.json().catch(() => ({}));
+      if (j.ajustes) setAjustes((a) => ({ ...a, ...j.ajustes }));
       setGuardado("Guardado ✓"); setTimeout(() => setGuardado(""), 1500);
-    } catch { setGuardado("No se pudo guardar"); }
+      return true;
+    } catch { setGuardado("No se pudo guardar"); return false; }
   }
 
   // Todos los códigos de tipo de trabajo cuentan (vacaciones, ausencias…), sea cual sea la unidad de medida
@@ -565,6 +646,8 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     if (ds === 0 || ds === 6 || festivos.has(dia)) return 0;
     let base = ds === 5 && ajustes.jornadaViernes ? Number(ajustes.jornadaViernes) : Number(ajustes.jornada) || 8;
     if (recurso) {
+      const alta = datos?.alta?.[recurso];
+      if (alta && dia < alta) return 0; // todavía no estaba de alta
       if (festivosRec[recurso]?.has(dia)) return 0; // festivo específico de este trabajador
       const pob = ajustes.asignacion?.[recurso];
       if (pob && festPobl[pob]?.has(dia)) return 0; // festivo local de su población
@@ -604,7 +687,6 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
       d.total += f.horas;
       r.movs.push({ ...f, cat });
     }
-
     // Cruce ALSOAPP: aceptadas cubren jornada; pendientes solo se anotan.
     // También crea filas de trabajadores que solo tienen ausencia en app (sin movs BC).
     for (const [kRec, porDia] of mapaAusApp.entries()) {
@@ -661,6 +743,23 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
       }
     }
 
+    // En activo = alguna imputación en los 21 días anteriores (lo trae la carga).
+    // Si el periodo elegido no tiene líneas suyas, igual entra: el laborable sale en rojo.
+    const esMaquina = (rec) => /machin|m[aá]quina/i.test(datos.tipoRecurso?.[rec] || "");
+    const entraVacio = (id) => {
+      if (!id || porRec[id] || esMaquina(id)) return;
+      const alta = datos.alta?.[id];
+      if (alta && alta > datos.hasta) return;
+      porRec[id] = { recurso: id, nombre: datos.nombres?.[id] || id, dias: {}, movs: [] };
+    };
+    for (const rec of datos.activos || []) entraVacio(String(rec || "").trim());
+    const defecto = new Set(Object.keys(porRec));
+    const inactivos = new Set((ajustes.inactivos || []).map((id) => String(id)));
+    for (const id of inactivos) delete porRec[id];
+    for (const rec of ajustes.activosForzados || []) {
+      const id = String(rec || "").trim();
+      if (!inactivos.has(id)) entraVacio(id);
+    }
     const lista = Object.values(porRec).map((r) => {
       const t = {
         trabajadas: 0, extras: 0, exceso: 0, ausencias: 0, teoricas: 0,
@@ -704,16 +803,55 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
       tipos[k] ||= { cod: k, horas: 0, movs: 0, unidades: new Set() };
       tipos[k].horas += f.horas; tipos[k].movs++; tipos[k].unidades.add(f.unidad || "—");
     }
-    return { dias, lista, noHoras, tipos: Object.values(tipos).sort((a, b) => b.horas - a.horas), hastaReal };
+    return { dias, lista, noHoras, tipos: Object.values(tipos).sort((a, b) => b.horas - a.horas), hastaReal, defecto };
   }, [datos, ajustes, soloPersonas, mapaAusApp, ausenciasApp]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Departamento = grupo de recurso de la tabla Recursos (misma lectura que mano de obra).
-  const ficha = useMemo(() => indiceRecursos(recursos), [recursos]);
+  // Departamento = grupo de recurso. Primero la tabla Recursos de Cargar datos;
+  // si no está, el grupo que trae la ficha de recurso al cargar las horas.
+  const fichaTabla = useMemo(() => indiceRecursos(recursos), [recursos]);
+  const ficha = useMemo(() => {
+    if (fichaTabla.cargada && fichaTabla.columna) return fichaTabla;
+    const desdeDatos = indiceDesdeGrupos(datos?.grupos);
+    if (desdeDatos.cargada) return desdeDatos;
+    return indiceDesdeGrupos(gruposBc);
+  }, [fichaTabla, datos, gruposBc]);
+
+  useEffect(() => {
+    if (fichaTabla.cargada && fichaTabla.columna) return;
+    if (datos?.grupos && Object.keys(datos.grupos).length) return;
+    if (gruposBc) return;
+    let vivo = true;
+    fetch("/api/horas/grupos")
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({}));
+        if (!vivo) return;
+        if (!r.ok || !j.grupos || !Object.keys(j.grupos).length) {
+          setGruposError(j.error || "No se pudieron leer los departamentos.");
+          return;
+        }
+        setGruposError("");
+        setGruposBc(j.grupos);
+      })
+      .catch(() => { if (vivo) setGruposError("No se pudieron leer los departamentos."); });
+    return () => { vivo = false; };
+  }, [fichaTabla, datos, gruposBc]);
   const deptoListo = ficha.cargada && !!ficha.columna;
   const deptoDe = (recurso) => {
     if (!deptoListo) return "";
     return ficha.mapa.get(String(recurso || "").trim().toUpperCase())?.unidad || SIN_DEPTO;
   };
+  const personasPlantilla = useMemo(() => {
+    if (!datos?.nombres) return [];
+    const esMaquina = (id) => /machin|m[aá]quina/i.test(datos.tipoRecurso?.[id] || "");
+    return Object.entries(datos.nombres)
+      .filter(([id]) => id && !esMaquina(id))
+      .map(([recurso, nombre]) => ({
+        recurso,
+        nombre: nombre || recurso,
+        depto: deptoDe(recurso) || SIN_DEPTO,
+      }))
+      .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+  }, [datos, ficha]); // eslint-disable-line react-hooks/exhaustive-deps
   const deptoActivo = deptoListo ? departamento : "";
   const opcionesDep = calc && deptoListo
     ? [...new Set(calc.lista.map((r) => deptoDe(r.recurso)).filter(Boolean))].sort((a, b) => {
@@ -736,7 +874,7 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     return visibles.map((r) => {
       const a = revisarAnomalias(r, calc.dias, calc.hastaReal, jornadaDia, incPorRec[r.recurso]);
       if (!a.sinImputar.length && !a.incompletos.length && !a.incidencias.length) return null;
-      return { recurso: r.recurso, nombre: r.nombre, depto: deptoDe(r.recurso) || SIN_DEPTO, ...a };
+      return { recurso: r.recurso, nombre: r.nombre, depto: deptoDe(r.recurso) || SIN_DEPTO, movs: r.movs, ...a };
     }).filter(Boolean);
   }, [calc, visibles, incPorRec, deptoListo, departamento]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -748,28 +886,28 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     return partes.join(" · ") || "—";
   }
 
-  function borradorAvisoParaDepto(deptoNombre, recursosSel = null) {
-    let filas = filasAviso.filter((f) => f.depto === deptoNombre);
+  function borradorAvisoParaDepto(deptoNombre, recursosSel = null, { todos = false } = {}) {
+    let filas = todos ? filasAviso.slice() : filasAviso.filter((f) => f.depto === deptoNombre);
     if (recursosSel) {
       const ok = new Set(recursosSel);
       filas = filas.filter((f) => ok.has(f.recurso));
     }
     if (!filas.length || !datos) return null;
-    const codigo = codigoDepartamentoDesdeUnidad(deptoNombre === SIN_DEPTO ? "" : deptoNombre);
-    const { para, cc } = listasCorreoDepartamento(codigo);
-    const { intro, cierre, htmlDetalle, nFilasDetalle } = construirAvisoHoras({
-      deptoNombre, desde: datos.desde, hasta: datos.hasta, filas,
-    });
+    const codigo = todos ? null : codigoDepartamentoDesdeUnidad(deptoNombre === SIN_DEPTO ? "" : deptoNombre);
+    const { para, cc } = todos ? listasCorreoTodosResponsables() : listasCorreoDepartamento(codigo);
+    const { intro, cierre, htmlDetalle, nFilasDetalle } = construirAvisoHoras({ filas });
+    const nombre = todos ? "Todos los departamentos" : deptoNombre;
     return {
       para,
       cc,
-      deptoNombre,
+      deptoNombre: nombre,
       nTrabajadores: filas.length,
       nFilasDetalle,
-      asunto: `Revisión horas · ${deptoNombre} · ${fmtF(datos.desde)}–${fmtF(datos.hasta)}`,
+      asunto: `Revisión horas · ${nombre} · ${fmtF(datos.desde)}–${fmtF(datos.hasta)}`,
       intro,
       cierre,
       htmlDetalle,
+      urlCuadro: urlCuadroHoras(),
     };
   }
 
@@ -798,10 +936,6 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
     const opciones = [...porDep.entries()]
       .map(([nombre, n]) => ({ nombre, n }))
       .sort((a, b) => (a.nombre === SIN_DEPTO ? 1 : b.nombre === SIN_DEPTO ? -1 : a.nombre.localeCompare(b.nombre, "es")));
-    if (opciones.length === 1) {
-      abrirSeleccionTrabajadores(opciones[0].nombre);
-      return;
-    }
     setElegirDeptoAviso({ opciones });
   }
 
@@ -941,13 +1075,14 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
             <div className="flex gap-1">
               {[
                 ["cuadro", "Cuadro de horas"],
+                ["plantilla", "Trabajadores activos"],
                 ["extras", "Extras y ausencias"],
                 ["detalle", "Detalle"],
                 ["tipos", "Tipos de trabajo y jornada"],
                 ["config", "Configuración"],
                 ...(veTarifas ? [["tarifas", "Tarifas y pago"]] : []),
               ].map(([k, t]) => (
-                <button key={k} onClick={() => setPestana(k)} className={`px-4 py-2 text-sm -mb-px border-b-2 ${pestana === k ? "border-blue-700 text-blue-800 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>{t}</button>
+                <button key={k} onClick={() => elegirPestana(k)} className={`px-4 py-2 text-sm -mb-px border-b-2 ${pestana === k ? "border-blue-700 text-blue-800 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>{t}</button>
               ))}
             </div>
             {(pestana === "extras" || (veTarifas && pestana === "tarifas")) && (
@@ -961,14 +1096,17 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
           {(pestana === "cuadro" || pestana === "extras") && (
             <div className="flex flex-wrap items-center gap-3 mt-3 text-sm">
               <input value={buscar} onChange={(e) => setBuscar(e.target.value)} placeholder="Buscar trabajador…" className={`${input} w-56`} />
+              <button type="button" onClick={() => setPestana("plantilla")} className="px-3 py-1.5 rounded bg-blue-700 text-white hover:bg-blue-800">
+                Trabajadores activos
+              </button>
               <label className="flex items-center gap-1 text-slate-600">Departamento
                 <select value={deptoActivo} onChange={(e) => setDepartamento(e.target.value)} disabled={!deptoListo} className={`${input} max-w-[220px]`} title="Grupo de recurso de la tabla Recursos, en Cargar datos">
                   <option value="">Todos</option>
                   {opcionesDep.map((d) => <option key={d} value={d}>{d}</option>)}
                 </select>
               </label>
-              {!ficha.cargada && <span className="text-xs text-amber-700">Para filtrar por departamento, carga la tabla Recursos en Cargar datos.</span>}
-              {ficha.cargada && !ficha.columna && <span className="text-xs text-amber-700">La tabla Recursos no trae el grupo del recurso, así que no se puede saber el departamento.</span>}
+              {!deptoListo && !gruposError && <span className="text-xs text-slate-500">Cargando departamentos…</span>}
+              {!deptoListo && gruposError && <span className="text-xs text-amber-700">{gruposError}</span>}
               <label className="flex items-center gap-1 text-slate-600"><input type="checkbox" checked={soloIncidencias} onChange={(e) => setSoloIncidencias(e.target.checked)} /> Solo con incidencias</label>
               {datos.tipoRecurso && Object.keys(datos.tipoRecurso).length > 0 && (
                 <label className="flex items-center gap-1 text-slate-600"><input type="checkbox" checked={soloPersonas} onChange={(e) => setSoloPersonas(e.target.checked)} /> Solo personas (sin máquinas)</label>
@@ -1240,7 +1378,7 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
           {pestana === "config" && (
             <ConfiguracionHoras ajustes={ajustes} guardarAjustes={guardarAjustes} trabajadores={calc.lista} codigos={calc.tipos.map((t) => t.cod).filter(Boolean)} />
           )}
-          {veTarifas && pestana === "tarifas" && (
+          {veTarifas && tarifasAbierta && pestana === "tarifas" && (
             <TarifasHoras trabajadores={calc.lista} codigos={calc.tipos.map((t) => t.cod || "(sin tipo)")} ajustes={ajustes} desde={datos.desde} hasta={datos.hasta} amianto={amianto} />
           )}
 
@@ -1270,12 +1408,19 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
               <section className="lg:col-span-2 bg-white rounded-xl shadow-sm border border-slate-200 p-4 text-sm grid gap-3 content-start">
                 <div className="font-semibold text-slate-800">Jornada y festivos</div>
                 <label className="flex items-center gap-2">Jornada diaria (lunes a jueves)
-                  <input type="number" step="0.25" value={ajustes.jornada} onChange={(e) => setAjustes({ ...ajustes, jornada: e.target.value })} onBlur={() => guardarAjustes(ajustes)} className={`${input} w-20`} /> h
+                  <input type="number" step="0.25" value={ajustes.jornada} onChange={(e) => setAjustes({ ...ajustes, jornada: e.target.value })} onBlur={(e) => { const n = Number(e.target.value); guardarAjustes({ ...ajustes, jornada: n > 0 ? n : 8 }); }} className={`${input} w-20`} /> h
                 </label>
                 <label className="flex items-center gap-2">Jornada del viernes (vacío = igual)
-                  <input type="number" step="0.25" value={ajustes.jornadaViernes || ""} onChange={(e) => setAjustes({ ...ajustes, jornadaViernes: e.target.value || null })} onBlur={() => guardarAjustes(ajustes)} className={`${input} w-20`} /> h
+                  <input type="number" step="0.25" value={ajustes.jornadaViernes || ""} onChange={(e) => setAjustes({ ...ajustes, jornadaViernes: e.target.value || null })} onBlur={(e) => { const n = Number(e.target.value); guardarAjustes({ ...ajustes, jornadaViernes: n > 0 ? n : null }); }} className={`${input} w-20`} /> h
                 </label>
-                <FestivosLinea ajustes={ajustes} guardarAjustes={guardarAjustes} trabajadores={calc.lista} />
+                {ajustesCargados ? (
+                  <>
+                    <JornadaPorTrabajador ajustes={ajustes} guardarAjustes={guardarAjustes} trabajadores={calc.lista} />
+                    <FestivosLinea ajustes={ajustes} guardarAjustes={guardarAjustes} trabajadores={calc.lista} />
+                  </>
+                ) : (
+                  <p className="text-xs text-slate-400">Cargando la jornada y los festivos guardados…</p>
+                )}
                 <p className="text-xs text-slate-400">Los festivos y fines de semana no cuentan como días sin imputar; si alguien trabaja ese día, sale como exceso.</p>
               </section>
             </div>
@@ -1283,14 +1428,58 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
         </>
       )}
 
+      {pedirClaveTarifas && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setPedirClaveTarifas(false)}>
+          <form className="bg-white rounded-xl shadow-xl w-full max-w-sm" onClick={(e) => e.stopPropagation()} onSubmit={confirmarClaveTarifas}>
+            <div className="px-5 py-4 border-b border-slate-100">
+              <div className="text-sm font-semibold text-slate-800">Tarifas y pago</div>
+              <p className="text-[11px] text-slate-500 mt-1">Esta pestaña está protegida. Escribe la contraseña para entrar.</p>
+            </div>
+            <div className="px-5 py-4">
+              <input
+                type="password"
+                autoFocus
+                value={claveTarifas}
+                onChange={(e) => { setClaveTarifas(e.target.value); setClaveTarifasError(""); }}
+                className="w-full border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                placeholder="Contraseña"
+                autoComplete="off"
+              />
+              {claveTarifasError && <p className="mt-2 text-[12px] text-red-600">{claveTarifasError}</p>}
+            </div>
+            <div className="px-5 py-3 border-t border-slate-100 flex justify-end gap-2">
+              <button type="button" onClick={() => setPedirClaveTarifas(false)} className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50">Cancelar</button>
+              <button type="submit" className="text-sm font-semibold px-4 py-1.5 rounded-lg text-white bg-blue-700 hover:bg-blue-800">Entrar</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {elegirDeptoAviso && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setElegirDeptoAviso(null)}>
           <div className="bg-white rounded-xl shadow-xl w-full max-w-md" onClick={(e) => e.stopPropagation()}>
             <div className="px-5 py-4 border-b border-slate-100">
               <div className="text-sm font-semibold text-slate-800">¿A qué departamento avisar?</div>
-              <p className="text-[11px] text-slate-500 mt-1">Hay incidencias en varios departamentos. Elige uno para preparar el correo a sus responsables.</p>
+              <p className="text-[11px] text-slate-500 mt-1">Elige todos los responsables de la empresa, o un solo departamento.</p>
             </div>
             <ul className="px-3 py-3 space-y-2 max-h-80 overflow-y-auto">
+              <li>
+                <button
+                  type="button"
+                  className="w-full text-left px-4 py-3 text-sm rounded-xl border border-amber-300 bg-amber-50 hover:bg-amber-100 flex justify-between gap-3 items-center"
+                  onClick={() => {
+                    const b = borradorAvisoParaDepto(null, null, { todos: true });
+                    setElegirDeptoAviso(null);
+                    if (b) setAvisoHoras(b);
+                  }}
+                >
+                  <span>
+                    <span className="font-medium text-slate-800 block">Todos los responsables</span>
+                    <span className="text-[11px] text-slate-500">Un correo a todos los responsables de la empresa</span>
+                  </span>
+                  <span className="text-xs text-slate-500 shrink-0">{filasAviso.length} trabajador{filasAviso.length === 1 ? "" : "es"}</span>
+                </button>
+              </li>
               {elegirDeptoAviso.opciones.map((o) => (
                 <li key={o.nombre}>
                   <button
@@ -1461,6 +1650,24 @@ export default function ControlHoras({ recursos = [], usuario = null }) {
             </div>
           </div>
         </div>
+      )}
+      {verPlantilla && calc && (
+        <VentanaPlantilla
+          ajustes={ajustes}
+          guardarAjustes={guardarAjustes}
+          personas={personasPlantilla}
+          defecto={calc.defecto}
+          onCerrar={() => setVerPlantilla(false)}
+        />
+      )}
+      {pestana === "plantilla" && calc && (
+        <VentanaPlantilla
+          embebida
+          ajustes={ajustes}
+          guardarAjustes={guardarAjustes}
+          personas={personasPlantilla}
+          defecto={calc.defecto}
+        />
       )}
     </div>
   );

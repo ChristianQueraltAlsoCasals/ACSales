@@ -461,14 +461,14 @@ class ManejadorPeticiones(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             print("[servicio_registro] El cliente cerró la conexión. El servicio sigue.")
 
-    def _traer_albaranes(self, factura: str, pedido: str) -> dict:
+    def _traer_albaranes(self, factura: str, pedido: str, albaranes=None) -> dict:
         """Si Edge se cae (EPIPE, ventana cerrada), lo reabre una vez y reintenta."""
         from traer_albaranes_compra import traer_albaranes_en_pagina
 
         ultimo = "No se ha podido traer los albaranes."
         for intento in range(2):
             try:
-                return traer_albaranes_en_pagina(asegurar_pagina(), factura, pedido)
+                return traer_albaranes_en_pagina(asegurar_pagina(), factura, pedido, albaranes)
             except Exception as e:
                 ultimo = str(e)
                 if intento == 0 and _corte_navegador(ultimo):
@@ -516,8 +516,11 @@ class ManejadorPeticiones(BaseHTTPRequestHandler):
             if not factura or not pedido:
                 self._responder(400, {"ok": False, "error": "Faltan numero_factura y numero_pedido."})
                 return
-            print(f"[servicio_registro] Traer albaranes {factura} ← {pedido}...")
-            resultado = self._traer_albaranes(factura, pedido)
+            albaranes = datos.get("albaranes") or []
+            if isinstance(albaranes, str):
+                albaranes = [x.strip() for x in albaranes.split(",") if x.strip()]
+            print(f"[servicio_registro] Traer albaranes {factura} ← {pedido}" + (f" ({', '.join(albaranes)})" if albaranes else "") + "...")
+            resultado = self._traer_albaranes(factura, pedido, albaranes or None)
             print(f"[servicio_registro] {factura}: {'OK' if resultado.get('ok') else 'ERROR — ' + str(resultado.get('error'))}")
             self._responder(200 if resultado.get("ok") else 500, resultado)
             return
@@ -543,7 +546,13 @@ class ManejadorPeticiones(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/salud":
-            self._responder(200, {"estado": "activo"})
+            import traer_albaranes_compra as _traer
+            self._responder(200, {
+                "estado": "activo",
+                "carpeta": str(Path(__file__).resolve().parent),
+                "script_traer": str(Path(_traer.__file__).resolve()),
+                "tiene_limpieza_albaran": hasattr(_traer, "dejar_solo_albaranes_pedidos"),
+            })
         else:
             self.send_response(404)
             self.end_headers()

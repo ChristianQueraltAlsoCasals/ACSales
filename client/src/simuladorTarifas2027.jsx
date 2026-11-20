@@ -1,6 +1,6 @@
 /**
  * Simulador de tarifas 2027 — revisió per client sense tocar la tarifa 2026.
- * Fórmula: tarifaObjetivo = (costePrevisto × (1 + % estructura)) / (1 - margenObjetivo).
+ * Fórmula: tarifaObjetivo = costeDirecto / (1 − % estructura − % margen deseado).
  */
 import React, { useEffect, useMemo, useState } from "react";
 import { ArrowLeft, RefreshCw, RotateCcw, Save, Search, SlidersHorizontal } from "lucide-react";
@@ -298,22 +298,21 @@ function PanelOrigenMarge({ cliente, desde, hasta, onTancar }) {
   );
 }
 
-/** Coste MO amb estructura: coste × (1 + pctEstructura). */
-export function costeConEstructura(coste, pctEstructura) {
-  const c = Number(coste);
+/** Part del preu que cobreix el coste: 1 − % estructura − % margen. Null si no és vàlid. */
+export function baseTrasEstructuraYMargen(pctEstructura, margen) {
   const e = Number(pctEstructura);
-  if (!(c > 0)) return null;
-  if (!Number.isFinite(e) || e < 0) return c;
-  return c * (1 + e);
+  const m = Number(margen);
+  if (!Number.isFinite(e) || !Number.isFinite(m) || e < 0 || m < 0) return null;
+  const base = 1 - e - m;
+  return base > 0 ? base : null;
 }
 
-/** tarifaObj = costeConEstructura / (1 - margen) */
+/** tarifaObj = coste directo / (1 − % estructura − % margen deseado) */
 export function tarifaObjetivo(coste, margen, pctEstructura = 0) {
-  const c = costeConEstructura(coste, pctEstructura);
-  const m = Number(margen);
-  if (c == null || !(c > 0) || !(m < 1) || m < 0) return null;
-  if (m >= 0.99) return null;
-  return c / (1 - m);
+  const c = Number(coste);
+  const base = baseTrasEstructuraYMargen(pctEstructura, margen);
+  if (!(c > 0) || base == null) return null;
+  return c / base;
 }
 
 function mediaHNormal(filas) {
@@ -391,18 +390,16 @@ function PanelOrigenLinea({ linea, campo, ctx, onTancar }) {
       titol: "Coste + estructura",
       valor: eur2(linea.costeLin),
       formula:
-        "Coste de la línia = precio actual × (coste MO amb estructura ÷ tarifa de referència H_NORMAL).",
-      font: "El % d'estructura s'aplica al coste previst abans de repartir-lo a cada línia.",
+        "Coste de la línia = precio actual × (coste directo ÷ tarifa de referència H_NORMAL). Estructura = precio actual × % estructura. Suma = coste + estructura.",
+      font: "L'estructura i el margen es resten del preu de venda (fórmula comercial), no s'apliquen com a recàrrec sobre el coste.",
       linies: [
         `Precio actual línia: ${eur2(linea.actual)}`,
-        `Coste MO previst: ${eur2(ctx.costePrevisto)}/h`,
+        `Coste directo previst: ${eur2(ctx.costePrevisto)}/h`,
         `% estructura: ${pct(ctx.pctEstructura)}`,
-        `Coste MO + estructura: ${eur2(ctx.costePrevisto)} × (1 + ${pct(ctx.pctEstructura)}) = ${eur2(ctx.costeTotal)}/h`,
         `Tarifa referència (mitjana H_NORMAL): ${eur2(ctx.tarifaRef)}/h`,
-        `Ratio = ${eur2(ctx.costeTotal)} ÷ ${eur2(ctx.tarifaRef)} = ${
-          ctx.tarifaRef > 0 ? (ctx.costeTotal / ctx.tarifaRef).toLocaleString("es-ES", { maximumFractionDigits: 4 }) : "—"
-        }`,
-        `Coste línia = ${eur2(linea.actual)} × ratio = ${eur2(linea.costeLin)}`,
+        `Coste línia = ${eur2(linea.actual)} × (${eur2(ctx.costePrevisto)} ÷ ${eur2(ctx.tarifaRef)}) = ${eur2(linea.costeDir)}`,
+        `Estructura línia = ${eur2(linea.actual)} × ${pct(ctx.pctEstructura)} = ${eur2(linea.estructuraLin)}`,
+        `Coste + estructura = ${eur2(linea.costeDir)} + ${eur2(linea.estructuraLin)} = ${eur2(linea.costeLin)}`,
       ],
     },
     recomendada: {
@@ -410,11 +407,15 @@ function PanelOrigenLinea({ linea, campo, ctx, onTancar }) {
       valor: eur2(linea.recomendada),
       formula:
         "Recomendada = precio actual × (1 + ajuste %). L'ajust surt de comparar la tarifa objectiu amb la tarifa actual de referència.",
-      font: "Tarifa objectiu = (coste MO + estructura) ÷ (1 − margen objectiu).",
+      font: "Tarifa objectiu = coste directo ÷ (1 − % estructura − % margen deseado).",
       linies: [
-        `Coste MO + estructura: ${eur2(ctx.costeTotal)}/h`,
+        `Coste directo: ${eur2(ctx.costePrevisto)}/h`,
+        `% estructura: ${pct(ctx.pctEstructura)}`,
         `Margen objectiu: ${pct(ctx.margenObjetivo)}`,
-        `Tarifa objectiu = ${eur2(ctx.costeTotal)} ÷ (1 − ${pct(ctx.margenObjetivo)}) = ${eur2(ctx.tarifaObj)}`,
+        `Denominador = 1 − ${pct(ctx.pctEstructura)} − ${pct(ctx.margenObjetivo)} = ${
+          ctx.denom != null ? pct(ctx.denom) : "—"
+        }`,
+        `Tarifa objectiu = ${eur2(ctx.costePrevisto)} ÷ ${ctx.denom != null ? pct(ctx.denom) : "—"} = ${eur2(ctx.tarifaObj)}`,
         `Tarifa actual de referència (simulador): ${eur2(ctx.tarifaActual)}`,
         `Ajuste = ${eur2(ctx.tarifaObj)} ÷ ${eur2(ctx.tarifaActual)} − 1 = ${pctSigned(ctx.ajuste)}`,
         `Recomendada línia = ${eur2(linea.actual)} × (1 + ${pctSigned(ctx.ajuste)}) = ${eur2(linea.recomendada)}`,
@@ -704,25 +705,27 @@ export default function SimuladorTarifas2027({
   const tarifaActual = tarifaActualManual != null ? tarifaActualManual : tarifaRef;
 
   const sim = useMemo(() => {
-    const costeTotal = costeConEstructura(costePrevisto, pctEstructura);
+    const denom = baseTrasEstructuraYMargen(pctEstructura, margenObjetivo);
     const obj = tarifaObjetivo(costePrevisto, margenObjetivo, pctEstructura);
     const margenActual =
-      tarifaActual != null && tarifaActual > 0 && costeTotal != null
-        ? (tarifaActual - costeTotal) / tarifaActual
+      tarifaActual != null && tarifaActual > 0 && costePrevisto > 0
+        ? 1 - costePrevisto / tarifaActual - pctEstructura
         : null;
     const ajuste =
       obj != null && tarifaActual != null && tarifaActual > 0 ? obj / tarifaActual - 1 : null;
-    return { obj, margenActual, ajuste, costeTotal };
+    return { obj, margenActual, ajuste, denom };
   }, [costePrevisto, margenObjetivo, pctEstructura, tarifaActual]);
 
   const lineasSim = useMemo(() => {
-    const costeBase = sim.costeTotal != null ? sim.costeTotal : costePrevisto;
-    const ratioCoste = tarifaRef > 0 ? costeBase / tarifaRef : null;
+    const ratioCoste = tarifaRef > 0 && costePrevisto > 0 ? costePrevisto / tarifaRef : null;
     const factor = sim.ajuste != null ? 1 + sim.ajuste : null;
     return (filasTarifa || []).map((f) => {
       const key = `${f.producto}|${f.tipoTrabajo}`;
       const actual = Number(f.precio) || 0;
-      const costeLin = ratioCoste != null ? actual * ratioCoste : null;
+      const costeDir = ratioCoste != null ? actual * ratioCoste : null;
+      const estructuraLin = Number.isFinite(pctEstructura) ? actual * pctEstructura : null;
+      const costeLin =
+        costeDir != null && estructuraLin != null ? costeDir + estructuraLin : costeDir;
       const recomendada = factor != null ? actual * factor : null;
       const variacion = actual > 0 && recomendada != null ? recomendada / actual - 1 : null;
       const aprobada = aprobadas[key] != null ? aprobadas[key] : recomendada;
@@ -732,13 +735,15 @@ export default function SimuladorTarifas2027({
         descripcion: f.descripcion,
         tipoTrabajo: f.tipoTrabajo,
         actual,
+        costeDir,
+        estructuraLin,
         costeLin,
         recomendada,
         variacion,
         aprobada,
       };
     });
-  }, [filasTarifa, tarifaRef, costePrevisto, sim.costeTotal, sim.ajuste, aprobadas]);
+  }, [filasTarifa, tarifaRef, costePrevisto, pctEstructura, sim.ajuste, aprobadas]);
 
   const restablecerEjemplo = () => {
     setCostePrevisto(DEF_COSTE_2027);
@@ -834,7 +839,7 @@ export default function SimuladorTarifas2027({
 
         <SeccioXR
           titol="Simulador de tarifas 2027"
-          sub="Tarifa objetivo = (coste MO × (1 + % estructura)) ÷ (1 − margen objetivo)."
+          sub="Tarifa objetivo = coste directo ÷ (1 − % estructura − % margen deseado)."
         >
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-4">
             <label className="text-sm">
@@ -875,8 +880,10 @@ export default function SimuladorTarifas2027({
                 onChange={(e) => setPctEstructura(Number(e.target.value))}
                 className="w-full mt-1"
               />
-              <div className="text-[10px] text-slate-500 mt-0.5">
-                Coste + estructura: {eur2(sim.costeTotal)}/h
+              <div className={`text-[10px] mt-0.5 ${sim.denom == null ? "text-amber-700" : "text-slate-500"}`}>
+                {sim.denom == null
+                  ? "Estructura + margen ≥ 100 % (fórmula no vàlida)"
+                  : `1 − estr. − margen = ${pct(sim.denom)}`}
               </div>
             </label>
             <label className="text-sm">
@@ -896,11 +903,11 @@ export default function SimuladorTarifas2027({
 
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3 text-sm">
             <div className="xr-note sky">
-              <div className="text-[10px] uppercase text-slate-500 font-semibold">Coste MO + estructura</div>
-              <div className="font-bold text-lg">{eur2(sim.costeTotal)}</div>
+              <div className="text-[10px] uppercase text-slate-500 font-semibold">Coste directo</div>
+              <div className="font-bold text-lg">{eur2(costePrevisto)}</div>
             </div>
             <div className="xr-note sky">
-              <div className="text-[10px] uppercase text-slate-500 font-semibold">Margen actual</div>
+              <div className="text-[10px] uppercase text-slate-500 font-semibold">Margen actual (després d&apos;estructura)</div>
               <div className="font-bold text-lg">{pct(sim.margenActual)}</div>
             </div>
             <div className="xr-note sky">
@@ -913,11 +920,13 @@ export default function SimuladorTarifas2027({
                 {pctSigned(sim.ajuste)}
               </div>
               <div className="text-xs text-slate-600 mt-0.5">
-                {sim.ajuste != null && sim.ajuste > 0.01
-                  ? "La tarifa actual no alcanza el margen objetivo"
-                  : sim.ajuste != null && sim.ajuste < -0.01
-                    ? "La tarifa actual supera el margen objetivo"
-                    : "La tarifa actual está alineada con el objetivo"}
+                {sim.denom == null
+                  ? "Revisa estructura y margen (suma ≥ 100 %)"
+                  : sim.ajuste != null && sim.ajuste > 0.01
+                    ? "La tarifa actual no alcanza el margen objetivo"
+                    : sim.ajuste != null && sim.ajuste < -0.01
+                      ? "La tarifa actual supera el margen objetivo"
+                      : "La tarifa actual está alineada con el objetivo"}
               </div>
             </div>
           </div>
@@ -1042,7 +1051,7 @@ export default function SimuladorTarifas2027({
                     usaEspecial: !!tarifasInfo?.usaEspecial,
                     costePrevisto,
                     pctEstructura,
-                    costeTotal: sim.costeTotal,
+                    denom: sim.denom,
                     tarifaRef,
                     tarifaActual,
                     margenObjetivo,
@@ -1136,54 +1145,59 @@ export default function SimuladorTarifas2027({
                 </thead>
                 <tbody>
                   {listado.map((c) => (
-                    <tr
-                      key={c.clave}
-                      className={`cursor-pointer hover:bg-cyan-50/60 ${origenMargeClave === c.clave ? "bg-cyan-50/40" : ""}`}
-                      onClick={() => setClienteSel(c)}
-                    >
-                      <td>
-                        <div className="font-medium">{c.nombre}</div>
-                        {c.codigo ? <div className="text-xs text-slate-400 font-mono">{c.codigo}</div> : null}
-                      </td>
-                      <td className="text-right tabular-nums">{eur2(c.neta)}</td>
-                      <td className="text-right">
-                        <button
-                          type="button"
-                          title="Veure d'on surt aquest marge"
-                          className={`tabular-nums font-semibold underline decoration-dotted underline-offset-2 ${
-                            c.margenPct != null && c.margenPct < 0
-                              ? "text-red-700"
-                              : c.margenPct != null && c.margenPct < margenObjetivo
-                                ? "text-amber-800"
-                                : "text-slate-800"
-                          }`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setOrigenMargeClave((prev) => (prev === c.clave ? null : c.clave));
-                          }}
-                        >
-                          {pct(c.margenPct)}
-                        </button>
-                      </td>
-                      <td className="text-right tabular-nums">{pct(margenObjetivo)}</td>
-                      <td>
-                        <span className={`inline-block px-2 py-0.5 rounded border text-xs font-semibold ${badgeCls(c.recomendacion.tono)}`}>
-                          {c.recomendacion.etiqueta}
-                        </span>
-                      </td>
-                    </tr>
+                    <React.Fragment key={c.clave}>
+                      <tr
+                        className={`cursor-pointer hover:bg-cyan-50/60 ${origenMargeClave === c.clave ? "bg-cyan-50/40" : ""}`}
+                        onClick={() => setClienteSel(c)}
+                      >
+                        <td>
+                          <div className="font-medium">{c.nombre}</div>
+                          {c.codigo ? <div className="text-xs text-slate-400 font-mono">{c.codigo}</div> : null}
+                        </td>
+                        <td className="text-right tabular-nums">{eur2(c.neta)}</td>
+                        <td className="text-right">
+                          <button
+                            type="button"
+                            title="Clic per veure com es calcula aquest marge"
+                            className={`inline-block px-2 py-0.5 rounded border text-xs font-semibold tabular-nums ${
+                              c.margenPct != null && c.margenPct < 0
+                                ? "text-red-700 bg-red-50 border-red-200"
+                                : c.margenPct != null && c.margenPct < margenObjetivo
+                                  ? "text-amber-800 bg-amber-50 border-amber-200"
+                                  : "text-slate-800 bg-slate-50 border-slate-200"
+                            }`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOrigenMargeClave((prev) => (prev === c.clave ? null : c.clave));
+                            }}
+                          >
+                            {pct(c.margenPct)}
+                          </button>
+                        </td>
+                        <td className="text-right tabular-nums">{pct(margenObjetivo)}</td>
+                        <td>
+                          <span className={`inline-block px-2 py-0.5 rounded border text-xs font-semibold ${badgeCls(c.recomendacion.tono)}`}>
+                            {c.recomendacion.etiqueta}
+                          </span>
+                        </td>
+                      </tr>
+                      {origenMargeClave === c.clave ? (
+                        <tr className="bg-slate-50/80">
+                          <td colSpan={5} className="p-3">
+                            <PanelOrigenMarge
+                              cliente={c}
+                              desde={desde}
+                              hasta={hasta}
+                              onTancar={() => setOrigenMargeClave(null)}
+                            />
+                          </td>
+                        </tr>
+                      ) : null}
+                    </React.Fragment>
                   ))}
                 </tbody>
               </table>
             </div>
-            {origenMargeClave && (
-              <PanelOrigenMarge
-                cliente={listado.find((x) => x.clave === origenMargeClave)}
-                desde={desde}
-                hasta={hasta}
-                onTancar={() => setOrigenMargeClave(null)}
-              />
-            )}
           </>
         )}
       </SeccioXR>

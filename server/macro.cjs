@@ -25,15 +25,19 @@ const INDICADORES_INICIALES = [
   { id: "salarios", nombre: "Costes salariales", que: "Evolución de salarios", afecta: "Incrementa directamente el coste por hora trabajado", valor: "3.388 €/trabajador/mes (+4,0 % anual)", fecha: "2026-T2", fuente: "INE ETCL, 17/09/2026", url: "https://www.ine.es/dyngs/INEbase/operacion.htm?c=Estadistica_C&cid=1254736045053&idp=1254735976596" },
   { id: "convenio", nombre: "Convenio colectivo", que: "Subidas salariales obligatorias", afecta: "Puede reducir margen si no actualizas precio/hora", valor: "+3,04 % subida media pactada", fecha: "2026-08", fuente: "Ministerio de Trabajo", url: "https://www.infobae.com/espana/agencias/2026/09/10/los-salarios-en-convenio-suben-un-304-hasta-agosto-con-la-inflacion-disparada-al-43/" },
   { id: "ss", nombre: "Cotizaciones a la Seguridad Social", que: "Coste empresarial del trabajador", afecta: "Aumenta el coste laboral real", valor: "CC 23,60 % empresa · MEI 0,75 % · base máx. 5.101,20 €/mes", fecha: "2026", fuente: "Orden de cotización 2026", url: "https://www.cuatrecasas.com/es/spain/laboral/art/claves-orden-cotizacion-2026" },
-  { id: "bce", nombre: "Tipos de interés del BCE", que: "Coste general de financiación", afecta: "Puede encarecer préstamos, pólizas y leasing", valor: "2,50 % facilidad de depósito (+0,25 desde 16/09)", fecha: "2026-09-16", fuente: "BCE", url: "https://www.ecb.europa.eu/press/pr/date/2026/html/ecb.mp260910~314e508016.es.html" },
   { id: "euribor", nombre: "Euríbor", que: "Coste de financiación variable", afecta: "Puede aumentar gastos financieros", valor: "3,218 % media septiembre (3,331 % hoy)", fecha: "2026-09-24", fuente: "euribordiario.es", url: "https://www.euribordiario.es/" },
   { id: "eurusd", nombre: "Tipo de cambio EUR/USD", que: "Valor del euro frente al dólar", afecta: "Puede encarecer materiales importados", valor: "1,1426 USD por €", fecha: "2026-09-23", fuente: "Infobae / BCE", url: "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A" },
   { id: "transporte", nombre: "Coste del transporte", que: "Coste logístico", afecta: "Proveedores pueden trasladarlo a sus precios", valor: "1,42 €/km articulado; combustible +14,4 % anual", fecha: "2026-T2", fuente: "Observatorio de costes (Mº Transportes) / Fenadismer", url: "https://www.fenadismer.es/continuan-los-incrementos-de-costes-pero-tambien-de-actividad-del-transporte-en-2-trimestre-2026/" },
-  { id: "pib", nombre: "PIB", que: "Evolución general de la economía", afecta: "Si cae, puede reducirse la inversión y el volumen de trabajo", valor: "+0,7 % trimestral · +2,7 % anual", fecha: "2026-T2", fuente: "INE", url: "https://www.ine.es/dyngs/Prensa/avCNTR2T26.htm" },
+  { id: "pib", nombre: "PIB", que: "Evolución general de la economía", afecta: "Si cae, puede reducirse la inversión y el volumen de trabajo", valor: "+0,6 % trimestral · +2,7 % anual", fecha: "2026-T3", fuente: "INE", url: "https://www.ine.es/dyngs/Prensa/es/avCNTR3T26.htm" },
+  { id: "deficit", nombre: "Déficit público", que: "Necesidad de financiación de las Administraciones Públicas", afecta: "Condiciona impuestos, obra pública y clima de inversión", valor: "1,75 % del PIB (AAPP sin EELL, acumulado)", fecha: "2026-08", fuente: "Hacienda / IGAE", url: "https://www.hacienda.gob.es/en-GB/Prensa/Noticias/Paginas/2026/20261030-NP-DEFICIT-SEPTIEMBRE.aspx" },
+  { id: "deuda", nombre: "Deuda pública", que: "Deuda de las AAPP según Protocolo de Déficit Excesivo", afecta: "Influye en tipos soberanos y coste de financiación del país", valor: "99,7 % del PIB (1,75 billones €)", fecha: "2026-08", fuente: "Banco de España", url: "https://www.bde.es/wbe/es/noticias-eventos/actualidad-banco-espana/deuda-aapp-agosto26.html" },
   { id: "ipi", nombre: "Producción industrial", que: "Actividad de la industria", afecta: "Muy útil si trabajáis con clientes industriales", valor: "+2,6 % anual (corregido +2,3 %)", fecha: "2026-07", fuente: "INE, 10/09/2026", url: "https://www.ine.es/prensa/ipi_tabla.htm" },
   { id: "construccion", nombre: "Actividad de la construcción", que: "Evolución del sector construcción", afecta: "Puede anticipar más o menos demanda", valor: "−9,8 % anual (edificación −35,2 %, obra civil −4,6 %)", fecha: "2026-07", fuente: "INE IPCO, 14/09/2026", url: "https://www.ine.es/dyngs/INEbase/operacion.htm?c=Estadistica_C&cid=1254736177119&idp=1254735576757" },
   { id: "confianza", nombre: "Confianza empresarial", que: "Expectativas de las empresas", afecta: "Si baja, los clientes pueden posponer inversiones", valor: "+3,2 % trimestral (23 % favorables / 13,9 % desfavorables)", fecha: "2026-T3", fuente: "INE ICE", url: "https://www.ine.es/dyngs/Prensa/ICE3T26.htm" },
-  { id: "paro", nombre: "Desempleo", que: "Situación del mercado laboral", afecta: "Puede indicar desaceleración o dificultad para contratar personal", valor: "9,87 % (2.495.300 parados)", fecha: "2026-T2", fuente: "INE EPA", url: "https://www.ine.es/dyngs/Prensa/EPA2T26.htm" },
+  { id: "paro", nombre: "Desempleo (EPA)", que: "Situación del mercado laboral", afecta: "Puede indicar desaceleración o dificultad para contratar personal", valor: "10,18 % tasa de paro", fecha: "2026-T3", fuente: "INE EPA", url: "https://www.ine.es/dyngs/Prensa/EPA3T26.pdf" },
+  { id: "paro_mes", nombre: "Paro registrado (mes en curso)", que: "Desempleados inscritos en el SEPE el último mes publicado", afecta: "Señal mensual del mercado laboral (contratación, clima)", valor: "2.422.633 (+43.128 · +1,81 % mensual)", fecha: "2026-10", fuente: "SEPE / Ministerio de Trabajo", url: "https://www.lamoncloa.gob.es/serviciosdeprensa/notasprensa/trabajo14/Paginas/2026/041126-paro-registrado-octubre.aspx" },
+  { id: "paro_mes_ant", nombre: "Paro registrado (mes anterior)", que: "Desempleados inscritos en el SEPE el mes previo", afecta: "Comparativa inmediata del mes en curso", valor: "2.379.505 (+23.587 · +1,00 % mensual)", fecha: "2026-09", fuente: "SEPE / Ministerio de Trabajo", url: "https://www.lamoncloa.gob.es/serviciosdeprensa/notasprensa/trabajo14/paginas/2026/021026-paro-registrado-septiembre.aspx" },
+  { id: "bce", nombre: "Tipos de interés del BCE", que: "Coste general de financiación", afecta: "Puede encarecer préstamos, pólizas y leasing", valor: "2,50 % facilidad de depósito", fecha: "2026-10", fuente: "BCE", url: "https://www.ecb.europa.eu/" },
   {
     id: "impagos",
     nombre: "Impagos / retraso de cobro",
@@ -47,26 +51,36 @@ const INDICADORES_INICIALES = [
   },
 ];
 
+const CLAVE_MACRO = "indicadores_macro";
+
+async function leerIndicadores(db) {
+  const guardados = await db.getDoc(CLAVE_MACRO, {});
+  const lista = INDICADORES_INICIALES.map((ind) => ({ ...ind, ...(guardados.indicadores?.[ind.id] || {}) }));
+  return { indicadores: lista, actualizado: guardados.actualizado || "2026-09-24", origen: guardados.origen || "Valores iniciales (24/09/2026)" };
+}
+
+async function guardarIndicadores(db, cambios, origen) {
+  const g = await db.getDoc(CLAVE_MACRO, {});
+  g.indicadores = g.indicadores || {};
+  for (const [id, c] of Object.entries(cambios)) {
+    if (!INDICADORES_INICIALES.some((i) => i.id === id)) continue;
+    const limpio = {};
+    for (const k of ["valor", "fecha", "fuente", "url"]) if (c[k] != null) limpio[k] = String(c[k]).slice(0, 300);
+    g.indicadores[id] = { ...(g.indicadores[id] || {}), ...limpio };
+  }
+  g.actualizado = new Date().toISOString().slice(0, 10);
+  g.origen = origen;
+  await db.setDoc(CLAVE_MACRO, g);
+}
+
 module.exports = function montarMacro({ app, fetchConReintento, db }) {
-  const CLAVE = "indicadores_macro";
+  const CLAVE = CLAVE_MACRO;
 
   async function leer() {
-    const guardados = await db.getDoc(CLAVE, {});
-    const lista = INDICADORES_INICIALES.map((ind) => ({ ...ind, ...(guardados.indicadores?.[ind.id] || {}) }));
-    return { indicadores: lista, actualizado: guardados.actualizado || "2026-09-24", origen: guardados.origen || "Valores iniciales (24/09/2026)" };
+    return leerIndicadores(db);
   }
   async function guardar(cambios, origen) {
-    const g = await db.getDoc(CLAVE, {});
-    g.indicadores = g.indicadores || {};
-    for (const [id, c] of Object.entries(cambios)) {
-      if (!INDICADORES_INICIALES.some((i) => i.id === id)) continue;
-      const limpio = {};
-      for (const k of ["valor", "fecha", "fuente", "url"]) if (c[k] != null) limpio[k] = String(c[k]).slice(0, 300);
-      g.indicadores[id] = { ...(g.indicadores[id] || {}), ...limpio };
-    }
-    g.actualizado = new Date().toISOString().slice(0, 10);
-    g.origen = origen;
-    await db.setDoc(CLAVE, g);
+    return guardarIndicadores(db, cambios, origen);
   }
 
   app.get("/api/macro/indicadores", async (req, res) => res.json(await leer()));
@@ -198,3 +212,7 @@ module.exports = function montarMacro({ app, fetchConReintento, db }) {
     }
   });
 };
+
+module.exports.leerIndicadores = leerIndicadores;
+module.exports.guardarIndicadores = guardarIndicadores;
+module.exports.INDICADORES_INICIALES = INDICADORES_INICIALES;
