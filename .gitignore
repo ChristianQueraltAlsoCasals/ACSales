@@ -38,3 +38,5 @@ data/datos_empresas_grupo.json
 ChatGPT.url
 *.zip
 backups/
+
+bc_automation/_perfil_cdp_tmp/
