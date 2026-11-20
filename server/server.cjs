@@ -85,6 +85,7 @@ const { router: authRouter, requiereSesion } = require("./auth");
 const { prepararRecepcionAlbaran, crearPedidoPreparado } = require("./recepcionPreparar.cjs");
 const acfactory = require("./acfactory-client.cjs");
 const { soloControlHoras } = require("./permisos");
+const { prepararLogoCorreo } = require("./logoCliente.cjs");
 app.use("/api/auth", authRouter);
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) return next();
@@ -491,6 +492,41 @@ app.get("/api/bc/cliente-email", async (req, res) => {
   }
 });
 
+// Logo de la ficha del cliente (imagen de BC), recortado y pequeño, para el
+// correo a los encargados. Si el cliente no tiene imagen, logo = null.
+app.get("/api/bc/cliente-logo", async (req, res) => {
+  const numero = String(req.query.numero || "").trim();
+  const nombre = String(req.query.nombre || "").trim();
+  if (!numero && !nombre) return res.json({ logo: null });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/customers`;
+    const auth = { Authorization: `Bearer ${token}` };
+    const esc = (v) => v.replace(/'/g, "''");
+    const buscar = async (filtro) => {
+      const r = await fetchConReintento(`${base}?$filter=${encodeURIComponent(filtro)}&$select=id,number,displayName&$top=5`, { headers: auth });
+      if (!r.ok) return [];
+      return ((await r.json()).value) || [];
+    };
+    let cli = null;
+    if (numero) cli = (await buscar(`number eq '${esc(numero)}'`))[0] || null;
+    if (!cli && nombre) cli = (await buscar(`displayName eq '${esc(nombre)}'`))[0] || null;
+    if (!cli) return res.json({ logo: null });
+    const metaR = await fetchConReintento(`${base}(${cli.id})/picture`, { headers: { ...auth, Accept: "application/json" } });
+    if (!metaR.ok) return res.json({ logo: null });
+    const meta = await metaR.json();
+    if (!(meta.width > 0) || !(meta.height > 0)) return res.json({ logo: null });
+    const cr = await fetchConReintento(`${base}(${cli.id})/picture/pictureContent`, { headers: auth });
+    if (!cr.ok) return res.json({ logo: null });
+    const bytes = Buffer.from(await cr.arrayBuffer());
+    const logo = prepararLogoCorreo(bytes, meta.contentType || "");
+    res.json(logo ? { ...logo, cliente: cli.displayName || nombre } : { logo: null });
+  } catch (err) {
+    console.warn("[cliente-logo]", err.message);
+    res.json({ logo: null });
+  }
+});
+
 // PDF oficial de una factura de venta registrada (API v2.0, pdfDocument).
 async function leerPdfBC(url, headers) {
   const r = await fetchConReintento(url, { headers });
@@ -591,33 +627,122 @@ async function unirAlbaranYParte(albaranBuf, parteBuf) {
 
 // PDF del albarán de venta registrado (histórico), no del pedido.
 // En BC se localiza por Nº documento externo, que en la app es Doc. extern
-// (p. ej. PV26-001682 → 93746-2026 → ALBV26-002117). Detrás se añade el
-// parte de trabajo de app.alsocasals.com (93746-26).
+// (p. ej. PV26-001682 → 93746-2026 → ALBV26-002117). Si el pedido se
+// registró con otro externo (el del albarán no coincide con el del PV),
+// se busca también por número de pedido. Detrás se añade el parte de
+// trabajo de app.alsocasals.com (93746-26).
+function numeroAlbaran(number) {
+  const m = String(number || "").match(/(\d+)(?!.*\d)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+function albaranMasAlto(lista) {
+  let mejor = null;
+  for (const s of lista || []) {
+    if (!mejor) { mejor = s; continue; }
+    const a = numeroAlbaran(s.number);
+    const b = numeroAlbaran(mejor.number);
+    if (a > b || (a === b && String(s.number || "") > String(mejor.number || ""))) mejor = s;
+  }
+  return mejor;
+}
+
+// Del mismo pedido puede haber dos albaranes (ALBV26-003705 y ALBV26-003827).
+// El bueno es el de número más alto.
+function quedarAlbaranMasAltoPorPedido(lista) {
+  const porPedido = new Map();
+  const sinPedido = [];
+  for (const s of lista || []) {
+    const ped = String(s.orderNumber || "").trim();
+    if (!ped) { sinPedido.push(s); continue; }
+    const prev = porPedido.get(ped);
+    porPedido.set(ped, prev ? albaranMasAlto([prev, s]) : s);
+  }
+  return [...porPedido.values(), ...sinPedido];
+}
+
+async function listarAlbaranesVenta(base, auth, filtro) {
+  const busca = await fetchConReintento(
+    `${base}/salesShipments?$filter=${encodeURIComponent(filtro)}&$select=id,number,externalDocumentNumber,orderNumber,postingDate&$top=50`,
+    { headers: auth }
+  );
+  if (!busca.ok) {
+    const detalle = await busca.text();
+    return { ok: false, status: busca.status, detalle: detalle.slice(0, 400), lista: [] };
+  }
+  return { ok: true, lista: (await busca.json()).value || [] };
+}
+
+// PDF ya generado, unos minutos, para abrirlo con el nombre del albarán (101412-2026M.pdf).
+const pdfAlbaranTemporal = new Map();
+function guardarPdfAlbaranTemporal(nombre, base64) {
+  const ahora = Date.now();
+  for (const [id, item] of pdfAlbaranTemporal) {
+    if (item.exp < ahora) pdfAlbaranTemporal.delete(id);
+  }
+  const id = require("crypto").randomBytes(12).toString("hex");
+  const archivo = String(nombre || "albaran.pdf").replace(/[^\w.-]+/g, "_");
+  pdfAlbaranTemporal.set(id, { buf: Buffer.from(base64, "base64"), nombre: archivo, exp: ahora + 5 * 60 * 1000 });
+  return `/api/bc/albaran-venta-pdf/archivo/${id}/${encodeURIComponent(archivo)}`;
+}
+
+app.get("/api/bc/albaran-venta-pdf/archivo/:id/:nombre", (req, res) => {
+  const item = pdfAlbaranTemporal.get(String(req.params.id || ""));
+  if (!item || item.exp < Date.now()) {
+    pdfAlbaranTemporal.delete(String(req.params.id || ""));
+    return res.status(404).type("text/plain").send("El PDF ya no está disponible. Vuelve a abrirlo desde el pedido.");
+  }
+  const nombre = item.nombre || "albaran.pdf";
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `inline; filename="${nombre}"; filename*=UTF-8''${encodeURIComponent(nombre)}`);
+  res.send(item.buf);
+});
+
 app.get("/api/bc/albaran-venta-pdf", async (req, res) => {
   const externo = String(req.query.externo || "").trim();
   const pedido = String(req.query.pedido || "").trim();
   const numero = String(req.query.numero || "").trim();
-  if (!externo) return res.status(400).json({ error: "Falta el nº de documento externo del albarán." });
+  if (!externo && !pedido) return res.status(400).json({ error: "Falta el nº de documento externo o el pedido." });
   try {
     const token = await obtenerTokenBC();
     const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
     const auth = { Authorization: `Bearer ${token}` };
-    const esc = externo.replace(/'/g, "''");
-    const busca = await fetchConReintento(
-      `${base}/salesShipments?$filter=${encodeURIComponent(`externalDocumentNumber eq '${esc}'`)}&$select=id,number,externalDocumentNumber,orderNumber,postingDate&$top=50`,
-      { headers: auth }
-    );
-    if (!busca.ok) {
-      const detalle = await busca.text();
-      return res.status(502).json({ error: `BC respondió ${busca.status} buscando el albarán.`, detalle: detalle.slice(0, 400) });
+    const mapa = new Map();
+    const meter = (lista) => {
+      for (const s of lista || []) if (s?.id && !mapa.has(s.id)) mapa.set(s.id, s);
+    };
+    if (externo) {
+      const porExterno = await listarAlbaranesVenta(base, auth, `externalDocumentNumber eq '${externo.replace(/'/g, "''")}'`);
+      if (!porExterno.ok && !pedido) {
+        return res.status(502).json({ error: `BC respondió ${porExterno.status} buscando el albarán.`, detalle: porExterno.detalle });
+      }
+      if (porExterno.ok) meter(porExterno.lista);
     }
-    let lista = ((await busca.json()).value || []).slice();
+    if (pedido) {
+      const porPedido = await listarAlbaranesVenta(base, auth, `orderNumber eq '${pedido.replace(/'/g, "''")}'`);
+      if (!porPedido.ok && mapa.size === 0) {
+        return res.status(502).json({ error: `BC respondió ${porPedido.status} buscando el albarán del pedido.`, detalle: porPedido.detalle });
+      }
+      if (porPedido.ok) meter(porPedido.lista);
+    }
+    let lista = [...mapa.values()];
     lista.sort((a, b) => String(b.postingDate || "").localeCompare(String(a.postingDate || "")));
     if (pedido) {
       const delPedido = lista.filter((s) => String(s.orderNumber || "") === pedido);
       if (delPedido.length) lista = delPedido;
     }
     if (numero) lista = lista.filter((s) => String(s.number || "") === numero);
+    let avisoElegido = "";
+    if (!numero && lista.length > 1) {
+      const antes = lista.slice();
+      lista = quedarAlbaranMasAltoPorPedido(lista);
+      const quedan = new Set(lista.map((s) => s.id));
+      const fuera = antes.filter((s) => !quedan.has(s.id)).map((s) => s.number).filter(Boolean);
+      if (fuera.length === antes.length - lista.length && lista.length === 1) {
+        const todos = [lista[0].number, ...fuera].filter(Boolean).sort();
+        avisoElegido = `De este pedido había varios albaranes (${todos.join(", ")}). Se usa ${lista[0].number}, el de número más alto.`;
+      }
+    }
     if (!lista.length) {
       return res.status(404).json({
         error: `No hay albarán de venta con documento externo ${externo}${pedido ? ` del pedido ${pedido}` : ""} en el histórico de Business Central.`,
@@ -639,29 +764,53 @@ app.get("/api/bc/albaran-venta-pdf", async (req, res) => {
     for (const accept of ["application/pdf", "application/octet-stream"]) {
       const got = await leerPdfBC(`${raiz}/pdfDocumentContent`, { ...auth, Accept: accept });
       if (got.ok) {
-        const docExterno = shipment.externalDocumentNumber || externo;
+        const docAlbaran = String(shipment.externalDocumentNumber || "").trim();
+        const candidatosParte = [];
+        for (const c of [externo, docAlbaran]) {
+          const t = String(c || "").trim();
+          if (t && !candidatosParte.includes(t)) candidatosParte.push(t);
+        }
+        const docExterno = docAlbaran || externo;
         let base64 = got.base64;
         let parte = "";
-        let aviso = "";
+        let aviso = [
+          avisoElegido,
+          docAlbaran && externo && docAlbaran !== externo
+            ? `El albarán ${shipment.number} figura en BC con el documento externo ${docAlbaran}. El pedido tiene ${externo}.`
+            : "",
+        ].filter(Boolean).join(" ");
         let paginas = null;
+        let material = null;
         try {
-          const bajado = await descargarParteAlso(docExterno);
+          let bajado = { ok: false, aviso: "" };
+          for (const c of candidatosParte) {
+            bajado = await descargarParteAlso(c);
+            if (bajado.ok) break;
+          }
           if (bajado.ok && PDFDocument) {
             const unido = await unirAlbaranYParte(Buffer.from(got.base64, "base64"), bajado.buf);
             base64 = unido.buf.toString("base64");
             parte = bajado.codigo;
             paginas = unido.paginas;
+            try {
+              material = await require("./compararParteAlbaran.cjs").compararParteYAlbaran(Buffer.from(got.base64, "base64"), bajado.buf);
+            } catch (errCmp) {
+              aviso = aviso || `No se ha podido comparar el material. ${errCmp.message || ""}`.trim();
+            }
           } else if (bajado.aviso) {
-            aviso = bajado.aviso;
+            aviso = [aviso, bajado.aviso].filter(Boolean).join(" ");
           } else if (bajado.ok && !PDFDocument) {
-            aviso = "No se ha podido unir el parte: falta pdf-lib. El PDF solo lleva el albarán.";
+            aviso = [aviso, "No se ha podido unir el parte: falta pdf-lib. El PDF solo lleva el albarán."].filter(Boolean).join(" ");
           }
         } catch (errParte) {
-          aviso = `No se ha podido añadir el parte de trabajo. El PDF solo lleva el albarán. ${errParte.message || ""}`.trim();
+          aviso = [aviso, `No se ha podido añadir el parte de trabajo. El PDF solo lleva el albarán. ${errParte.message || ""}`.trim()].filter(Boolean).join(" ");
         }
-        const nombre = `Albaran_${String(shipment.number || externo).replace(/[^\w.-]+/g, "_")}${parte ? `_parte_${parte}` : ""}.pdf`;
+        const nombreBase = String(docExterno || shipment.number || externo || "albaran").trim().replace(/[^\w.-]+/g, "_");
+        const nombre = `${nombreBase || "albaran"}.pdf`;
+        const url = guardarPdfAlbaranTemporal(nombre, base64);
         return res.json({
           nombre,
+          url,
           base64,
           mime: "application/pdf",
           albaran: shipment.number,
@@ -670,6 +819,7 @@ app.get("/api/bc/albaran-venta-pdf", async (req, res) => {
           parte: parte || null,
           paginas,
           aviso: aviso || null,
+          material,
         });
       }
       ultimo = got;
@@ -677,6 +827,46 @@ app.get("/api/bc/albaran-venta-pdf", async (req, res) => {
     return res.status(502).json({ error: ultimo?.error || "Business Central no ha devuelto el PDF del albarán.", detalle: ultimo?.detalle || "" });
   } catch (err) {
     res.status(500).json({ error: "No se pudo obtener el PDF del albarán.", detalle: String(err.message || err) });
+  }
+});
+
+app.post("/api/bc/albaranes-por-pedido", async (req, res) => {
+  const pedidos = [];
+  const vistos = new Set();
+  for (const item of Array.isArray(req.body?.pedidos) ? req.body.pedidos : []) {
+    const n = String(item || "").trim();
+    if (!n || vistos.has(n)) continue;
+    vistos.add(n);
+    pedidos.push(n);
+    if (pedidos.length >= 40) break;
+  }
+  if (!pedidos.length) return res.json({ albaranes: {} });
+  try {
+    const token = await obtenerTokenBC();
+    const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})`;
+    const auth = { Authorization: `Bearer ${token}` };
+    const albaranes = {};
+    const lote = 5;
+    for (let i = 0; i < pedidos.length; i += lote) {
+      const grupo = pedidos.slice(i, i + lote);
+      const listas = await Promise.all(grupo.map(async (pedido) => {
+        const r = await listarAlbaranesVenta(base, auth, `orderNumber eq '${pedido.replace(/'/g, "''")}'`);
+        if (!r.ok) return { pedido, error: r.detalle || `BC ${r.status}` };
+        const s = albaranMasAlto(r.lista || []);
+        return {
+          pedido,
+          ref: s ? {
+            externo: String(s.externalDocumentNumber || "").trim(),
+            albaran: s.number || "",
+            fecha: s.postingDate || "",
+          } : null,
+        };
+      }));
+      for (const item of listas) albaranes[item.pedido] = item.ref === undefined ? null : item.ref;
+    }
+    res.json({ albaranes });
+  } catch (err) {
+    res.status(500).json({ error: "No se pudieron localizar los albaranes.", detalle: String(err.message || err) });
   }
 });
 
@@ -1835,6 +2025,168 @@ app.get("/api/buzon/mensaje/:id", async (req, res) => {
   }
 });
 
+// Correos ENVIADOS desde el buzón de quien está logueado que mencionan una OT.
+// Busca en Enviados (asunto y cuerpo) y completa con el resto de enviados del mismo hilo.
+function patronesCorreoOT(codigo, numero) {
+  const cod = String(codigo || "").trim().toUpperCase();
+  const deNumero = String(numero || "").replace(/\D/g, "");
+  const deCodigo = (cod.match(/(\d{3,6})(?=\/\d{4}$)/) || cod.match(/(\d{3,6})/) || [])[1] || "";
+  const n = parseInt(deNumero || deCodigo, 10);
+  const pad = n ? String(n).padStart(6, "0") : "";
+  const pref = (cod.match(/^([A-Z]{2,4})/) || [])[1] || "";
+  const anio = (cod.match(/\/(\d{4})$/) || [])[1] || "";
+  const frases = new Set();
+  if (cod.length >= 4) frases.add(cod);
+  if (pref && pad) {
+    frases.add(`${pref}${pad}`);
+    if (anio) frases.add(`${pref}${pad}/${anio}`);
+  }
+  if (pref && n && String(n) !== pad) frases.add(`${pref}${n}`);
+  if (n) {
+    frases.add(`OT ${n}`);
+    if (pad && pad !== String(n)) frases.add(`OT ${pad}`);
+    frases.add(`OT: ${pad || n}`);
+  }
+  return [...frases].filter((p) => p.length >= 4);
+}
+
+function mencionaCorreoOT(texto, patrones) {
+  const t = String(texto || "");
+  return patrones.some((p) => {
+    const esc = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?<![A-Za-z0-9])${esc}(?![A-Za-z0-9])`, "i").test(t);
+  });
+}
+
+function seQuedaCorreoOT(m, patrones) {
+  const texto = `${m.subject || ""}\n${m.bodyPreview || ""}`;
+  if (mencionaCorreoOT(texto, patrones)) return true;
+  const codigos = texto.match(/\b[A-Z]{2,4}\d{5,6}\/\d{4}\b/gi) || [];
+  if (!codigos.length) return true;
+  return codigos.some((c) => mencionaCorreoOT(c, patrones));
+}
+
+function kqlCorreoOT(patrones) {
+  const partes = patrones.map((p) => {
+    const limpio = String(p).replace(/"/g, "");
+    return /[\s/:.]/.test(limpio) ? `"${limpio}"` : limpio;
+  });
+  return `"${partes.join(" OR ").replace(/"/g, '\\"')}"`;
+}
+
+function resumirEnviadoOT(m) {
+  return {
+    id: m.id,
+    asunto: m.subject || "(sin asunto)",
+    para: (m.toRecipients || []).map((t) => t.emailAddress?.address).filter(Boolean),
+    cc: (m.ccRecipients || []).map((t) => t.emailAddress?.address).filter(Boolean),
+    fecha: m.sentDateTime || m.receivedDateTime || "",
+    adjuntos: !!m.hasAttachments,
+    preview: String(m.bodyPreview || "").replace(/\s+/g, " ").trim().slice(0, 280),
+    enlace: m.webLink || "",
+  };
+}
+
+async function buscarEnviadosOT(token, buzon, expresion) {
+  const headers = { Authorization: `Bearer ${token}`, ConsistencyLevel: "eventual" };
+  const sel = "id,subject,toRecipients,ccRecipients,sentDateTime,receivedDateTime,hasAttachments,bodyPreview,webLink,conversationId";
+  let url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/sentitems/messages?$search=${encodeURIComponent(expresion)}&$select=${sel}&$top=25`;
+  const mensajes = [];
+  const ids = new Set();
+  let paginas = 0;
+  let hayMas = false;
+  while (url && paginas < 8 && mensajes.length < 200) {
+    const r = await fetchConReintento(url, { headers });
+    if (!r.ok) {
+      const detalle = (await r.text()).slice(0, 400);
+      const err = new Error(`Graph respondió ${r.status}: ${detalle}`);
+      err.status = r.status;
+      throw err;
+    }
+    const j = await r.json();
+    for (const m of j.value || []) {
+      if (ids.has(m.id)) continue;
+      ids.add(m.id);
+      mensajes.push(m);
+    }
+    url = j["@odata.nextLink"] || "";
+    paginas += 1;
+    if (url && (paginas >= 8 || mensajes.length >= 200)) hayMas = true;
+  }
+  return { mensajes, hayMas };
+}
+
+async function enviadosDelHiloOT(token, buzon, conversationId) {
+  const headers = { Authorization: `Bearer ${token}` };
+  const sel = "id,subject,toRecipients,ccRecipients,sentDateTime,receivedDateTime,hasAttachments,bodyPreview,webLink,conversationId";
+  const filtro = `conversationId eq '${String(conversationId).replace(/'/g, "''")}'`;
+  const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(buzon)}/mailFolders/sentitems/messages?$filter=${encodeURIComponent(filtro)}&$select=${sel}&$top=30`;
+  const r = await fetchConReintento(url, { headers });
+  if (!r.ok) return [];
+  const j = await r.json();
+  return j.value || [];
+}
+
+app.get("/api/correo/ot-enviados", async (req, res) => {
+  if (!process.env.M365_CLIENT_SECRET) {
+    return res.status(503).json({ error: "Falta configurar M365_* en .env." });
+  }
+  const codigo = String(req.query.codigo || "").trim();
+  const numero = String(req.query.numero || "").trim();
+  const patrones = patronesCorreoOT(codigo, numero);
+  if (!patrones.length) return res.status(400).json({ error: "Falta el código de la OT." });
+  try {
+    const buzon = await buzonDelUsuario(req, res);
+    if (!buzon) return;
+    const token = await obtenerTokenGraph();
+    const tokenSimple = patrones.find((p) => /^[A-Z]{2,4}\d{6}$/.test(p)) || patrones.find((p) => /^[A-Z0-9]+$/.test(p));
+    let encontrados;
+    try {
+      encontrados = await buscarEnviadosOT(token, buzon, kqlCorreoOT(patrones));
+    } catch (err) {
+      if (!tokenSimple || err.status !== 400) throw err;
+      console.warn("[correo/ot-enviados] búsqueda amplia rechazada, reintento con", tokenSimple);
+      encontrados = await buscarEnviadosOT(token, buzon, `"${tokenSimple}"`);
+    }
+    const semillas = encontrados.mensajes.filter((m) => seQuedaCorreoOT(m, patrones));
+    const porId = new Map(semillas.map((m) => [m.id, m]));
+    const hilos = [...new Set(semillas.map((m) => m.conversationId).filter(Boolean))].slice(0, 25);
+    for (let i = 0; i < hilos.length; i += 4) {
+      const grupo = hilos.slice(i, i + 4);
+      const listas = await Promise.all(grupo.map((id) => enviadosDelHiloOT(token, buzon, id).catch(() => [])));
+      for (const lista of listas) {
+        for (const m of lista) if (!porId.has(m.id)) porId.set(m.id, m);
+      }
+    }
+    const mensajes = [...porId.values()].map(resumirEnviadoOT).sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
+    console.log(`[correo/ot-enviados] ${buzon} ${codigo || numero}: ${mensajes.length} enviados`);
+    res.json({ buzon, mensajes, hayMas: encontrados.hayMas });
+  } catch (err) {
+    console.error("Error /api/correo/ot-enviados:", err);
+    res.status(500).json({ error: "No se pudieron leer los correos enviados.", detalle: String(err.message || err) });
+  }
+});
+
+function adjuntoLogoCliente(logo) {
+  if (!logo?.base64) return null;
+  let bytes;
+  try {
+    bytes = Buffer.from(String(logo.base64).replace(/\s/g, ""), "base64");
+  } catch {
+    return null;
+  }
+  const listo = prepararLogoCorreo(bytes, logo.mime);
+  if (!listo) return null;
+  return {
+    "@odata.type": "#microsoft.graph.fileAttachment",
+    name: listo.mime === "image/jpeg" ? "logo-cliente.jpg" : "logo-cliente.png",
+    contentType: listo.mime,
+    contentBytes: listo.base64,
+    contentId: "logo-cliente",
+    isInline: true,
+  };
+}
+
 function adjuntoFirmaCorreo() {
   try {
     const bytes = require("fs").readFileSync(path.join(__dirname, "public", "firma-correo.png"));
@@ -1859,7 +2211,7 @@ app.post("/api/correo/enviar", async (req, res) => {
   if (!process.env.M365_CLIENT_SECRET) {
     return res.status(503).json({ error: "Falta configurar M365_* en .env." });
   }
-  const { para, cc, asunto, cuerpoHtml, adjunto, adjuntos: adjuntosPedido, incluirFirma, respuestaA } = req.body || {};
+  const { para, cc, asunto, cuerpoHtml, adjunto, adjuntos: adjuntosPedido, incluirFirma, respuestaA, logoCliente } = req.body || {};
   const destinatarios = Array.isArray(para) ? para.filter(Boolean) : [];
   const enPara = new Set(destinatarios.map((e) => String(e).trim().toLowerCase()));
   const copiasVistas = new Set();
@@ -1936,6 +2288,7 @@ app.post("/api/correo/enviar", async (req, res) => {
       body: body === undefined ? undefined : JSON.stringify(body),
     }, 1);
     const firma = incluirFirma ? adjuntoFirmaCorreo() : null;
+    const logoAdj = adjuntoLogoCliente(logoCliente);
 
     if (respuestaA) {
       const creado = await graph(`${base}/messages/${encodeURIComponent(respuestaA)}/createReply`, "POST", {});
@@ -1954,6 +2307,10 @@ app.post("/api/correo/enviar", async (req, res) => {
       if (firma) {
         const af = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", firma);
         if (!af.ok) console.warn("[correo/enviar] firma no adjuntada", af.status);
+      }
+      if (logoAdj) {
+        const al = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", logoAdj);
+        if (!al.ok) console.warn("[correo/enviar] logo no adjuntado", al.status);
       }
       for (const f of ficheros) {
         const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", f);
@@ -1990,6 +2347,10 @@ app.post("/api/correo/enviar", async (req, res) => {
         const af = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", firma);
         if (!af.ok) console.warn("[correo/enviar] firma no adjuntada", af.status);
       }
+      if (logoAdj) {
+        const al = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", logoAdj);
+        if (!al.ok) console.warn("[correo/enviar] logo no adjuntado", al.status);
+      }
       for (const f of ficheros) {
         const aa = await graph(`${base}/messages/${encodeURIComponent(draft.id)}/attachments`, "POST", f);
         if (!aa.ok) {
@@ -2010,6 +2371,7 @@ app.post("/api/correo/enviar", async (req, res) => {
     }
     const adjuntos = [];
     if (firma) adjuntos.push(firma);
+    if (logoAdj) adjuntos.push(logoAdj);
     for (const f of ficheros) adjuntos.push(f);
     if (adjuntos.length) mensaje.attachments = adjuntos;
     const url = `${base}/sendMail`;
@@ -2060,6 +2422,49 @@ app.post("/api/avisos", async (req, res) => {
   } catch (err) {
     console.error("Error guardando avisos:", err);
     res.status(500).json({ error: "No se pudo guardar los avisos." });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Comercial: clientes en seguimiento, tarifa de presupuesto y correos.
+// Un documento por empresa (Also Casals → "comercial"; otra → comercial_slug).
+// ---------------------------------------------------------------------
+const COMERCIAL_VACIO = { contactos: [], tarifa: [], presupuestos: [], actualizado: null };
+
+function documentoComercial(body) {
+  const b = body && typeof body === "object" ? body : {};
+  const lista = (v, tope) => (Array.isArray(v) ? v.slice(0, tope) : []);
+  return {
+    contactos: lista(b.contactos, 5000),
+    tarifa: lista(b.tarifa, 20000),
+    presupuestos: lista(b.presupuestos, 5000),
+    actualizado: new Date().toISOString(),
+  };
+}
+
+app.get("/api/comercial", async (req, res) => {
+  try {
+    const doc = await db.getDoc(claveEmpresa("comercial"), COMERCIAL_VACIO);
+    res.json({
+      contactos: Array.isArray(doc.contactos) ? doc.contactos : [],
+      tarifa: Array.isArray(doc.tarifa) ? doc.tarifa : [],
+      presupuestos: Array.isArray(doc.presupuestos) ? doc.presupuestos : [],
+      actualizado: doc.actualizado || null,
+    });
+  } catch (err) {
+    console.error("Error leyendo comercial:", err);
+    res.status(500).json({ error: "No se pudo leer el seguimiento comercial." });
+  }
+});
+
+app.post("/api/comercial", async (req, res) => {
+  try {
+    const doc = documentoComercial(req.body);
+    await db.setDoc(claveEmpresa("comercial"), doc);
+    res.json(doc);
+  } catch (err) {
+    console.error("Error guardando comercial:", err);
+    res.status(500).json({ error: "No se pudo guardar el seguimiento comercial." });
   }
 });
 
@@ -9730,10 +10135,11 @@ app.post("/api/facturas-compra/bandeja/procesada", async (req, res) => {
 // ---------------------------------------------------------------------
 require("./iaBC.cjs")({ app, obtenerTokenBC, fetchConReintento, db });
 require("./contabilidad.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, EMPRESA_NOMBRE, db, claveEmpresa });
+require("./panelInicial.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_ID, leerPdfBC, fetchParteAlso });
 require("./macro.cjs")({ app, fetchConReintento, db });
 const BUZON_PERSONAL = () => process.env.M365_BUZON_PERSONAL || "maria.rufi@alsocasals.com";
 require("./correoPC.cjs")({ app, obtenerTokenGraph, fetchConReintento, leerRecep, escribirRecep, BUZON_PERSONAL });
-require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL });
+require("./pedidosVentaSeguimiento.cjs")({ app, db, claveEmpresa, obtenerTokenGraph, fetchConReintento, BUZON_PERSONAL, buzonDelUsuario });
 require("./teamsChatbot.cjs")({ app, db, obtenerTokenGraph, fetchConReintento });
 require("./horas.cjs")({ app, obtenerTokenBC, fetchConReintento, EMPRESA_NOMBRE, EMPRESA_ID, db, claveEmpresa });
 require("./recepcionFirmas.cjs")({
@@ -9747,7 +10153,28 @@ require("./recepcionFirmas.cjs")({
   escribirRecep,
   leerVistaPdf: leerVistaPdfRecepcion,
 });
-require("./ofertasComparar.cjs").registrar({ app, fetchConReintento });
+async function buscarArticulosOferta(filtro) {
+  const token = await obtenerTokenBC();
+  const base = `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}/api/v2.0/companies(${EMPRESA_ID()})/items`;
+  const r = await fetchConReintento(
+    `${base}?$filter=${encodeURIComponent(filtro)}&$top=80&$select=number,displayName,blocked`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!r.ok) throw new Error(`BC respondió ${r.status} al buscar artículos.`);
+  return ((await r.json()).value || []).map((it) => ({
+    numero: it.number,
+    descripcion: it.displayName || "",
+    blocked: !!it.blocked,
+  }));
+}
+require("./ofertasComparar.cjs").registrar({
+  app,
+  fetchConReintento,
+  buscarArticulos: buscarArticulosOferta,
+  empresaNombre: EMPRESA_NOMBRE,
+  db,
+  claveEmpresa,
+});
 require("./albaranVentaCorreo.cjs").registrarRutas({
   app,
   obtenerTokenBC,

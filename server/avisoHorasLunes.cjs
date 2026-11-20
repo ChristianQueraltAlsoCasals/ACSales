@@ -29,19 +29,10 @@ const AUSENCIA = new Set(["vacaciones", "baja", "festivo", "permiso"]);
 const SIN_DEPTO = "Sin departamento";
 
 const PARA = [
-  "albert.curto@alsocasals.com",
-  "alex.lopez@alsocasals.com",
-  "jesus.calvo@alsocasals.com",
-  "gabriel.galvez@alsocasals.com",
-  "jordi.costea@alsocasals.com",
-  "ramon.castell@alsocasals.com",
-  "josep.altadill@alsocasals.com",
-];
-const CC = [
-  "ana.moreno@ferrosca.com",
   "edith.galvez@alsocasals.com",
   "maria.rufi@alsocasals.com",
 ];
+const CC = [];
 
 function esc(v) {
   return String(v ?? "")
@@ -375,7 +366,7 @@ function programar({ db }) {
   };
   setTimeout(tick, 30000);
   setInterval(tick, 60 * 1000);
-  console.log(`[aviso-horas] Cada lunes y el día 7 a las ${String(hora).padStart(2, "0")}:00 (Europe/Madrid) → responsables. Periodo: mes abierto hasta el día 7 del mes siguiente. Excepción: no se envía el 2026-11-07.`);
+  console.log(`[aviso-horas] Cada lunes y el día 7 a las ${String(hora).padStart(2, "0")}:00 (Europe/Madrid) → ${PARA.join(", ")}. Periodo: mes abierto hasta el día 7 del mes siguiente. Excepción: no se envía el 2026-11-07.`);
 }
 
 module.exports = { periodoRevision, preparar, enviar, programar, diaSemana };

@@ -15,6 +15,7 @@
  */
 import React, { useState, useMemo, useEffect } from "react";
 import { Search, ArrowLeft, TrendingDown, Users, Mail } from "lucide-react";
+import ComparadorOfertas from "./comparadorOfertas";
 import { historialVentaArticulo } from "./agenteInteligente.js";
 import {
   cargarMapeoArticulos,
@@ -157,6 +158,33 @@ export default function Precios({ lineas, pedidos }) {
   }, [historialVenta]);
 
   const c = useMemo(() => (lineas?.headers?.length ? cols(lineas.headers) : null), [lineas]);
+
+  const comprasPorCodigo = useMemo(() => {
+    if (!c || !lineas?.rows?.length) return {};
+    const por = {};
+    for (const r of lineas.rows) {
+      const doc = String(r[c.doc] || "").trim();
+      if (!/^pc/i.test(doc)) continue;
+      const cod = String(r[c.cod] || "").trim();
+      if (!cod) continue;
+      const neto = precioNeto(r, c);
+      if (isNaN(neto) || neto <= 0) continue;
+      const compra = {
+        fecha: c.fecha ? String(r[c.fecha] || "").trim().slice(0, 10) : "",
+        proveedor: String(r[c.prov] || "").trim(),
+        precio: Math.round(neto * 10000) / 10000,
+        documento: doc,
+        cantidad: parseNum(r[c.cant]),
+        ot: String(r[c.ot] || "").trim(),
+        codigo: cod,
+      };
+      const fam = mapeoOk ? familiaDe(cod) : { codigos: [cod] };
+      for (const k of new Set([cod, ...(fam.codigos || [])].filter(Boolean))) {
+        (por[k] ||= []).push(compra);
+      }
+    }
+    return por;
+  }, [c, lineas, mapeoOk]);
   const cp = useMemo(() => (pedidos?.headers?.length ? colsPedidos(pedidos.headers) : null), [pedidos]);
 
   // comprador por nº de pedido (PC)
@@ -644,6 +672,7 @@ export default function Precios({ lineas, pedidos }) {
         <div className="mt-6 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-800">
           Carga las «Líneas de Compra» en «Cargar datos» para analizar el histórico de precios.
         </div>
+        <ComparadorOfertas comprasPorCodigo={comprasPorCodigo} />
       </div>
     );
   }
@@ -875,6 +904,7 @@ export default function Precios({ lineas, pedidos }) {
             </div>
           </>
         )}
+        <ComparadorOfertas comprasPorCodigo={comprasPorCodigo} />
       </div>
     );
   }
@@ -979,6 +1009,8 @@ export default function Precios({ lineas, pedidos }) {
           </p>
         </div>
       )}
+
+      <ComparadorOfertas comprasPorCodigo={comprasPorCodigo} />
 
       {/* POP-UP: ofertas de compra (OC) del mismo artículo + OT */}
       {ofertas && (

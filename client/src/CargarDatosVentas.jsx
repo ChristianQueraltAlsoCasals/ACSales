@@ -36,7 +36,8 @@ import {
   SlidersHorizontal,
   Calendar,
   Shirt,
-  Scale,
+  Briefcase,
+  LayoutDashboard,
 } from "lucide-react";
 import TeamsPendentsCampana from "./teamsPendents.jsx";
 import SimuladorTarifas2027 from "./simuladorTarifas2027.jsx";
@@ -76,10 +77,12 @@ import { excelValoracionPresupuesto as generarExcelValoracion } from "./excelVal
 import Recepcion from "./recepcion.jsx";
 import FacturasCompra from "./facturasCompra.jsx";
 import FacturasVenta from "./facturasVenta.jsx";
+import PanelInicial from "./panelInicial.jsx";
 import AnalisisCliente from "./analisisCliente.jsx";
 import Precios from "./precios.jsx";
 import { EMAILS_DEPARTAMENTO, listasCorreoDepartamento, aplicarRemitente } from "./departamentos.js";
 import Correo from "./correo.jsx";
+import Comercial from "./comercial.jsx";
 import Tareas from "./tareas.jsx";
 import Calendario from "./calendario.jsx";
 import ChatIA from "./chatIA.jsx";
@@ -87,8 +90,7 @@ import Ratios from "./ratios.jsx";
 import IAFlotante from "./iaFlotante.jsx";
 import ControlHoras from "./horas.jsx";
 import Ropa from "./ropa.jsx";
-import ComparadorOfertas from "./comparadorOfertas.jsx";
-import { SelectorEmpresa, empresaGuardada } from "./empresa.jsx";
+import { SelectorEmpresa, empresaGuardada, esEmpresaQuimlab } from "./empresa.jsx";
 import { soloControlHoras } from "./permisos.js";
 import VistaPartesPendents, { construirInformePartes, resumenCorreoOT } from "./partesPendentsFacturar.jsx";
 import Papa from "papaparse";
@@ -2293,6 +2295,9 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
   const [enviando, setEnviando] = useState(false);
   const [error, setError] = useState(null);
   const [de, setDe] = useState("");
+  const [logo, setLogo] = useState(null);
+  const logoRef = useRef(null);
+  const logoListo = useRef(!String(borrador.cliente || "").trim());
 
   useEffect(() => {
     let vivo = true;
@@ -2307,6 +2312,19 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
         setCc(aj.cc.join("; "));
       })
       .catch(() => {});
+    const nombreLogo = String(borrador.cliente || "").trim();
+    if (nombreLogo) {
+      const qs = new URLSearchParams({ nombre: nombreLogo });
+      fetch(`/api/bc/cliente-logo?${qs}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          const listo = d?.base64 ? d : null;
+          logoRef.current = listo;
+          logoListo.current = true;
+          if (vivo && listo) setLogo(listo);
+        })
+        .catch(() => { logoListo.current = true; });
+    }
     return () => { vivo = false; };
   }, []); // el borrador es el de al abrir; no reescribir si el padre se repinta
 
@@ -2330,13 +2348,25 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
     setEnviando(true);
     setError(null);
     try {
+      if (!logoListo.current) {
+        await new Promise((resolve) => {
+          const t = setInterval(() => {
+            if (logoListo.current) { clearInterval(t); resolve(); }
+          }, 40);
+          setTimeout(() => { clearInterval(t); resolve(); }, 4000);
+        });
+      }
+      const logoEnvio = logoRef.current;
       const intro = cuerpo
         .split(/\r?\n/)
         .map((l) => (l ? l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "<br/>"))
         .join("<br/>");
-      const cuerpoHtml = borrador.htmlRevision
-        ? `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;">${intro}</div>${borrador.htmlRevision}`
-        : intro;
+      const logoHtml = logoEnvio?.base64
+        ? `<p style="margin:0 0 12px 0;"><img src="cid:logo-cliente" alt="" width="${logoEnvio.ancho}" height="${logoEnvio.alto}" style="width:${logoEnvio.ancho}px;height:${logoEnvio.alto}px;border:0;display:block;"></p>`
+        : "";
+      const cuerpoHtml = (borrador.htmlRevision
+        ? `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1f2937;">${logoHtml}${intro}</div>${borrador.htmlRevision}`
+        : `${logoHtml}${intro}`);
       const ficheros = [
         ...((borrador.adjuntosExtra || []).filter((a) => a?.base64)),
         ...(borrador.adjunto?.base64 ? [borrador.adjunto] : []),
@@ -2349,6 +2379,7 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
           cc: copias,
           asunto: asunto.trim(),
           cuerpoHtml,
+          ...(logoEnvio?.base64 ? { logoCliente: { base64: logoEnvio.base64, mime: logoEnvio.mime } } : {}),
           ...(ficheros.length > 1 ? { adjuntos: ficheros } : { adjunto: ficheros[0] || null }),
         }),
       });
@@ -2377,10 +2408,23 @@ function ModalCorreoResponsableOT({ borrador, onCerrar, onEnviado, sinAdjunto = 
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 flex-shrink-0 bg-white rounded-t-lg">
           <div>
             <div className="text-sm font-semibold text-slate-800">{titulo || "Correo al responsable"} · OT {borrador.num}</div>
-            <div className="text-[11px] text-slate-500">
-              {borrador.noBC}{borrador.cliente ? ` · ${borrador.cliente}` : ""}
-              {borrador.departamento ? ` · dpto. ${borrador.departamento}` : ""}
-              {de ? ` · desde ${de}` : ""}
+            <div className="text-[11px] text-slate-500 flex items-center gap-2">
+              {logo?.base64 && (
+                <img
+                  src={`data:${logo.mime};base64,${logo.base64}`}
+                  alt=""
+                  width={logo.ancho}
+                  height={logo.alto}
+                  title="Este logo se añade arriba del correo"
+                  className="inline-block rounded bg-white"
+                  style={{ height: logo.alto, width: logo.ancho }}
+                />
+              )}
+              <span>
+                {borrador.noBC}{borrador.cliente ? ` · ${borrador.cliente}` : ""}
+                {borrador.departamento ? ` · dpto. ${borrador.departamento}` : ""}
+                {de ? ` · desde ${de}` : ""}
+              </span>
             </div>
           </div>
           <button type="button" onClick={onCerrar} className="p-1 text-slate-400 hover:text-slate-700" aria-label="Cerrar">
@@ -2578,6 +2622,183 @@ function BotonCorreoFacturacion({ ficha, onRegistrado, dif = null, valoracion = 
         />
       )}
     </span>
+  );
+}
+
+function fechaCorreoEnviado(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function listaDestinatarios(arr) {
+  const lista = (arr || []).filter(Boolean);
+  if (!lista.length) return "—";
+  if (lista.length <= 2) return lista.join(", ");
+  return `${lista.slice(0, 2).join(", ")} +${lista.length - 2}`;
+}
+
+function PanelCorreosEnviadosOT({ ficha, onCerrar }) {
+  const codigo = codigoOTParaBC(ficha);
+  const [mensajes, setMensajes] = useState(null);
+  const [buzon, setBuzon] = useState("");
+  const [error, setError] = useState(null);
+  const [hayMas, setHayMas] = useState(false);
+  const [detalle, setDetalle] = useState(null);
+  const [cargandoDetalle, setCargandoDetalle] = useState(false);
+
+  useEffect(() => {
+    const prevBody = document.body.style.overflow;
+    const prevHtml = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevBody;
+      document.documentElement.style.overflow = prevHtml;
+    };
+  }, []);
+
+  useEffect(() => {
+    let vivo = true;
+    const qs = new URLSearchParams({ codigo, numero: String(ficha.numeroOT || "") });
+    fetch(`/api/correo/ot-enviados?${qs}`)
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detalle || d.error || `Error ${r.status}`);
+        return d;
+      })
+      .then((d) => {
+        if (!vivo) return;
+        setMensajes(d.mensajes || []);
+        setBuzon(d.buzon || "");
+        setHayMas(!!d.hayMas);
+      })
+      .catch((e) => { if (vivo) setError(e.message || String(e)); });
+    return () => { vivo = false; };
+  }, [codigo, ficha.numeroOT]);
+
+  const abrirMensaje = async (id) => {
+    setCargandoDetalle(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/buzon/mensaje/${encodeURIComponent(id)}`);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detalle || d.error || `Error ${r.status}`);
+      setDetalle(d);
+    } catch (e) {
+      setError(e.message || String(e));
+    }
+    setCargandoDetalle(false);
+  };
+
+  const cuerpoHtml = detalle
+    ? (/html/i.test(detalle.tipoCuerpo || "") || /<[a-z!]/i.test(detalle.cuerpo || "")
+      ? detalle.cuerpo
+      : `<pre style="font-family:Calibri,sans-serif;white-space:pre-wrap">${String(detalle.cuerpo || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`)
+    : "";
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 flex items-center justify-center p-4"
+      style={{ zIndex: 2147482000, background: "rgba(15, 23, 42, 0.55)" }}
+      onClick={onCerrar}
+    >
+      <div
+        className="bg-white rounded-lg shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col min-h-0"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3 px-4 py-3 border-b border-slate-200">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-slate-800">Correos enviados · {codigo || ficha.numeroOT}</div>
+            <div className="text-[11px] text-slate-500 truncate">
+              {buzon ? `Desde ${buzon}` : "Desde tu buzón"}
+              {ficha.general?.cliente ? ` · ${ficha.general.cliente}` : ""}
+              {mensajes ? ` · ${mensajes.length}${hayMas ? "+" : ""}` : ""}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <BotonCorreoFacturacion
+              ficha={ficha}
+              className="text-[12px] font-semibold text-white bg-purple-600 hover:bg-purple-700 rounded px-3 py-1.5 inline-flex items-center gap-1.5"
+              title="Escribir un correo nuevo sobre esta OT"
+            >
+              <Send size={13} /> Escribir correo
+            </BotonCorreoFacturacion>
+            <button type="button" onClick={onCerrar} className="p-1 text-slate-400 hover:text-slate-700" aria-label="Cerrar">
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+        <div className="overflow-y-auto flex-1 min-h-0">
+          {error && <div className="m-3 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
+          {detalle ? (
+            <div className="p-4">
+              <button type="button" onClick={() => setDetalle(null)} className="text-[12px] text-blue-700 hover:underline mb-2">← Volver a la lista</button>
+              <div className="text-sm font-semibold text-slate-800">{detalle.asunto}</div>
+              <div className="text-[12px] text-slate-500 mt-1">
+                {fechaCorreoEnviado(detalle.fecha)}
+                {detalle.para?.length ? ` · Para ${listaDestinatarios(detalle.para)}` : ""}
+              </div>
+              {detalle.cc?.length > 0 && <div className="text-[12px] text-slate-500">Copia: {listaDestinatarios(detalle.cc)}</div>}
+              <iframe
+                title={detalle.asunto}
+                sandbox=""
+                srcDoc={cuerpoHtml}
+                className="w-full mt-3 border border-slate-200 rounded bg-white"
+                style={{ height: "50vh" }}
+              />
+            </div>
+          ) : mensajes == null && !error ? (
+            <div className="px-4 py-10 text-center text-sm text-slate-400">Buscando en enviados…</div>
+          ) : mensajes?.length === 0 ? (
+            <div className="px-4 py-10 text-center text-sm text-slate-500">No hay correos enviados desde tu buzón que mencionen esta OT.</div>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {(mensajes || []).map((m) => (
+                <li key={m.id} className="px-4 py-2.5 hover:bg-blue-50/60">
+                  <button type="button" onClick={() => abrirMensaje(m.id)} className="w-full text-left">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[12px] font-semibold text-slate-800 truncate flex-1">{m.asunto}</span>
+                      {m.adjuntos && <Paperclip size={12} className="text-slate-400 shrink-0" />}
+                      <span className="text-[11px] text-slate-400 whitespace-nowrap">{fechaCorreoEnviado(m.fecha)}</span>
+                    </div>
+                    <div className="text-[11px] text-slate-500 truncate">Para {listaDestinatarios(m.para)}{m.cc?.length ? ` · Copia ${listaDestinatarios(m.cc)}` : ""}</div>
+                    {m.preview && <div className="text-[12px] text-slate-400 truncate mt-0.5">{m.preview}</div>}
+                  </button>
+                  {m.enlace && (
+                    <a href={m.enlace} target="_blank" rel="noreferrer" className="text-[11px] text-blue-600 hover:underline">Abrir en Outlook</a>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {cargandoDetalle && <div className="px-4 py-2 text-[12px] text-slate-400">Abriendo correo…</div>}
+          {hayMas && !detalle && <div className="px-4 py-2 text-[11px] text-slate-400">Hay más correos de los que se han podido listar. Afina por la OT en Outlook si falta alguno.</div>}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function BotonCorreosEnviadosOT({ ficha }) {
+  const [abierto, setAbierto] = useState(false);
+  const codigo = codigoOTParaBC(ficha);
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setAbierto(true)}
+        title={`Correos enviados desde tu buzón sobre ${codigo || ficha.numeroOT}`}
+        aria-label={`Correos enviados de ${codigo || ficha.numeroOT}`}
+        className="inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"
+      >
+        <Mail size={14} />
+      </button>
+      {abierto && <PanelCorreosEnviadosOT ficha={ficha} onCerrar={() => setAbierto(false)} />}
+    </>
   );
 }
 
@@ -3457,7 +3678,6 @@ function PedidosVentaPendientes({ pedidosVenta = [], lineasPedidoVenta = [] }) {
         buscandoCorreos={buscandoCorreos}
         estadoCorreo={estadoCorreo}
         NotasOT={NotasOT}
-        BotonCorreo={BotonCorreoFacturacion}
       />
       {avisoEnvio && (
         <div className="fixed bottom-4 right-4 z-40 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm rounded-lg shadow px-4 py-2 flex items-center gap-3 max-w-md">
@@ -3910,7 +4130,7 @@ function PantallaOTs({ incrustada = false }) {
                     <th className="px-2 py-2 font-semibold w-[40%]">Descripció</th>
                     <th className="px-2 py-2 font-semibold">Departamento</th>
                     <th className="px-2 py-2 font-semibold text-right" title="Materiales (compras PC) + mano de obra a coste 21,50 €/h">Gasto asociado</th>
-                    <th className="px-2 py-2 font-semibold text-center">✉</th>
+                    <th className="px-2 py-2 font-semibold text-center" title="Correos enviados desde tu buzón sobre esta OT">✉</th>
                     <th className="px-2 py-2 font-semibold text-center">Ver Datos</th>
                   </tr>
                 </thead>
@@ -3952,7 +4172,7 @@ function PantallaOTs({ incrustada = false }) {
                         })()}
                       </td>
                       <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}>
-                        <BotonCorreoFacturacion ficha={f} />
+                        <BotonCorreosEnviadosOT ficha={f} />
                       </td>
                       <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}>
                         <button
@@ -7553,12 +7773,13 @@ function dedupeFilasBc(filas) {
 
 function seccionDesdeHash(soloHoras) {
   if (soloHoras) return "horas";
-  if (typeof window === "undefined") return "cargar";
+  if (typeof window === "undefined") return "panel";
   const h = window.location.hash || "";
   if (h === "#/horas" || h.startsWith("#/horas/") || h.startsWith("#/horas?")) return "horas";
   if (h === "#/ropa" || h.startsWith("#/ropa/") || h.startsWith("#/ropa?")) return "ropa";
-  if (h === "#/ofertas" || h.startsWith("#/ofertas/") || h.startsWith("#/ofertas?")) return "ofertas";
-  return "cargar";
+  if (h === "#/ofertas" || h.startsWith("#/ofertas/") || h.startsWith("#/ofertas?")) return "ropa";
+  if ((h === "#/comercial" || h.startsWith("#/comercial/") || h.startsWith("#/comercial?")) && esEmpresaQuimlab()) return "comercial";
+  return "panel";
 }
 
 function PantallaPrincipal({ usuario = null, onLogout = null }) {
@@ -7716,6 +7937,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
   const [vistas, setVistas] = useState(() => new Set([seccionInicial]));
   const abrirSeccion = (id) => {
     if (soloHoras && id !== "horas") return;
+    if (id === "comercial" && !esEmpresaQuimlab()) return;
     setVistas((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     setSeccion(id);
   };
@@ -7740,13 +7962,14 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
       const esHoras = h === "#/horas" || h.startsWith("#/horas/") || h.startsWith("#/horas?");
       const esRopa = h === "#/ropa" || h.startsWith("#/ropa/") || h.startsWith("#/ropa?");
       const esOfertas = h === "#/ofertas" || h.startsWith("#/ofertas/") || h.startsWith("#/ofertas?");
-      if (!esHoras && !esRopa && !esOfertas) return;
+      const esComercial = (h === "#/comercial" || h.startsWith("#/comercial/") || h.startsWith("#/comercial?")) && esEmpresaQuimlab();
+      if (!esHoras && !esRopa && !esOfertas && !esComercial) return;
       if (soloHoras) {
         setSeccion("horas");
         setVistas(new Set(["horas"]));
         return;
       }
-      const id = esOfertas ? "ofertas" : esRopa ? "ropa" : "horas";
+      const id = esComercial ? "comercial" : (esRopa || esOfertas ? "ropa" : "horas");
       setVistas((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
       setSeccion(id);
     };
@@ -7905,12 +8128,14 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
               navItem("horas", "Control de horas", Timer)
             ) : (
               <>
+                {navItem("panel", "Panel inicial", LayoutDashboard)}
                 {navItem("cargar", "Cargar datos", Database)}
                 {navItem("memoria", "Memoria histórica", History)}
                 {navItem("explorador", "Explorador de OTs", Search)}
                 {navItem("recepcion", "Recepción de material", Package)}
                 {navItem("facturascompra", "Validación de facturas", ClipboardCheck)}
                 {navItem("precios", "Precios de artículos", Tag)}
+                {esEmpresaQuimlab() && navItem("comercial", "Comercial", Briefcase)}
                 {navItem("pedidosventa", "Pedidos de venta", ShoppingCart)}
                 {navItem("facturasventa", "Facturas de venta", FileText)}
                 {navItem("analisiscliente", "Anàlisi per client", Users)}
@@ -7922,7 +8147,6 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
                 {navItem("ratios", "Ratios financieros", BarChart3)}
                 {navItem("horas", "Control de horas", Timer)}
                 {navItem("ropa", "Ropa", Shirt)}
-                {navItem("ofertas", "Comparador de ofertas", Scale)}
 
                 <div className="bc-nav-grupo">Hoja de ruta</div>
                 {[
@@ -7947,6 +8171,7 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
 
         {/* Main */}
         <main className="bc-main">
+          {panel("panel", <PanelInicial />)}
           {panel("explorador", <PantallaOTs incrustada />)}
           {panel("recepcion", (
             <Recepcion
@@ -7969,6 +8194,9 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
               lineas={{ headers: Object.keys(data["lineas_compra"]?.rows?.[0] || {}), rows: data["lineas_compra"]?.rows || [] }}
               pedidos={{ headers: Object.keys(data["pedidos_compra"]?.rows?.[0] || {}), rows: data["pedidos_compra"]?.rows || [] }}
             />
+          ))}
+          {esEmpresaQuimlab() && panel("comercial", (
+            <Comercial tarifasBc={data["tarifas_venta"]?.rows || []} />
           ))}
           {panel("pedidosventa", (
             <PedidosVentaPendientes pedidosVenta={data["pedidos_venta"]?.rows || []} lineasPedidoVenta={data["lineas_pedido_venta"]?.rows || []} />
@@ -8018,7 +8246,6 @@ function PantallaPrincipal({ usuario = null, onLogout = null }) {
           {panel("ratios", <Ratios recursos={data.recursos?.rows || []} />)}
           {panel("horas", <ControlHoras recursos={data.recursos?.rows || []} usuario={usuario} />)}
           {panel("ropa", <Ropa recursos={data.recursos?.rows || []} />)}
-          {panel("ofertas", <ComparadorOfertas />)}
           {panel("memoria", (
             <>
               <div className="flex items-center gap-2">

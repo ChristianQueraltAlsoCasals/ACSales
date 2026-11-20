@@ -6,7 +6,8 @@
  * unidad se abren todos, como en el correo de esa unidad.
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Mail, SlidersHorizontal, StickyNote } from "lucide-react";
+import { createPortal } from "react-dom";
+import { ChevronDown, ChevronRight, FileText, Mail, Send, SlidersHorizontal, StickyNote, X } from "lucide-react";
 import { normalizarNumeroOT } from "./agenteInteligente.js";
 
 const UNIDADES = [
@@ -148,6 +149,7 @@ export function construirInformePartes({ fichas, pedidosVenta, lineasPedidoVenta
     if (!num) continue;
     cabeceras.set(num, {
       cliente: String(cab.customerName || cab.sellToCustomerName || cab.Sell_to_Customer_Name || "").trim(),
+      clienteN: String(cab.customerNumber || cab.sellToCustomerNumber || cab.Sell_to_Customer_No || "").trim(),
       fecha: fechaValida(cab.orderDate || cab.Order_Date),
       externo: String(cab.externalDocumentNumber || cab.External_Document_No || "").trim(),
     });
@@ -193,6 +195,7 @@ export function construirInformePartes({ fichas, pedidosVenta, lineasPedidoVenta
         fecha: "",
         externo: cab?.externo || "",
         clienteCab: cab?.cliente || "",
+        clienteN: cab?.clienteN || "",
         d1imp: new Map(),
         descripcion: "",
         partesTrabajo: [],
@@ -232,6 +235,7 @@ export function construirInformePartes({ fichas, pedidosVenta, lineasPedidoVenta
         codigo: p.otRaw || "Sense OT",
         ficha,
         cliente: ficha?.general?.cliente || p.clienteCab || "",
+        clienteN: p.clienteN || "",
         descripcion: String(ficha?.general?.descripcion || "").trim(),
         estado: String(ficha?.general?.estadoApp || "").trim(),
         parts: [],
@@ -245,6 +249,7 @@ export function construirInformePartes({ fichas, pedidosVenta, lineasPedidoVenta
       porOT.set(clave, ot);
     }
     if (!ot.cliente && p.clienteCab) ot.cliente = p.clienteCab;
+    if (!ot.clienteN && p.clienteN) ot.clienteN = p.clienteN;
     if (p.otRaw && (ot.codigo === "Sense OT" || p.otRaw.length > ot.codigo.length)) ot.codigo = p.otRaw;
     ot.parts.push(p);
     ot.pend += p.pend;
@@ -462,26 +467,37 @@ export function resumenCorreoOT(notas, codigo) {
   };
 }
 
-function abrirPdfBase64(base64, ventana) {
+function abrirPdfBase64(base64, ventana, nombre, urlServidor) {
+  if (urlServidor) {
+    if (ventana) ventana.location = urlServidor;
+    else window.open(urlServidor, "_blank", "noopener");
+    return;
+  }
   const bin = atob(base64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
-  if (ventana) ventana.location = url;
-  else window.open(url, "_blank", "noopener");
+  const archivo = String(nombre || "albaran.pdf").replace(/[^\w.-]+/g, "_");
+  const url = URL.createObjectURL(new File([bytes], archivo, { type: "application/pdf" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = archivo;
+  a.click();
+  if (ventana) ventana.close();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 function BotonPdfAlbaran({ externo, pedido }) {
   const [estado, setEstado] = useState(null);
   const doc = String(externo || "").trim();
+  const ped = String(pedido || "").trim();
   const abrir = async (numero) => {
-    if (!doc) return;
+    if (!doc && !ped) return;
     const ventana = window.open("", "_blank");
     setEstado("cargando");
     try {
-      const q = new URLSearchParams({ externo: doc });
-      if (pedido) q.set("pedido", pedido);
+      const q = new URLSearchParams();
+      if (doc) q.set("externo", doc);
+      if (ped) q.set("pedido", ped);
       if (numero) q.set("numero", numero);
       const r = await fetch(`/api/bc/albaran-venta-pdf?${q}`);
       const d = await r.json().catch(() => ({}));
@@ -492,27 +508,35 @@ function BotonPdfAlbaran({ externo, pedido }) {
         return;
       }
       if (!d.base64) throw new Error("Business Central no ha devuelto el PDF del albarán.");
-      abrirPdfBase64(d.base64, ventana);
-      setEstado(d.aviso ? { aviso: d.aviso } : null);
+      abrirPdfBase64(d.base64, ventana, d.nombre, d.url);
+      setEstado({
+        aviso: d.aviso || null,
+        material: d.material || null,
+      });
     } catch (err) {
       if (ventana) ventana.close();
       setEstado({ error: err.message || String(err) });
     }
   };
-  if (!doc) return <span className="text-slate-300">—</span>;
+  if (!doc && !ped) return <span className="text-slate-300">—</span>;
   return (
     <span className="inline-flex flex-col items-start gap-0.5">
       <button
         type="button"
         onClick={() => abrir()}
         disabled={estado === "cargando"}
-        title={`Albarán de venta y parte de trabajo del documento ${doc}`}
+        title={`Albarán de venta y parte de trabajo${doc ? ` del documento ${doc}` : ""}${ped ? ` del pedido ${ped}` : ""}`}
         className="text-[10px] font-semibold text-blue-700 border border-blue-200 rounded px-1.5 py-0.5 bg-white hover:bg-blue-50 disabled:opacity-50 whitespace-nowrap"
       >
         {estado === "cargando" ? "…" : "PDF"}
       </button>
-      {estado?.error && <span className="text-[10px] text-red-600 max-w-[220px]">{estado.error}</span>}
-      {estado?.aviso && <span className="text-[10px] text-amber-700 max-w-[220px]">{estado.aviso}</span>}
+      {estado?.error && <span className="text-[10px] text-red-600 max-w-[260px]">{estado.error}</span>}
+      {estado?.aviso && <span className="text-[10px] text-amber-700 max-w-[260px]">{estado.aviso}</span>}
+      {estado?.material?.texto && (
+        <span className={`text-[10px] max-w-[260px] ${estado.material.cuadra ? (estado.material.deMas?.length ? "text-amber-800" : "text-emerald-700") : "text-red-700"}`}>
+          {estado.material.texto}
+        </span>
+      )}
       {estado?.varios?.length > 0 && (
         <span className="flex flex-col items-start">
           {estado.varios.map((a) => (
@@ -532,7 +556,58 @@ function BotonPdfAlbaran({ externo, pedido }) {
   );
 }
 
-function DetallePartes({ parts }) {
+function externoDeParte(p, refs) {
+  return String(p.externo || "").trim() || String(refs?.[p.doc]?.externo || "").trim();
+}
+
+function fechaEnvio(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("es-ES", {
+    timeZone: "Europe/Madrid",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(d);
+}
+
+function TextoEnvio({ externo, envios }) {
+  const clave = String(externo || "").trim();
+  if (!clave || !envios || !(clave in envios)) return null;
+  const info = envios[clave];
+  if (!info) return <div className="text-[10px] text-slate-400">No enviado</div>;
+  const cuando = fechaEnvio(info.fecha);
+  const para = [...(info.para || []), ...(info.cc || [])].filter(Boolean);
+  const title = [
+    cuando ? `Enviado el ${cuando}` : "Enviado",
+    para.length ? `a ${para.join(", ")}` : "",
+    info.asunto ? `«${info.asunto}»` : "",
+    info.adjunto || "",
+  ].filter(Boolean).join(" · ");
+  return (
+    <div className="text-[10px] font-semibold text-emerald-700" title={title}>
+      Enviado{cuando ? ` ${cuando}` : ""}
+    </div>
+  );
+}
+
+function ResumenEnvios({ parts, envios, visible, buscando, refsAlb }) {
+  if (!visible) return null;
+  const docs = (parts || []).map((p) => externoDeParte(p, refsAlb)).filter(Boolean);
+  if (!docs.length) return null;
+  const vistos = docs.filter((e) => e in (envios || {}));
+  if (!vistos.length) {
+    return buscando ? <div className="text-[10px] text-slate-400">Correo…</div> : null;
+  }
+  const n = vistos.filter((e) => envios[e]).length;
+  return (
+    <div className={`text-[10px] ${n ? "text-emerald-700 font-semibold" : "text-slate-400"}`} title="Partes de esta OT ya enviados por correo, según los PDF del buzón de enviados">
+      {n} de {docs.length} enviados
+    </div>
+  );
+}
+
+function DetallePartes({ parts, envios, refsAlb }) {
   const hayParte = parts.some((p) => p.partesTrabajo?.length);
   return (
     <div className="ml-6 my-1 border border-slate-200 rounded-md bg-white overflow-hidden">
@@ -559,19 +634,389 @@ function DetallePartes({ parts }) {
               {hayParte && (
                 <td className="px-2 py-1 text-slate-700">{p.partesTrabajo.length ? p.partesTrabajo.join(", ") : "—"}</td>
               )}
-              <td className="px-2 py-1 text-slate-500">{p.externo || "—"}</td>
+              <td className="px-2 py-1 text-slate-500">{externoDeParte(p, refsAlb) || "—"}</td>
               <td className="px-2 py-1 whitespace-nowrap">
                 <TextoFecha fecha={p.fecha} dias={p.dias} clase={p.clase} />
               </td>
               <td className="px-2 py-1 text-right whitespace-nowrap font-semibold text-slate-800">{eur2(p.pend)}</td>
               <td className="px-2 py-1">
-                <BotonPdfAlbaran externo={p.externo} pedido={p.doc} />
+                <BotonPdfAlbaran externo={externoDeParte(p, refsAlb)} pedido={p.doc} />
+                <TextoEnvio externo={externoDeParte(p, refsAlb)} envios={envios} />
               </td>
             </tr>
           ))}
         </tbody>
       </table>
     </div>
+  );
+}
+
+const LS_EMAILS_CLIENTE = "pedidos_venta_emails_cliente_v1";
+
+function emailClienteRecordado(clave) {
+  try {
+    const mapa = JSON.parse(localStorage.getItem(LS_EMAILS_CLIENTE) || "{}");
+    return mapa[clave] || "";
+  } catch {
+    return "";
+  }
+}
+
+function recordarEmailCliente(clave, email) {
+  if (!clave || !email) return;
+  try {
+    const mapa = JSON.parse(localStorage.getItem(LS_EMAILS_CLIENTE) || "{}");
+    mapa[clave] = email;
+    localStorage.setItem(LS_EMAILS_CLIENTE, JSON.stringify(mapa));
+  } catch { /* el navegador puede bloquear el almacén */ }
+}
+
+function emailsDeCampo(texto) {
+  return String(texto || "").split(/[;,\s]+/).map((e) => e.trim()).filter((e) => /.+@.+\..+/.test(e));
+}
+
+function nombreAdjuntoUnico(nombre, usados) {
+  let n = String(nombre || "albaran.pdf").replace(/[\\/]/g, "_");
+  if (!/\.pdf$/i.test(n)) n += ".pdf";
+  if (!usados.has(n.toLowerCase())) {
+    usados.add(n.toLowerCase());
+    return n;
+  }
+  const punto = n.lastIndexOf(".");
+  const base = punto > 0 ? n.slice(0, punto) : n;
+  const ext = punto > 0 ? n.slice(punto) : ".pdf";
+  let i = 2;
+  while (usados.has(`${base}_${i}${ext}`.toLowerCase())) i += 1;
+  const out = `${base}_${i}${ext}`;
+  usados.add(out.toLowerCase());
+  return out;
+}
+
+function recortarAdjuntosCorreo(adjuntos) {
+  const topeFichero = 3 * 1024 * 1024;
+  const topeTotal = 10 * 1024 * 1024;
+  const ok = [];
+  const fuera = [];
+  let suma = 0;
+  for (const a of adjuntos) {
+    const bytes = Math.floor(String(a.base64 || "").replace(/\s/g, "").length * 3 / 4);
+    const cabe = ok.length < 10 && bytes > 0 && bytes <= topeFichero && suma + bytes <= topeTotal;
+    if (!cabe) {
+      fuera.push(a.nombre);
+      continue;
+    }
+    suma += bytes;
+    ok.push(a);
+  }
+  return { ok, fuera };
+}
+
+function borradorPedirPedido(ot) {
+  const lineas = (ot.parts || []).map((p) => {
+    const refs = [p.externo, ...(p.partesTrabajo || [])].filter(Boolean);
+    return `· ${p.doc}${refs.length ? ` (${refs.join(" · ")})` : ""} — ${eur2(p.pend)}`;
+  });
+  const otTxt = ot.codigo || "—";
+  const desc = String(ot.descripcion || "").trim();
+  const cuerpo =
+    `Benvolgut/da,\n\n` +
+    `Us adjuntem els albarans i els parts de treball de l'OT ${otTxt}.\n` +
+    `Descripció: ${desc || "—"}\n\n` +
+    `Per poder facturar els pedidos de venda següents, necessitem que ens indiqueu el número de pedido:\n\n` +
+    `${lineas.join("\n") || "· (sense pedidos)"}` +
+    `\n\nQuedem a l'espera de la vostra resposta.\n\nGràcies.`;
+  const cliente = String(ot.cliente || "").trim();
+  return {
+    asunto: [`Número de pedido`, `OT ${otTxt}`, desc, cliente].filter(Boolean).join(" · ").slice(0, 180),
+    cuerpo,
+  };
+}
+
+async function pdfDeAlbaran(externo, pedido, numero) {
+  const q = new URLSearchParams();
+  if (externo) q.set("externo", externo);
+  if (pedido) q.set("pedido", pedido);
+  if (numero) q.set("numero", numero);
+  const r = await fetch(`/api/bc/albaran-venta-pdf?${q}`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || d.detalle || `Error ${r.status}`);
+  return d;
+}
+
+async function descargarPdfsDeOT(ot, onProgreso) {
+  const adjuntos = [];
+  const avisos = [];
+  const usados = new Set();
+  const parts = ot.parts || [];
+  for (let i = 0; i < parts.length; i += 1) {
+    const p = parts[i];
+    onProgreso?.(`${i + 1} de ${parts.length} · ${p.doc}`);
+    const externo = String(p.externo || "").trim();
+    if (!externo && !p.doc) {
+      avisos.push(`${p.doc || "PV"}: sin documento externo ni número de pedido, no hay PDF.`);
+      continue;
+    }
+    try {
+      const d = await pdfDeAlbaran(externo, p.doc);
+      const piezas = [];
+      if (d.varios?.length) {
+        for (const a of d.varios) {
+          try {
+            const uno = await pdfDeAlbaran(externo, p.doc, a.numero);
+            if (!uno.base64) throw new Error("Business Central no ha devuelto el PDF.");
+            piezas.push(uno);
+          } catch (err) {
+            avisos.push(`${p.doc} · ${a.numero}: ${err.message || err}`);
+          }
+        }
+      } else if (d.base64) {
+        piezas.push(d);
+      } else {
+        avisos.push(`${p.doc}: Business Central no ha devuelto el PDF.`);
+      }
+      for (const pieza of piezas) {
+        if (pieza.aviso) avisos.push(`${p.doc}: ${pieza.aviso}`);
+        adjuntos.push({
+          nombre: nombreAdjuntoUnico(pieza.nombre || `Albaran_${p.doc}.pdf`, usados),
+          base64: pieza.base64,
+          mime: pieza.mime || "application/pdf",
+        });
+      }
+    } catch (err) {
+      avisos.push(`${p.doc}: ${err.message || err}`);
+    }
+  }
+  const recorte = recortarAdjuntosCorreo(adjuntos);
+  if (recorte.fuera.length) {
+    avisos.push(`No caben en el correo (máximo 10 PDF o 10 MB): ${recorte.fuera.join(", ")}`);
+  }
+  return { adjuntos: recorte.ok, avisos };
+}
+
+function htmlDeTexto(texto) {
+  return String(texto || "")
+    .split(/\r?\n/)
+    .map((l) => (l ? l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "<br/>"))
+    .join("<br/>");
+}
+
+function ModalPedirPedido({ ot, onCerrar, onEnviado }) {
+  const borrador = borradorPedirPedido(ot);
+  const claveEmail = ot.clienteN || ot.cliente || "";
+  const [para, setPara] = useState(emailClienteRecordado(claveEmail));
+  const [cc, setCc] = useState("");
+  const [asunto, setAsunto] = useState(borrador.asunto);
+  const [cuerpo, setCuerpo] = useState(borrador.cuerpo);
+  const [de, setDe] = useState("");
+  const [emailBC, setEmailBC] = useState(null);
+  const [adjuntos, setAdjuntos] = useState([]);
+  const [avisos, setAvisos] = useState([]);
+  const [progreso, setProgreso] = useState("Preparant els PDF…");
+  const [cargando, setCargando] = useState(true);
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let vivo = true;
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => { if (vivo && d.email) setDe(d.email); })
+      .catch(() => {});
+    const qs = new URLSearchParams();
+    if (ot.clienteN) qs.set("numero", ot.clienteN);
+    if (ot.cliente) qs.set("nombre", ot.cliente);
+    if (qs.toString()) {
+      fetch(`/api/bc/cliente-email?${qs}`)
+        .then((r) => r.json())
+        .then((d) => {
+          if (!vivo) return;
+          const e = (d && d.email) || "";
+          setEmailBC(e);
+          setPara((actual) => actual || e);
+        })
+        .catch(() => { if (vivo) setEmailBC(""); });
+    } else {
+      setEmailBC("");
+    }
+    descargarPdfsDeOT(ot, (txt) => { if (vivo) setProgreso(txt); })
+      .then((res) => {
+        if (!vivo) return;
+        setAdjuntos(res.adjuntos);
+        setAvisos(res.avisos);
+        setCargando(false);
+      })
+      .catch((err) => {
+        if (!vivo) return;
+        setAvisos([err.message || String(err)]);
+        setCargando(false);
+      });
+    const prevBody = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      vivo = false;
+      document.body.style.overflow = prevBody;
+    };
+  }, [ot]);
+
+  const enviar = async () => {
+    const destinatarios = emailsDeCampo(para);
+    const copias = emailsDeCampo(cc).filter((e) => !destinatarios.some((p) => p.toLowerCase() === e.toLowerCase()));
+    if (!destinatarios.length) { setError("Indica el email del cliente."); return; }
+    if (!asunto.trim()) { setError("Falta el asunto."); return; }
+    setEnviando(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: destinatarios,
+          cc: copias,
+          asunto: asunto.trim(),
+          cuerpoHtml: htmlDeTexto(cuerpo),
+          ...(adjuntos.length ? { adjuntos } : {}),
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      recordarEmailCliente(claveEmail, destinatarios[0]);
+      onEnviado?.({ de: json.de, para: destinatarios, cc: copias, asunto: asunto.trim() });
+    } catch (err) {
+      setError(err.message || String(err));
+      setEnviando(false);
+    }
+  };
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 flex items-center justify-center p-4"
+      style={{ zIndex: 2147483000, background: "rgba(15, 23, 42, 0.55)" }}
+      onClick={onCerrar}
+    >
+      <div
+        className="bg-white rounded-lg shadow-2xl w-full max-w-xl max-h-[90vh] flex flex-col min-h-0"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 flex-shrink-0">
+          <div>
+            <div className="text-sm font-semibold text-slate-800">Pedir número de pedido · OT {ot.codigo}</div>
+            <div className="text-[11px] text-slate-500">
+              {ot.cliente || "Sin cliente"}
+              {` · ${(ot.parts || []).length} PV`}
+              {de ? ` · desde ${de}` : ""}
+            </div>
+          </div>
+          <button type="button" onClick={onCerrar} className="p-1 text-slate-400 hover:text-slate-700" aria-label="Cerrar">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="px-4 py-3 space-y-3 text-sm overflow-y-auto flex-1 min-h-0">
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Para</span>
+            <input
+              value={para}
+              onChange={(e) => setPara(e.target.value)}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] focus:outline-none focus:ring-2 focus:ring-blue-400"
+              placeholder="email del cliente"
+            />
+            <span className="block mt-1 text-[11px] text-slate-400">
+              {emailBC === null
+                ? "Consultando la ficha del cliente en BC…"
+                : emailBC
+                  ? `Ficha BC: ${emailBC}`
+                  : "La ficha del cliente en BC no tiene email. Escríbelo y se recordará."}
+            </span>
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Copia</span>
+            <input
+              value={cc}
+              onChange={(e) => setCc(e.target.value)}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] focus:outline-none focus:ring-2 focus:ring-blue-400"
+              placeholder="opcional"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Asunto</span>
+            <input
+              value={asunto}
+              onChange={(e) => setAsunto(e.target.value)}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] focus:outline-none focus:ring-2 focus:ring-blue-400"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Mensaje</span>
+            <textarea
+              value={cuerpo}
+              onChange={(e) => setCuerpo(e.target.value)}
+              rows={10}
+              className="mt-1 w-full border border-slate-300 rounded-md px-2 py-1.5 text-[13px] focus:outline-none focus:ring-2 focus:ring-blue-400"
+            />
+          </label>
+          <div className="text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2 space-y-1">
+            <div className="flex items-start gap-2">
+              <FileText size={14} className="text-blue-700 flex-shrink-0 mt-0.5" />
+              <div>
+                {cargando ? (
+                  <span>Preparando los PDF… {progreso}</span>
+                ) : adjuntos.length ? (
+                  adjuntos.map((a) => <div key={a.nombre}>Adjunto: <strong>{a.nombre}</strong></div>)
+                ) : (
+                  <span className="text-amber-700">Sin PDF. El correo se puede enviar igual, pero el cliente no verá los albaranes.</span>
+                )}
+              </div>
+            </div>
+            {avisos.map((a) => <div key={a} className="text-[11px] text-amber-700">{a}</div>)}
+          </div>
+          {error && <div className="text-[12px] text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
+        </div>
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-slate-200 bg-slate-50 flex-shrink-0">
+          <button type="button" onClick={onCerrar} disabled={enviando} className="text-sm px-3 py-1.5 rounded-md border border-slate-300 text-slate-700 hover:bg-white">
+            Cancelar
+          </button>
+          <button
+            type="button"
+            onClick={enviar}
+            disabled={enviando || cargando}
+            className="text-sm font-semibold px-4 py-1.5 rounded-md text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 inline-flex items-center gap-1.5"
+          >
+            <Send size={14} />
+            {enviando ? "Enviando…" : cargando ? "Preparando PDF…" : "Enviar al cliente"}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function BotonPedirPedido({ ot, onRegistrado, refsAlb }) {
+  const [abierto, setAbierto] = useState(false);
+  const otCorreo = {
+    ...ot,
+    parts: (ot.parts || []).map((p) => ({ ...p, externo: externoDeParte(p, refsAlb) })),
+  };
+  const nPdf = (otCorreo.parts || []).filter((p) => String(p.externo || "").trim() || p.doc).length;
+  return (
+    <span className="inline-flex items-center justify-center">
+      <button
+        type="button"
+        onClick={() => setAbierto(true)}
+        title={`Enviar al cliente los PDF de esta OT (${nPdf}) y pedirle el número de pedido para facturar los PV`}
+        className="inline-flex items-center justify-center text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded p-1"
+      >
+        <Mail size={14} />
+      </button>
+      {abierto && (
+        <ModalPedirPedido
+          ot={otCorreo}
+          onCerrar={() => setAbierto(false)}
+          onEnviado={(info) => { setAbierto(false); onRegistrado?.(info); }}
+        />
+      )}
+    </span>
   );
 }
 
@@ -599,13 +1044,17 @@ export default function VistaPartesPendents({
   buscandoCorreos,
   estadoCorreo,
   NotasOT,
-  BotonCorreo,
 }) {
   const [fUnidad, setFUnidad] = useState("");
   const [fOt, setFOt] = useState("");
   const [fCliente, setFCliente] = useState("");
   const [filtrosAbiertos, setFiltrosAbiertos] = useState(false);
   const [otsAbiertas, setOtsAbiertas] = useState(() => new Set());
+  const [envios, setEnvios] = useState({});
+  const [buscandoEnvios, setBuscandoEnvios] = useState(false);
+  const enviosRef = useRef({});
+  const [refsAlb, setRefsAlb] = useState({});
+  const refsAlbRef = useRef({});
   const anclaDetalle = useRef(null);
   const cajaFiltro = useRef(null);
   const otsTodas = informe?.ots || [];
@@ -703,6 +1152,76 @@ export default function VistaPartesPendents({
       .map((cod) => ({ ...infoUnidad(cod), ots: por.get(cod) || [] }))
       .filter((b) => b.ots.length);
   }, [detalle, unidades, fUnidad]);
+
+  const externosVisibles = useMemo(() => {
+    const set = new Set();
+    for (const b of bloques) {
+      for (const ot of b.ots) {
+        if (!fUnidad && !otsAbiertas.has(ot.clave)) continue;
+        for (const p of ot.parts || []) {
+          const e = String(p.externo || "").trim() || String(refsAlb[p.doc]?.externo || "").trim();
+          if (e) set.add(e);
+        }
+      }
+    }
+    return [...set].sort();
+  }, [bloques, fUnidad, otsAbiertas, refsAlb]);
+
+  const pedidosSinExterno = useMemo(() => {
+    const set = new Set();
+    for (const b of bloques) {
+      for (const ot of b.ots) {
+        if (!fUnidad && !otsAbiertas.has(ot.clave)) continue;
+        for (const p of ot.parts || []) {
+          if (!String(p.externo || "").trim() && p.doc && !(p.doc in refsAlbRef.current)) set.add(p.doc);
+        }
+      }
+    }
+    return [...set].sort();
+  }, [bloques, fUnidad, otsAbiertas, refsAlb]);
+
+  useEffect(() => {
+    const faltan = externosVisibles.filter((e) => !(e in enviosRef.current));
+    if (!faltan.length) return undefined;
+    let vivo = true;
+    setBuscandoEnvios(true);
+    fetch("/api/pedidos-venta/enviados-pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ externos: faltan }),
+    })
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        if (!vivo || !ok || !d?.enviados) return;
+        const next = { ...enviosRef.current };
+        for (const e of faltan) next[e] = d.enviados[e] ?? null;
+        enviosRef.current = next;
+        setEnvios(next);
+      })
+      .catch(() => {})
+      .finally(() => { if (vivo) setBuscandoEnvios(false); });
+    return () => { vivo = false; };
+  }, [externosVisibles]);
+
+  useEffect(() => {
+    if (!pedidosSinExterno.length) return undefined;
+    let vivo = true;
+    fetch("/api/bc/albaranes-por-pedido", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pedidos: pedidosSinExterno }),
+    })
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        if (!vivo || !ok || !d?.albaranes) return;
+        const next = { ...refsAlbRef.current };
+        for (const ped of pedidosSinExterno) next[ped] = d.albaranes[ped] || null;
+        refsAlbRef.current = next;
+        setRefsAlb(next);
+      })
+      .catch(() => {});
+    return () => { vivo = false; };
+  }, [pedidosSinExterno]);
 
   const tot = detalle.reduce((a, ot) => ({
     pend: a.pend + ot.pend,
@@ -960,7 +1479,7 @@ export default function VistaPartesPendents({
                         <th className="px-2 py-2 font-semibold">{abierto ? "Data antig." : "Més antic"}</th>
                         <th className="px-2 py-2 font-semibold text-right">Pendent</th>
                         <th className="px-2 py-2 font-semibold">Comentari</th>
-                        <th className="px-2 py-2 font-semibold text-center w-10"><Mail size={12} className="inline" /></th>
+                        <th className="px-2 py-2 font-semibold text-center w-10" title="Correo al cliente: PDF de la OT y número de pedido"><Mail size={12} className="inline" /></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1040,10 +1559,9 @@ export default function VistaPartesPendents({
                                 </button>
                               </td>
                               <td className="px-2 py-2 text-center whitespace-nowrap">
-                                {ot.ficha ? (
-                                  <BotonCorreo ficha={ot.ficha} onRegistrado={(info) => onRegistrarEnvio(ot.ficha.numeroOT, info?.para)} />
-                                ) : null}
+                                <BotonPedirPedido ot={ot} refsAlb={refsAlb} onRegistrado={(info) => onRegistrarEnvio(claveN, info?.para)} />
                                 {rc ? <div className="text-[10px] text-blue-700" title={rc.para || ""}>✉ {rc.veces || 1}×</div> : null}
+                                <ResumenEnvios parts={ot.parts} envios={envios} refsAlb={refsAlb} visible={abierto || otsAbiertas.has(ot.clave)} buscando={buscandoEnvios} />
                               </td>
                             </tr>
                             {abierta && (
@@ -1056,7 +1574,7 @@ export default function VistaPartesPendents({
                             {partesVisibles && !abierto && (
                               <tr className="bg-slate-50/80">
                                 <td colSpan={8} className="px-3 pb-2 pt-0">
-                                  <DetallePartes parts={ot.parts} />
+                                  <DetallePartes parts={ot.parts} envios={envios} refsAlb={refsAlb} />
                                 </td>
                               </tr>
                             )}
@@ -1070,7 +1588,7 @@ export default function VistaPartesPendents({
                                 </td>
                                 <td />
                                 <td className="px-2 py-1 text-slate-500">
-                                  {p.externo || ""}
+                                  {externoDeParte(p, refsAlb) || ""}
                                   {!p.partesTrabajo?.length && p.descripcion ? (
                                     <div className="text-[10px] text-slate-400 truncate max-w-md" title={p.descripcion}>{p.descripcion}</div>
                                   ) : null}
@@ -1081,7 +1599,8 @@ export default function VistaPartesPendents({
                                 </td>
                                 <td className="px-2 py-1 text-right whitespace-nowrap text-slate-700">{eur2(p.pend)}</td>
                                 <td className="px-2 py-1">
-                                  <BotonPdfAlbaran externo={p.externo} pedido={p.doc} />
+                                  <BotonPdfAlbaran externo={externoDeParte(p, refsAlb)} pedido={p.doc} />
+                                  <TextoEnvio externo={externoDeParte(p, refsAlb)} envios={envios} />
                                 </td>
                                 <td />
                               </tr>

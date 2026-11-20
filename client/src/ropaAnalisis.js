@@ -56,3 +56,44 @@ export function stockExcel() {
 export function sumaAno(lineas, ano) {
   return lineas.reduce((a, l) => a + (l.anos[ano] || 0), 0);
 }
+
+// Precio unitario de la cabecera de STOCK31126, por prenda y año.
+// Si la hoja escribe "13,40 € + 2,20 €", el total es lo pagado y el detalle es el desglose (prenda + logo).
+export const PRECIOS = {
+  pantalon: {
+    2023: [{ total: 13.4 }],
+    2024: [
+      { total: 15.6, detalle: "13,40 + 2,20" },
+      { total: 15.45, detalle: "13,40 + 2,05" },
+    ],
+    2025: [{ total: 14.77, detalle: "12,57 + 2,20" }],
+  },
+  jaqueta: {
+    2023: [{ total: 23 }, { total: 23.65 }],
+    2024: [{ total: 24.9, detalle: "23,00 + 1,90" }],
+    2025: [{ total: 26.5, detalle: "23,00 + 3,50" }],
+  },
+  polo: {
+    2023: [{ total: 9.54 }, { total: 10.34 }, { total: 11.24 }],
+    2024: [{ total: 9.79 }],
+    2025: [{ total: 10.8 }, { total: 11.6 }],
+    2026: [{ total: 9.4 }],
+  },
+  jersey: {
+    2022: [{ total: 10.5 }],
+    2023: [{ total: 10.75 }, { total: 11 }],
+    2024: [{ total: 11.6 }, { total: 11 }],
+    2025: [{ total: 12.93 }],
+    2026: [{ total: 11.75 }],
+  },
+  sudadera: {
+    2022: [{ total: 21.75 }],
+    2023: [{ total: 22.05 }],
+    2024: [{ total: 21.65 }],
+    2026: [{ total: 19.9 }],
+  },
+};
+
+export function preciosDe(id, ano) {
+  return PRECIOS[id]?.[ano] || [];
+}

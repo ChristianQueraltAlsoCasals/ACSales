@@ -887,15 +887,6 @@ function ModalConsultaPc({ grupo, emailsProveedor, onClose, onEnviado }) {
   );
 }
 
-function lineasParaConsulta(grupo) {
-  return (grupo?.lineas || [])
-    .filter((l) => l && !l.soloPedido && (l.descripcion || l.descripcionAlbaran))
-    .map((l) => ({
-      descripcion: l.descripcion || l.descripcionAlbaran,
-      cantidad: l.cantidad != null && l.cantidad !== "" ? l.cantidad : l.cantidadAlbaran,
-    }));
-}
-
 function textoConsultaResponsable({ proveedor, albaran, pedido, ot, lineas }) {
   const alb = albaran ? `el albarán ${albaran}` : "un albarán";
   const deQuien = proveedor ? ` de ${proveedor}` : "";
@@ -962,7 +953,9 @@ function ModalConsultaResponsable({ grupo, onClose, onEnviado }) {
   const elegirDepto = (codigo) => {
     deptoRef.current = codigo;
     setDepto(codigo);
-    aplicarDestinos(codigo, remitente, !paraTocado.current, !ccTocado.current);
+    paraTocado.current = false;
+    ccTocado.current = false;
+    aplicarDestinos(codigo, remitente, true, true);
   };
 
   const html = useMemo(() => htmlConsultaPc(intro, cierre), [intro, cierre]);
@@ -1071,6 +1064,277 @@ function ModalConsultaResponsable({ grupo, onClose, onEnviado }) {
           <button onClick={onClose} className="text-sm border border-slate-300 rounded-md px-4 py-2 hover:bg-slate-50">Cancelar</button>
           <button onClick={enviar} disabled={enviando} className="flex items-center gap-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 rounded-md px-4 py-2">
             {enviando ? <RefreshCw size={14} className="animate-spin" /> : <Send size={14} />} Enviar al responsable
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function textoPedidoIncorrecto({ proveedor, albaran, pedido, lineas }) {
+  const empresa = razonEmpresaFirma();
+  const alb = albaran ? `el albarán ${albaran}` : "un albarán";
+  const deQuien = proveedor ? ` de ${proveedor}` : "";
+  const num = pedido
+    ? `En el documento figura el número de pedido ${pedido}. Ese número no es correcto: no corresponde a un pedido de compra de ${empresa}.`
+    : `En el documento no figura un número de pedido de compra correcto de ${empresa}.`;
+  const filas = (lineas || [])
+    .filter((l) => l.descripcion)
+    .map((l) => `· ${l.descripcion}${l.cantidad != null && l.cantidad !== "" ? ` — cantidad ${l.cantidad}` : ""}`);
+  const bloque = filas.length ? `\n\nMaterial leído en el albarán:\n${filas.join("\n")}` : "";
+  return `Buenos días,\n\nHemos recibido ${alb}${deQuien}.\n\n${num}\n\n¿Nos podéis indicar el número de pedido de compra correcto de esta entrega?${bloque}`;
+}
+
+function asuntoPedidoIncorrecto({ pedido, albaran }) {
+  const empresa = razonEmpresaFirma();
+  const alb = albaran ? `Albarán ${albaran}` : "Albarán sin número";
+  if (pedido) return `${alb} — el nº de pedido ${pedido} es incorrecto – ${empresa}`;
+  return `${alb} — el nº de pedido es incorrecto – ${empresa}`;
+}
+
+// Avisa, sin enviar al primer clic, de que el nº de pedido del albarán no es correcto.
+// Destino: responsable del departamento o proveedor.
+function ModalPedidoIncorrecto({ grupo, emailsProveedor, onClose, onEnviado }) {
+  const inicial = grupo.noEncontrado ? "proveedor" : "responsable";
+  const [tipo, setTipo] = useState(inicial);
+  const tipoRef = useRef(inicial);
+  const deptoInicial = codigoDepartamentoDesdeUnidad(grupo.departamento) || "";
+  const [depto, setDepto] = useState(deptoInicial);
+  const deptoRef = useRef(deptoInicial);
+  const [proveedor, setProveedor] = useState(grupo.proveedor || "");
+  const [para, setPara] = useState("");
+  const paraTocado = useRef(false);
+  const [emailBC, setEmailBC] = useState(null);
+  const emailProveedorRef = useRef(emailRecordadoProveedor(emailsProveedor, grupo.proveedor));
+  const [remitente, setRemitente] = useState("");
+  const ccTocado = useRef(false);
+  const [cc, setCc] = useState("");
+  const cierreTocado = useRef(false);
+  const [cierre, setCierre] = useState(() => textoCierre(""));
+  const introTocado = useRef(false);
+  const [intro, setIntro] = useState(() => textoPedidoIncorrecto(grupo));
+  const [asunto, setAsunto] = useState(() => asuntoPedidoIncorrecto(grupo));
+  const pdfBytes = bytesDeBase64(grupo.pdfBase64);
+  const pdfOk = pdfBytes > 0 && pdfBytes <= TOPE_FICHERO;
+  const [adjuntarPdf, setAdjuntarPdf] = useState(pdfOk);
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState(null);
+
+  const aplicarResponsable = (codigo, emailRemitente, forzar) => {
+    const d = destinosResponsable(codigo, emailRemitente);
+    if (forzar || !paraTocado.current) setPara(d.para.join("; "));
+    if (forzar || !ccTocado.current) setCc(d.cc.join("; "));
+  };
+
+  const aplicarProveedor = (emailRemitente, emailPara, forzarPara) => {
+    if (forzarPara || !paraTocado.current) setPara(emailPara || "");
+    if (!ccTocado.current) setCc(copiasAdministracion(emailRemitente).join("; "));
+  };
+
+  useEffect(() => {
+    fetch("/api/correo/remitente")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.email) setRemitente(d.email);
+        if (!cierreTocado.current) setCierre(textoCierre(d.nombre));
+        if (tipoRef.current === "responsable") aplicarResponsable(deptoRef.current, d.email, false);
+        else aplicarProveedor(d.email, emailProveedorRef.current, false);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const nombre = proveedor.trim();
+    if (!nombre) { setEmailBC(""); return; }
+    let vivo = true;
+    setEmailBC(null);
+    const qs = new URLSearchParams({ nombre });
+    fetch(`/api/bc/proveedor-email?${qs}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (!vivo) return;
+        const e = (d && d.email) || "";
+        setEmailBC(e);
+        emailProveedorRef.current = e || emailRecordadoProveedor(emailsProveedor, nombre);
+        if (tipoRef.current === "proveedor") aplicarProveedor(remitente, emailProveedorRef.current, false);
+      })
+      .catch(() => { if (vivo) setEmailBC(""); });
+    return () => { vivo = false; };
+  }, [proveedor, emailsProveedor, remitente]);
+
+  useEffect(() => {
+    if (introTocado.current) return;
+    setIntro(textoPedidoIncorrecto({ ...grupo, proveedor: proveedor.trim() }));
+  }, [proveedor, grupo]);
+
+  const elegirTipo = (t) => {
+    tipoRef.current = t;
+    setTipo(t);
+    paraTocado.current = false;
+    ccTocado.current = false;
+    if (t === "responsable") aplicarResponsable(deptoRef.current, remitente, true);
+    else aplicarProveedor(remitente, emailProveedorRef.current, true);
+  };
+
+  const elegirDepto = (codigo) => {
+    deptoRef.current = codigo;
+    setDepto(codigo);
+    if (tipoRef.current !== "responsable") return;
+    paraTocado.current = false;
+    ccTocado.current = false;
+    aplicarResponsable(codigo, remitente, true);
+  };
+
+  const html = useMemo(() => htmlConsultaPc(intro, cierre), [intro, cierre]);
+  const etiqueta = etiquetaDepartamento(depto);
+
+  const enviar = async () => {
+    const dest = partirEmails(para);
+    if (!dest.length) {
+      setError(tipo === "proveedor"
+        ? "Escribe el correo del proveedor en Para."
+        : (depto ? "Escribe al menos un destinatario en Para." : "Elige el departamento del responsable, o escribe el correo en Para."));
+      return;
+    }
+    if (!(asunto || "").trim()) { setError("El asunto está vacío."); return; }
+    setEnviando(true);
+    setError(null);
+    try {
+      const adjuntos = adjuntarPdf && pdfOk
+        ? [{ nombre: nombrePdfConsulta(grupo.albaran, grupo.pedido), base64: grupo.pdfBase64, mime: "application/pdf" }]
+        : [];
+      const r = await fetch("/api/correo/enviar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          para: dest,
+          cc: partirEmails(cc),
+          asunto: asunto.trim(),
+          cuerpoHtml: html,
+          adjuntos,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(json.detalle || json.error || `Error ${r.status}`);
+      const escrito = dest.join("; ");
+      onEnviado({
+        pedido: grupo.pedido,
+        para: escrito,
+        tipo,
+        depto: tipo === "responsable" ? etiqueta : "",
+        proveedor: proveedor.trim(),
+        recordarEmail: tipo === "proveedor" && proveedor.trim() && escrito !== (emailBC || "") ? escrito : null,
+      });
+    } catch (err) {
+      setError(err.message || String(err));
+      setEnviando(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[92vh] overflow-y-auto p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Mail size={18} /> Nº de pedido incorrecto</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+        </div>
+        <p className="text-[12px] text-slate-500 mb-3">
+          Avisa de que el número de pedido del albarán no es correcto y pide el bueno.
+          Revisa destinatario y texto. No se envía hasta que pulses Enviar.
+          {grupo.pedido ? ` Número leído: ${grupo.pedido}.` : ""}
+          {grupo.albaran ? ` Albarán ${grupo.albaran}.` : ""}
+        </p>
+
+        <div className="flex flex-wrap gap-1.5 mb-3">
+          <button
+            type="button"
+            onClick={() => elegirTipo("responsable")}
+            className={`text-[12px] font-semibold rounded-full px-3 py-1 border ${tipo === "responsable" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+          >
+            Al responsable
+          </button>
+          <button
+            type="button"
+            onClick={() => elegirTipo("proveedor")}
+            className={`text-[12px] font-semibold rounded-full px-3 py-1 border ${tipo === "proveedor" ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"}`}
+          >
+            Al proveedor
+          </button>
+        </div>
+
+        {tipo === "responsable" ? (
+          <div className="mb-3">
+            <div className="text-xs font-semibold text-slate-500 mb-1">Responsable del departamento</div>
+            <div className="flex flex-wrap gap-1.5">
+              {DEPTOS_RESPONSABLE.map((d) => (
+                <button
+                  key={d.codigo}
+                  type="button"
+                  onClick={() => elegirDepto(d.codigo)}
+                  className={`text-[12px] font-semibold rounded-full px-3 py-1 border ${
+                    depto === d.codigo ? "bg-slate-800 text-white border-slate-800" : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
+                  }`}
+                >
+                  {d.nombre}
+                </button>
+              ))}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-1">
+              {depto
+                ? `Responsables: ${(emailsPorCodigoDepartamento(depto) || []).join(", ") || "sin correos de este departamento"}`
+                : "Elige el departamento. Si el pedido no está en BC, no hay departamento asignado."}
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-1 items-center text-[13px] mb-3">
+            <label className="text-xs font-semibold text-slate-500">Proveedor</label>
+            <div>
+              <input value={proveedor} onChange={(e) => setProveedor(e.target.value)} placeholder="Nombre tal como está en la ficha de BC" className="w-full border border-slate-300 rounded px-2 py-1" />
+              <div className="text-[10px] text-slate-400 mt-0.5">
+                {!proveedor.trim()
+                  ? "Escribe el proveedor para buscar su email, o pon el correo directamente en Para."
+                  : emailBC === null
+                    ? "Consultando la ficha del proveedor en BC…"
+                    : emailBC
+                      ? `Ficha BC: ${emailBC}`
+                      : "La ficha del proveedor en BC no tiene email con ese nombre. Escríbelo en Para y se recordará."}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-[80px_1fr] gap-x-2 gap-y-2 items-center text-[13px] mb-3">
+          <label className="text-xs font-semibold text-slate-500">Para</label>
+          <input value={para} onChange={(e) => { paraTocado.current = true; setPara(e.target.value); }} placeholder={tipo === "proveedor" ? "email del proveedor" : "correo del responsable"} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500">CC</label>
+          <input value={cc} onChange={(e) => { ccTocado.current = true; setCc(e.target.value); }} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500">Asunto</label>
+          <input value={asunto} onChange={(e) => setAsunto(e.target.value)} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Texto</label>
+          <textarea value={intro} onChange={(e) => { introTocado.current = true; setIntro(e.target.value); }} rows={9} className="w-full border border-slate-300 rounded px-2 py-1" />
+          <label className="text-xs font-semibold text-slate-500 self-start pt-1">Despedida</label>
+          <textarea value={cierre} onChange={(e) => { cierreTocado.current = true; setCierre(e.target.value); }} rows={4} className="w-full border border-slate-300 rounded px-2 py-1" />
+        </div>
+
+        <label className="flex items-center gap-2 text-[12px] text-slate-600 mb-3">
+          <input type="checkbox" checked={adjuntarPdf && pdfOk} disabled={!pdfOk} onChange={(e) => setAdjuntarPdf(e.target.checked)} />
+          {pdfOk
+            ? `Adjuntar el PDF de este albarán (${nombrePdfConsulta(grupo.albaran, grupo.pedido)})`
+            : grupo.pdfBase64
+              ? "El PDF pesa más de 3 MB y no se puede adjuntar a este correo."
+              : "Este albarán no tiene PDF para adjuntar."}
+        </label>
+
+        <div className="text-xs font-semibold text-slate-500 mb-1">Vista previa del correo</div>
+        <div className="border border-slate-200 rounded-md p-3 bg-slate-50 max-h-52 overflow-y-auto text-[13px]" dangerouslySetInnerHTML={{ __html: html }} />
+        {remitente && <div className="text-[10px] text-slate-400 mt-1">Se enviará desde {remitente}.</div>}
+
+        {error && <div className="mt-3 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded p-2">✗ {error}</div>}
+
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onClose} className="text-sm border border-slate-300 rounded-md px-4 py-2 hover:bg-slate-50">Cancelar</button>
+          <button onClick={enviar} disabled={enviando} className="flex items-center gap-2 text-sm font-semibold text-white bg-amber-700 hover:bg-amber-800 disabled:opacity-60 rounded-md px-4 py-2">
+            {enviando ? <RefreshCw size={14} className="animate-spin" /> : <Send size={14} />} {tipo === "proveedor" ? "Enviar al proveedor" : "Enviar al responsable"}
           </button>
         </div>
       </div>
@@ -2176,6 +2440,7 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
   const [fReclamo, setFReclamo] = useState(""); // "" | "si" | "no"
   const [avisoEnvio, setAvisoEnvio] = useState(null);
   const [consultaResp, setConsultaResp] = useState(null);
+  const [avisoPedido, setAvisoPedido] = useState(null);
   const [buscandoCorreos, setBuscandoCorreos] = useState(false);
   const [verYaRecibidos, setVerYaRecibidos] = useState(false); // lista de «ya recibidos» del documento subido
   const [q, setQ] = useState("");
@@ -3091,6 +3356,39 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
     });
   };
 
+  const abrirAvisoPedidoIncorrecto = (g) => {
+    const ficha = fichaPedido(g.pedido);
+    const conocido = g.pedido && numerosPedidoConocidos.has(String(g.pedido).toUpperCase());
+    setAvisoPedido({
+      pedido: g.pedido || "",
+      albaran: g.albaran || "",
+      proveedor: g.vendorName || ficha?.prov || "",
+      departamento: g.departamento || ficha?.depto || "",
+      pdfBase64: g.pdfBase64 || "",
+      lineas: lineasParaConsulta(g),
+      noEncontrado: !!(g.bcError || (g.pedido && !conocido)),
+    });
+  };
+
+  const onAvisoPedidoEnviado = async ({ pedido, para, tipo, depto, proveedor, recordarEmail }) => {
+    setAvisoPedido(null);
+    const quien = tipo === "proveedor"
+      ? (proveedor ? `${proveedor}: ${para}` : para)
+      : (depto ? `${depto}: ${para}` : para);
+    setAvisoEnvio(`✓ Aviso de nº de pedido incorrecto enviado a ${quien}`);
+    if (recordarEmail && proveedor) guardar({ emailsProveedor: { [proveedor]: recordarEmail } });
+    if (!pedido) return;
+    const destino = tipo === "proveedor" ? "al proveedor" : "al responsable";
+    const texto = `Avisado ${destino}${depto ? ` de ${depto}` : ""}${proveedor && tipo === "proveedor" ? ` ${proveedor}` : ""} de que el nº de pedido ${pedido} es incorrecto. Enviado a ${para}`;
+    await fetch("/api/recepcion/nota", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pedido, texto, autor: "📧 Correo" }),
+    }).catch(() => {});
+    const d = await fetch("/api/recepcion").then((x) => x.json()).catch(() => null);
+    if (d?.notas) setRecep((prev) => ({ ...prev, notas: d.notas }));
+  };
+
   const onConsultaResponsableEnviada = async ({ pedido, para, depto }) => {
     setConsultaResp(null);
     const quien = depto ? `${depto}: ${para}` : para;
@@ -3360,7 +3658,19 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                           {cruzando === g.id ? "Cargando…" : "Cargar pedido"}
                         </button>
                         {g.pedido && !existe && <span title="No aparece en la lista de pedidos cargada — revisar" className="text-amber-600 text-[11px]">⚠ no está en la lista</span>}
-                        {!g.pedido && !g.oferta && <span className="text-amber-700 text-[11px]">Albarán aparte: escribe su Nº de pedido o de oferta (OCAC…) y pulsa Cargar pedido</span>}
+                        {!g.pedido && !g.oferta && (
+                          <span className="inline-flex flex-wrap items-center gap-2 text-amber-700 text-[11px]">
+                            <span>Albarán aparte: en el documento no hay un PC. Escríbelo o avisa de que el nº es incorrecto.</span>
+                            <button
+                              type="button"
+                              onClick={() => abrirAvisoPedidoIncorrecto(g)}
+                              className="inline-flex items-center gap-1 font-semibold text-amber-900 border border-amber-400 bg-amber-50 hover:bg-amber-100 rounded px-2 py-1"
+                              title="Abre un correo al responsable o al proveedor. No se envía hasta que lo confirmes."
+                            >
+                              <Mail size={12} /> Nº de pedido incorrecto
+                            </button>
+                          </span>
+                        )}
                       </div>
                       {(() => {
                         const claveAlb = (a) => String(a || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -3406,7 +3716,14 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
 
                       {g.bcError && (
                         <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-3">
-                          No se han podido cruzar las líneas de material con BC: {g.bcError}. Puedes subir igualmente el albarán y el adjunto; las cantidades las registrarás a mano.
+                          <div>No se han podido cruzar las líneas de material con BC: {g.bcError}. Puedes subir igualmente el albarán y el adjunto; las cantidades las registrarás a mano.</div>
+                          <button
+                            type="button"
+                            onClick={() => abrirAvisoPedidoIncorrecto(g)}
+                            className="mt-2 inline-flex items-center gap-1 font-semibold text-amber-900 border border-amber-300 bg-white hover:bg-amber-100 rounded px-2 py-1"
+                          >
+                            <Mail size={12} /> Avisar de que el nº de pedido es incorrecto
+                          </button>
                         </div>
                       )}
 
@@ -3683,12 +4000,19 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
                         </button>
                         <button
                           onClick={() => abrirConsultaResponsable(g)}
-                          disabled={!g.pedido}
-                          title="Abre un correo al responsable del departamento para preguntar si este pedido es correcto y a qué OT corresponde. No se envía hasta que lo confirmes."
-                          className="inline-flex items-center gap-2 text-sm font-semibold text-blue-700 border border-blue-300 bg-white hover:bg-blue-50 disabled:opacity-50 rounded-md px-4 py-2"
+                          title="Abre un correo al responsable del departamento para preguntar si este pedido es correcto y a qué OT corresponde. También si el albarán no trae PC. No se envía hasta que lo confirmes."
+                          className="inline-flex items-center gap-2 text-sm font-semibold text-blue-700 border border-blue-300 bg-white hover:bg-blue-50 rounded-md px-4 py-2"
                         >
                           <Mail size={14} />
                           Preguntar al responsable
+                        </button>
+                        <button
+                          onClick={() => abrirAvisoPedidoIncorrecto(g)}
+                          title="Abre un correo al responsable del departamento o al proveedor para informar de que el número de pedido del albarán no es correcto. No se envía hasta que lo confirmes."
+                          className="inline-flex items-center gap-2 text-sm font-semibold text-amber-800 border border-amber-300 bg-amber-50 hover:bg-amber-100 rounded-md px-4 py-2"
+                        >
+                          <Mail size={14} />
+                          Nº de pedido incorrecto
                         </button>
                       </div>
 
@@ -4127,6 +4451,15 @@ export default function Recepcion({ pedidos, lineas, onActualizarBC, actualizand
           grupo={consultaResp}
           onClose={() => setConsultaResp(null)}
           onEnviado={onConsultaResponsableEnviada}
+        />
+      )}
+
+      {avisoPedido && (
+        <ModalPedidoIncorrecto
+          grupo={avisoPedido}
+          emailsProveedor={recep.emailsProveedor || {}}
+          onClose={() => setAvisoPedido(null)}
+          onEnviado={onAvisoPedidoEnviado}
         />
       )}
 

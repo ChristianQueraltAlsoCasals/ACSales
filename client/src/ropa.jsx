@@ -4,8 +4,10 @@
  * jaqueta, sudadera y jersey) y stock por talla, guardado en este navegador.
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Minus, Plus, Search, Shirt, ShoppingCart, User } from "lucide-react";
-import { ANOS, FECHA_STOCK, LINEAS, lineasDe, stockExcel, sumaAno, tallasDe } from "./ropaAnalisis";
+import { ChevronDown, Minus, Plus, Search, Shirt, ShoppingCart, User } from "lucide-react";
+import { ANOS, FECHA_STOCK, LINEAS, lineasDe, preciosDe, stockExcel, sumaAno, tallasDe } from "./ropaAnalisis";
+import { comprasDe, FECHA_LISTADO } from "./ropaTrabajadores";
+import ComparadorOfertas from "./comparadorOfertas";
 
 const LS = "acsales_ropa_stock_v2";
 const MINIMO_DEFECTO = 2;
@@ -143,10 +145,13 @@ export default function Ropa({ recursos = [] }) {
   const [tallaElegida, setTallaElegida] = useState({});
   const [avisoTalla, setAvisoTalla] = useState({});
   const [carrito, setCarrito] = useState([]);
+  const [verPreparacion, setVerPreparacion] = useState(false);
   const [remotos, setRemotos] = useState([]);
   const [cargandoTrab, setCargandoTrab] = useState(false);
   const [trabajador, setTrabajador] = useState("");
   const [avisoTrabajador, setAvisoTrabajador] = useState(false);
+  const [stockAbierto, setStockAbierto] = useState(true);
+  const [puesto, setPuesto] = useState({ polo: false, pantalon: false });
   const stockRef = useRef(null);
   const trabajadorRef = useRef(null);
   const deTabla = useMemo(() => trabajadoresDe(recursos), [recursos]);
@@ -208,12 +213,17 @@ export default function Ropa({ recursos = [] }) {
   };
 
   const quitarDelCarrito = (id, talla, recurso) => {
-    setCarrito((prev) => prev.filter((l) => !(l.id === id && l.talla === talla && l.recurso === recurso)));
+    setCarrito((prev) => {
+      const next = prev.filter((l) => !(l.id === id && l.talla === talla && l.recurso === recurso));
+      if (!next.length) setVerPreparacion(false);
+      return next;
+    });
   };
 
   const elegir = (id) => {
     setFiltro((actual) => (actual === id ? "" : id));
     setBusca("");
+    setStockAbierto(true);
     requestAnimationFrame(() => {
       stockRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -244,18 +254,31 @@ export default function Ropa({ recursos = [] }) {
 
   const totalPrenda = (p) => p.tallas.reduce((a, t) => a + (guardado.unidades[clave(p.id, t)] || 0), 0);
 
+  const vestir = (id) => {
+    setPuesto((p) => ({ ...p, [id]: !p[id] }));
+  };
+
+  const figura = puesto.polo && puesto.pantalon
+    ? { src: "/ropa/maniqui-render.jpg", alt: "Maniquí vestido con la camiseta y los pantalones", titulo: "Uniforme de trabajo" }
+    : puesto.polo
+      ? { src: "/ropa/maniqui-camiseta.jpg", alt: "Maniquí con la camiseta de manga corta", titulo: "Camiseta manga corta" }
+      : puesto.pantalon
+        ? { src: "/ropa/maniqui-pantalones.jpg", alt: "Maniquí con los pantalones largos", titulo: "Pantalones largos" }
+        : { src: "/ropa/maniqui-desnudo.jpg", alt: "Maniquí sin vestir", titulo: "Sin vestir" };
+
   const chip = (id, nombre) => {
-    const activo = filtro === id;
+    const activo = puesto[id];
     return (
       <button
         key={id}
         type="button"
-        onClick={() => elegir(id)}
+        onClick={() => vestir(id)}
+        aria-pressed={activo}
         className={`text-left rounded-lg border px-3 py-2 text-sm transition-colors ${activo ? "border-[#1e3358] bg-[#1e3358] text-white" : "border-slate-200 bg-white text-slate-700 hover:border-slate-400"}`}
       >
         <span className="block font-semibold leading-tight">{nombre}</span>
         <span className={`block text-xs mt-0.5 ${activo ? "text-white/80" : "text-slate-500"}`}>
-          {totalPrenda(PRENDAS.find((p) => p.id === id))} uds
+          {activo ? "Puesto" : "Poner"} · {totalPrenda(PRENDAS.find((p) => p.id === id))} uds
         </span>
       </button>
     );
@@ -268,8 +291,8 @@ export default function Ropa({ recursos = [] }) {
         <h1 className="bc-page-title">Ropa</h1>
       </div>
       <p className="bc-page-sub">
-        Uniforme de trabajo de Also Casals. El maniquí lleva la camiseta de manga corta y los pantalones largos.
-        El stock parte del recuento del {FECHA_STOCK}. Debajo, los pedidos de cada año.
+        Uniforme de trabajo de Also Casals. El maniquí empieza sin ropa: pulsa una prenda para vestirlo.
+        El stock parte del recuento del {FECHA_STOCK}. Al elegir un trabajador verás la ropa que ha recogido.
       </p>
 
       <div ref={trabajadorRef} className="mt-4 bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm max-w-xl scroll-mt-4">
@@ -297,6 +320,8 @@ export default function Ropa({ recursos = [] }) {
         )}
       </div>
 
+      {elegido && <RopaDelTrabajador nombre={elegido.nombre} />}
+
       <div className="bc-cue-row">
         <div className="bc-cue">
           <div className="bc-cue-valor">{resumen.prendas}</div>
@@ -320,12 +345,12 @@ export default function Ropa({ recursos = [] }) {
         <article className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
           <div className="px-4 py-3 border-b border-slate-100">
             <div className="text-[11px] font-bold tracking-[0.14em] uppercase text-slate-400">Maniquí</div>
-            <div className="font-semibold text-slate-800">Uniforme de trabajo</div>
+            <div className="font-semibold text-slate-800">{figura.titulo}</div>
           </div>
           <div className="bg-[#e8e8ea]">
             <img
-              src="/ropa/maniqui-render.jpg"
-              alt="Maniquí con la camiseta negra de manga corta y los pantalones de trabajo"
+              src={figura.src}
+              alt={figura.alt}
               className="w-full h-[540px] object-contain object-bottom"
             />
           </div>
@@ -397,9 +422,18 @@ export default function Ropa({ recursos = [] }) {
           </div>
           {carrito.length > 0 && (
             <div className="border-t border-slate-200 px-4 py-3">
-              <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
-                <ShoppingCart size={16} /> Carrito
-                <span className="text-slate-500 font-normal">{carrito.reduce((a, l) => a + l.uds, 0)} uds</span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                  <ShoppingCart size={16} /> Carrito
+                  <span className="text-slate-500 font-normal">{carrito.reduce((a, l) => a + l.uds, 0)} uds</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setVerPreparacion(true)}
+                  className="text-sm font-semibold text-white bg-[#1e3358] rounded-md px-3 py-1.5"
+                >
+                  Preparar ropa
+                </button>
               </div>
               <ul className="mt-2 space-y-1">
                 {carrito.map((l) => (
@@ -409,6 +443,7 @@ export default function Ropa({ recursos = [] }) {
                   </li>
                 ))}
               </ul>
+              {verPreparacion && <Preparacion lineas={carrito} stock={guardado.unidades} minimos={guardado.minimos} />}
             </div>
           )}
         </article>
@@ -418,13 +453,21 @@ export default function Ropa({ recursos = [] }) {
 
       <section ref={stockRef} className="mt-6 scroll-mt-4">
         <div className="flex flex-wrap items-end justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-bold text-slate-800">Stock de ropa</h2>
-            <p className="text-xs text-slate-500 mt-0.5 max-w-xl">
-              Unidades a {FECHA_STOCK}, por talla. Si cambias una cifra, se guarda en este navegador. El mínimo avisa cuando queda poca ropa de esa prenda.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setStockAbierto((v) => !v)}
+            aria-expanded={stockAbierto}
+            className="flex items-start gap-2 text-left"
+          >
+            <ChevronDown size={18} className={`mt-1 shrink-0 text-slate-500 transition-transform ${stockAbierto ? "" : "-rotate-90"}`} />
+            <span>
+              <h2 className="text-lg font-bold text-slate-800">Stock de ropa</h2>
+              <p className="text-xs text-slate-500 mt-0.5 max-w-xl">
+                Unidades a {FECHA_STOCK}, por talla. Si cambias una cifra, se guarda en este navegador. El mínimo avisa cuando queda poca ropa de esa prenda.
+              </p>
+            </span>
+          </button>
+          {stockAbierto && <div className="flex items-center gap-2">
             {filtro && (
               <button type="button" onClick={() => setFiltro("")} className="text-sm font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md px-3 py-1.5">
                 Ver todas
@@ -439,10 +482,10 @@ export default function Ropa({ recursos = [] }) {
                 className="border border-slate-300 rounded-md pl-8 pr-3 py-1.5 text-sm w-52"
               />
             </label>
-          </div>
+          </div>}
         </div>
 
-        <div className="mt-3 bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+        {stockAbierto && <div className="mt-3 bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500 border-b border-slate-200">
@@ -521,9 +564,129 @@ export default function Ropa({ recursos = [] }) {
               );
             })}
           </table>
-        </div>
+        </div>}
       </section>
+
+      <ComparadorOfertas />
     </div>
+  );
+}
+
+function Preparacion({ lineas, stock, minimos }) {
+  const grupos = [];
+  for (const l of lineas) {
+    let g = grupos.find((x) => x.recurso === l.recurso);
+    if (!g) {
+      g = { recurso: l.recurso, nombre: l.trabajador, historial: comprasDe(l.trabajador), filas: [] };
+      grupos.push(g);
+    }
+    const u = stock[clave(l.id, l.talla)] || 0;
+    const min = minimos[l.id] ?? MINIMO_DEFECTO;
+    const previas = g.historial.filter((h) => h.prenda === l.nombre);
+    g.filas.push({ ...l, stock: u, min, previas });
+  }
+
+  return (
+    <div className="mt-3 border-t border-slate-200 pt-3">
+      <h3 className="text-sm font-bold text-slate-800">Preparación</h3>
+      <p className="text-xs text-slate-500 mt-0.5">
+        Cruza el carrito con el recurso, el stock de esta pantalla y la ropa que ya consta de esa persona, hasta el {FECHA_LISTADO}. No resta stock ni crea un pedido.
+      </p>
+      <div className="mt-2 space-y-3">
+        {grupos.map((g) => (
+          <div key={g.recurso} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+            <div className="text-sm font-semibold text-slate-800">{g.nombre}</div>
+            <div className="text-xs text-slate-500">Recurso {g.recurso}</div>
+            <ul className="mt-2 space-y-2">
+              {g.filas.map((f) => {
+                const misma = f.previas.filter((h) => h.talla === f.talla);
+                const alcanza = f.stock >= f.uds;
+                return (
+                  <li key={`${f.id}-${f.talla}`} className="text-sm text-slate-700">
+                    <div className="font-medium">{f.nombre} · talla {f.talla} · {f.uds}</div>
+                    <div className={`text-xs mt-0.5 ${alcanza ? "text-emerald-800" : "text-red-700"}`}>
+                      {alcanza ? `Hay stock: ${f.stock}` : `No alcanza: hay ${f.stock} y pides ${f.uds}`}
+                      {f.stock <= f.min ? ` · en el mínimo (${f.min})` : ""}
+                    </div>
+                    <div className="text-xs text-slate-500 mt-0.5">
+                      {f.previas.length === 0
+                        ? "No consta esta prenda para este trabajador."
+                        : misma.length
+                          ? `Ya tiene ${f.nombre} talla ${f.talla}: ${misma.map((h) => `${fechaCorta(h.fecha)}, ${h.uds} ${h.estado === "Recollida" ? "recogida" : h.estado === "Pendent" ? "pendiente" : "rechazada"}`).join("; ")}.`
+                          : `Ya tiene ${f.nombre}, en otra talla: ${f.previas.map((h) => `${h.talla || "sin talla"} el ${fechaCorta(h.fecha)}`).join("; ")}.`}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function fechaCorta(iso) {
+  if (!iso) return "Sin fecha";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+const ESTADO_ROPA = {
+  Recollida: { txt: "Recogida", cls: "text-emerald-800 bg-emerald-100" },
+  Pendent: { txt: "Pendiente", cls: "text-amber-800 bg-amber-100" },
+  Refusada: { txt: "Rechazada", cls: "text-slate-600 bg-slate-100" },
+};
+
+function RopaDelTrabajador({ nombre }) {
+  const lineas = [...comprasDe(nombre)].sort((a, b) => (b.fecha || "").localeCompare(a.fecha || ""));
+  const recogidas = lineas.filter((l) => l.estado === "Recollida").reduce((a, l) => a + l.uds, 0);
+
+  return (
+    <section className="mt-4">
+      <h2 className="text-lg font-bold text-slate-800">Ropa de {nombre}</h2>
+      <p className="text-xs text-slate-500 mt-0.5">
+        Lo que consta como comprado para este trabajador, hasta el {FECHA_LISTADO}.
+      </p>
+      {lineas.length === 0 ? (
+        <p className="mt-2 text-sm text-slate-600">No hay ropa registrada para {nombre}.</p>
+      ) : (
+        <div className="mt-3 bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+          <div className="px-4 py-2 text-sm text-slate-600 border-b border-slate-100">
+            {recogidas} unidades recogidas
+          </div>
+          <div className="overflow-x-auto max-h-80">
+            <table className="w-full text-sm min-w-[560px]">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500 border-b border-slate-200">
+                  <th className="px-4 py-2 font-semibold">Fecha</th>
+                  <th className="px-3 py-2 font-semibold">Ropa</th>
+                  <th className="px-3 py-2 font-semibold">Talla</th>
+                  <th className="px-3 py-2 font-semibold text-right">Uds</th>
+                  <th className="px-4 py-2 font-semibold">Estado</th>
+                </tr>
+              </thead>
+              <tbody>
+                {lineas.map((l, i) => {
+                  const est = ESTADO_ROPA[l.estado] || { txt: l.estado || "—", cls: "text-slate-600 bg-slate-100" };
+                  return (
+                    <tr key={`${l.fecha}-${l.codigo}-${i}`} className="border-t border-slate-100">
+                      <td className="px-4 py-1.5 whitespace-nowrap text-slate-600">{fechaCorta(l.fecha)}</td>
+                      <td className="px-3 py-1.5 text-slate-800">{l.prenda}</td>
+                      <td className="px-3 py-1.5 text-slate-700">{l.talla || "—"}</td>
+                      <td className="px-3 py-1.5 text-right tabular-nums text-slate-800">{l.uds}</td>
+                      <td className="px-4 py-1.5">
+                        <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${est.cls}`}>{est.txt}</span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -531,7 +694,27 @@ function celda(n) {
   return n > 0 ? n : "—";
 }
 
+function euros(n) {
+  return n.toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " €";
+}
+
+function PrecioAno({ id, ano }) {
+  const lista = preciosDe(id, ano);
+  if (!lista.length) return null;
+  return (
+    <div className="mt-0.5 font-normal text-[11px] leading-tight text-slate-500">
+      {lista.map((p, i) => (
+        <div key={i}>
+          {euros(p.total)}
+          {p.detalle ? <span className="block text-[10px]">{p.detalle}</span> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function PedidosAno({ ids }) {
+  const [abierto, setAbierto] = useState(true);
   const prendas = PRENDAS.filter((p) => ids.includes(p.id));
   const lineas = LINEAS.filter((l) => ids.includes(l.id));
   if (prendas.length === 0) return null;
@@ -540,11 +723,21 @@ function PedidosAno({ ids }) {
 
   return (
     <section className="mt-6">
-      <h2 className="text-lg font-bold text-slate-800">Pedidos año a año</h2>
-      <p className="text-xs text-slate-500 mt-0.5 max-w-3xl">
-        Unidades pedidas a Fervalls, Herraiz y Serigrafix, de 2022 a 2026. El stock es el recuento del {FECHA_STOCK}.
-      </p>
-      <div className="mt-3 bg-white border border-slate-200 rounded-xl overflow-x-auto shadow-sm">
+      <button
+        type="button"
+        onClick={() => setAbierto((v) => !v)}
+        aria-expanded={abierto}
+        className="flex items-start gap-2 text-left"
+      >
+        <ChevronDown size={18} className={`mt-1 shrink-0 text-slate-500 transition-transform ${abierto ? "" : "-rotate-90"}`} />
+        <span>
+          <h2 className="text-lg font-bold text-slate-800">Pedidos año a año</h2>
+          <p className="text-xs text-slate-500 mt-0.5 max-w-3xl">
+            Unidades pedidas a Fervalls, Herraiz y Serigrafix, de 2022 a 2026. Debajo, el precio unitario de ese año. Si hay dos cifras, la segunda es el logo. El stock es el recuento del {FECHA_STOCK}.
+          </p>
+        </span>
+      </button>
+      {abierto && <div className="mt-3 bg-white border border-slate-200 rounded-xl overflow-x-auto shadow-sm">
         <table className="w-full text-sm min-w-[760px]">
           <thead>
             <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500 border-b border-slate-200">
@@ -564,7 +757,10 @@ function PedidosAno({ ids }) {
                 <tr className="bg-slate-50 border-t border-slate-200">
                   <td className="px-4 py-2 font-semibold text-slate-800" colSpan={2}>{p.nombre}</td>
                   {ANOS.map((a) => (
-                    <td key={a} className="px-3 py-2 text-right tabular-nums font-semibold text-slate-800">{celda(sumaAno(ls, a))}</td>
+                    <td key={a} className="px-3 py-2 text-right tabular-nums font-semibold text-slate-800 align-top">
+                      {celda(sumaAno(ls, a))}
+                      <PrecioAno id={p.id} ano={a} />
+                    </td>
                   ))}
                   <td className="px-3 py-2 text-right tabular-nums font-semibold text-slate-800">{ls.reduce((n, l) => n + l.pedido, 0)}</td>
                   <td className="px-4 py-2 text-right tabular-nums font-semibold text-slate-800">{ls.reduce((n, l) => n + l.stock, 0)}</td>
@@ -597,7 +793,7 @@ function PedidosAno({ ids }) {
             </tr>
           </tfoot>
         </table>
-      </div>
+      </div>}
     </section>
   );
 }

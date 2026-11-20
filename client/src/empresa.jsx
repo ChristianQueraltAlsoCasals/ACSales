@@ -29,6 +29,12 @@ export function esAdmin() {
 export function empresaGuardada() {
   try { return JSON.parse(localStorage.getItem(LS_EMPRESA_APP) || "null"); } catch { return null; }
 }
+
+/** Also Casals y Ferros no llevan la ventana Comercial. */
+export function esEmpresaQuimlab(e = empresaGuardada()) {
+  const n = `${e?.nombre || ""} ${e?.displayName || ""}`.toLowerCase();
+  return n.includes("quimlab");
+}
 /** true si la empresa elegida NO es la de por defecto (ALSO CASALS) */
 export function esOtraEmpresa() {
   const e = empresaGuardada();

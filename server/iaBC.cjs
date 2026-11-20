@@ -295,7 +295,7 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
     {
       name: "abrir_pantalla",
       description:
-        "Abre una pantalla de ACSales para Maria. Ids: cargar, memoria, explorador, recepcion, facturascompra, precios, pedidosventa, facturasventa, analisiscliente, simuladortarifas, correo, tareas, calendario, ia, ratios, horas.",
+        "Abre una pantalla de ACSales para Maria. Ids: cargar, memoria, explorador, recepcion, facturascompra, precios, pedidosventa, facturasventa, comercial, analisiscliente, simuladortarifas, correo, tareas, calendario, ia, ratios, horas.",
       input_schema: {
         type: "object",
         properties: {
@@ -431,7 +431,7 @@ module.exports = function montarIaBC({ app, obtenerTokenBC, fetchConReintento, d
       }
       case "abrir_pantalla": {
         const pantalla = String(entradaOriginal?.pantalla || "").trim();
-        const ids = ["cargar", "memoria", "explorador", "recepcion", "facturascompra", "precios", "pedidosventa", "facturasventa", "analisiscliente", "simuladortarifas", "correo", "tareas", "calendario", "ia", "ratios", "horas"];
+        const ids = ["cargar", "memoria", "explorador", "recepcion", "facturascompra", "precios", "pedidosventa", "facturasventa", "comercial", "analisiscliente", "simuladortarifas", "correo", "tareas", "calendario", "ia", "ratios", "horas"];
         if (!ids.includes(pantalla)) throw new Error(`Pantalla desconocida «${pantalla}». Usa una de: ${ids.join(", ")}`);
         return { accionApp: true, tipo: "abrir_pantalla", pantalla, mensaje: `Se abrirá la pantalla «${pantalla}».` };
       }

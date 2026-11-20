@@ -18,6 +18,7 @@ const NOMBRES = {
   precios: "Precios de artículos",
   pedidosventa: "Pedidos de venta",
   facturasventa: "Facturas de venta emitidas",
+  comercial: "Comercial",
   analisiscliente: "Anàlisi per client",
   simuladortarifas: "Simulador de tarifas 2027",
   correo: "Correo",
@@ -26,7 +27,6 @@ const NOMBRES = {
   ratios: "Ratios financieros",
   horas: "Control de horas",
   ropa: "Ropa",
-  ofertas: "Comparador de ofertas",
   ia: "Asistente IA",
 };
 
@@ -36,9 +36,10 @@ const SUGERENCIAS = {
   explorador: ["¿Qué OTs de la pantalla están pendientes de facturar?", "Resume esta OT"],
   recepcion: ["¿Qué pedidos llevan más retraso?", "¿Qué proveedores tienen más pedidos pendientes?"],
   facturascompra: ["¿Esta factura cuadra con el pedido?", "¿Qué facturas tengo pendientes de validar?"],
-  precios: ["¿Qué artículos han subido más de precio?", "Compara los precios de este artículo entre proveedores"],
+  precios: ["¿Qué artículos han subido más de precio?", "Compara las ofertas en PDF de los proveedores"],
   pedidosventa: ["¿Qué pedidos de venta llevan más tiempo pendientes?", "Resume los pendientes por cliente"],
   facturasventa: ["¿Qué facturas de venta están pendientes de cobro?", "Resume las facturas de esta pantalla"],
+  comercial: ["¿A quién tengo que hacer seguimiento hoy?", "Resume los presupuestos abiertos"],
   analisiscliente: ["Quin deute té aquest client?", "Com paga aquest client?", "Quin risc té aquest client?"],
   simuladortarifas: [
     "Quins clients han de pujar tarifa el 2027?",
@@ -50,8 +51,7 @@ const SUGERENCIAS = {
   calendario: ["¿Qué tengo esta semana?", "Crea un evento para mañana"],
   ratios: ["Explícame los ratios en fácil", "¿Qué ratio debería preocuparme más?"],
   horas: ["¿Quién tiene más días sin imputar?", "¿Quién acumula más horas extra?"],
-  ropa: ["¿Qué tallas están sin stock?", "¿Cuántas jaquetas de alta visibilidad hay?"],
-  ofertas: ["¿Qué proveedor tiene el mejor precio?", "Compara las ofertas adjuntas"],
+  ropa: ["¿Qué tallas están sin stock?", "Compara las ofertas en PDF de los proveedores"],
 };
 
 function textoPantalla() {
